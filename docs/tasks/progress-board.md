@@ -18,3 +18,4 @@
 - WebUI mounted local API settings/key/refresh endpoints.
 - Test harness and smoke validation.
 - `odm-collect --max-batches` bounded window control.
+- WebUI/API collection batch progress visibility.

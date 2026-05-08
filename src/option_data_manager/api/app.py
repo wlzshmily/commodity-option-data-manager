@@ -178,6 +178,7 @@ def create_app(
             "status": _overall_status(overview, latest_run),
             "database_path": database_path,
             "summary": overview["summary"],
+            "collection": overview["collection"],
             "latest_run": latest_run[0].__dict__ if latest_run else None,
             "api": {
                 "bind": settings.get_value(API_BIND_KEY) or "127.0.0.1",

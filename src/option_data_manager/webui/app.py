@@ -149,6 +149,7 @@ INDEX_HTML = """<!doctype html>
               <div class="metric-card"><span>活跃期权</span><strong id="summary-options">--</strong></div>
               <div class="metric-card"><span>Greeks/IV 覆盖</span><strong class="good" id="summary-iv">--</strong></div>
               <div class="metric-card"><span>20日K线</span><strong class="good" id="summary-kline">正常</strong></div>
+              <div class="metric-card"><span>采集分片</span><strong id="summary-batches">--</strong></div>
             </div>
           </div>
 
@@ -157,6 +158,14 @@ INDEX_HTML = """<!doctype html>
               <div><span class="panel-title">交易所采集状态</span><span class="panel-note">覆盖率、品种数和标的数用于判断全市场缺口。</span></div>
             </div>
             <div class="exchange-cards" id="exchange-cards"></div>
+          </section>
+
+          <section class="panel card">
+            <div class="panel-header">
+              <div><span class="panel-title">采集分片进度</span><span class="panel-note">手动刷新会按分片窗口推进，失败分片会保留以便后续重试。</span></div>
+            </div>
+            <div class="progress-cards" id="collection-progress"></div>
+            <div class="notice d-none mt-3" id="collection-failures"></div>
           </section>
 
           <section class="panel card">
@@ -406,7 +415,7 @@ body {
 .hero-title-block p { margin: 0; color: rgba(255, 253, 248, .82); }
 .hero-metrics {
   display: grid;
-  grid-template-columns: repeat(4, minmax(118px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
   gap: 12px;
   align-items: center;
   padding: 20px 22px;
@@ -428,6 +437,7 @@ body {
 .panel-title { font-size: 15px; font-weight: 800; }
 .panel-note { color: var(--muted); font-size: 12px; margin-left: 8px; }
 .exchange-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+.progress-cards { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 12px; }
 .settings-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(160px, 1fr));
@@ -454,6 +464,16 @@ body {
 }
 .exchange-card strong { font-size: 16px; margin-right: 10px; }
 .exchange-card div:last-child { color: var(--aqua); font-size: 12px; margin-top: 5px; }
+.progress-card {
+  min-height: 70px;
+  padding: 11px 13px;
+  border: 1px solid rgba(138, 66, 70, .13);
+  border-radius: 4px;
+  background: #fffdf8;
+}
+.progress-card span { display: block; color: var(--muted); font-size: 11px; font-weight: 800; }
+.progress-card strong { display: block; margin-top: 5px; font: 800 16px/1.2 var(--mono); color: var(--text); }
+.progress-card small { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; }
 .table-shell, .quote-table-wrap {
   border: 1px solid var(--line);
   border-radius: 4px;
@@ -857,8 +877,10 @@ function renderOverview() {
   $("#summary-options").textContent = fmtNum(summary.active_options);
   $("#summary-iv").textContent = fmtPct(summary.iv_coverage);
   $("#summary-kline").textContent = summary.kline_coverage >= 0.999 ? "正常" : "补齐中";
+  $("#summary-batches").textContent = fmtCollectionProgress(state.overview.collection);
   updateHealthPill(summary);
   renderExchangeCards();
+  renderCollectionProgress();
   renderUnderlyingRows();
 }
 
@@ -879,6 +901,35 @@ function renderExchangeCards() {
       <div>Quote ${fmtPct(quoteCoverage)} · IV ${fmtPct(ivCoverage)}</div>
     </div>`;
   }).join("");
+}
+
+function fmtCollectionProgress(progress) {
+  if (!progress || !progress.active_batches) return "--";
+  return `${fmtNum(progress.success_batches)} / ${fmtNum(progress.active_batches)}`;
+}
+
+function renderCollectionProgress() {
+  const progress = state.overview.collection ?? {};
+  const active = Number(progress.active_batches ?? 0);
+  const cards = [
+    ["总分片", fmtNum(active), `${fmtNum(progress.planned_underlyings ?? 0)} 标的`],
+    ["已完成", fmtNum(progress.success_batches ?? 0), fmtPct(progress.completion_ratio ?? 0)],
+    ["待采集", fmtNum(progress.pending_batches ?? 0), "等待窗口执行"],
+    ["失败待重试", fmtNum(progress.failed_batches ?? 0), "不会丢失进度"],
+    ["最近分片更新", fmtDateTime(progress.latest_batch_update), progress.scope ?? "--"],
+  ];
+  $("#collection-progress").innerHTML = cards.map(([label, value, hint]) => `
+    <div class="progress-card">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      <small>${escapeHtml(hint)}</small>
+    </div>
+  `).join("");
+  const failures = progress.recent_failures ?? [];
+  $("#collection-failures").classList.toggle("d-none", failures.length === 0);
+  $("#collection-failures").innerHTML = failures.length
+    ? `最近失败分片：${failures.map((item) => `${escapeHtml(item.underlying_symbol)}#${escapeHtml(item.batch_index)} ${escapeHtml(item.last_error ?? item.status)}`).join("；")}`
+    : "";
 }
 
 function renderUnderlyingRows() {

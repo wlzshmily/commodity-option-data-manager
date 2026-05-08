@@ -12,6 +12,8 @@ def test_api_status_and_settings_do_not_require_key_by_default() -> None:
     client = TestClient(app)
 
     assert client.get("/api/health").status_code == 200
+    status = client.get("/api/status").json()
+    assert status["collection"]["active_batches"] == 0
     settings = client.get("/api/settings").json()
     assert settings["api"]["auth_required"] is False
     assert settings["tqsdk"]["password_configured"] is False
@@ -52,4 +54,3 @@ def test_saving_tqsdk_credentials_masks_password_in_settings() -> None:
     settings = client.get("/api/settings").json()
     assert settings["tqsdk"] == {"account": "demo", "password_configured": True}
     assert "super-secret" not in str(settings)
-

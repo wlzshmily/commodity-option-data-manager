@@ -14,11 +14,12 @@
 
 ## Verification
 
-- `uv run pytest -q`: passed, 10 tests.
+- `uv run pytest -q`: passed, 11 tests.
 - `uv run python -m compileall -q src tests option_data_manager`: passed.
 - `scripts/agentic-sdlc/check-agentic-sdlc.ps1 -Root .`: passed.
 - API factory smoke test: `/api/health`, `/api/status`, and `/api/settings` returned 200.
 - WebUI factory smoke test: `/`, `/api/settings`, and `/api/webui/overview` returned 200.
+- WebUI/API status now expose collection batch progress, including success, pending, failed, remaining, and recent failed batches.
 - Live bounded collection smoke: `uv run odm-collect --max-underlyings 1 --max-batches 1 --option-batch-size 5 --wait-cycles 1` completed and wrote a partial-failure report without secrets.
 
 ## Remaining Acceptance Work
