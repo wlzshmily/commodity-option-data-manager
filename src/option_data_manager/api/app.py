@@ -204,6 +204,8 @@ def create_app(
                 settings.get_value(OPTION_BATCH_SIZE_KEY) or "20",
                 "--max-underlyings",
                 settings.get_value("collection.max_underlyings") or "1000000",
+                "--max-batches",
+                settings.get_value("collection.max_batches") or "10",
             ]
         )
         service_state.set_value("collection.last_refresh_exit_code", str(exit_code))
@@ -336,6 +338,7 @@ def create_app(
                 "refresh_interval_seconds": int(settings.get_value(REFRESH_INTERVAL_KEY) or "30"),
                 "option_batch_size": int(settings.get_value(OPTION_BATCH_SIZE_KEY) or "20"),
                 "max_underlyings": int(settings.get_value("collection.max_underlyings") or "1000000"),
+                "max_batches": int(settings.get_value("collection.max_batches") or "10"),
                 "auto_retry": (settings.get_value("collection.auto_retry") or "true") == "true",
                 "kline_backfill": (settings.get_value("collection.kline_backfill") or "true") == "true",
                 "inactive_handling": settings.get_value("collection.inactive_handling") or "mark_inactive",

@@ -43,6 +43,7 @@ class StatefulMarketCollectionResult:
     finished_at: str
     scope: str
     max_underlyings: int
+    max_batches: int | None
     start_after_underlying: str | None
     option_batch_size: int
     planned_underlyings: int
@@ -60,12 +61,16 @@ def collect_market_batches(
     *,
     option_batch_size: int,
     max_underlyings: int,
+    max_batches: int | None = None,
     start_after_underlying: str | None,
     wait_cycles: int,
     iv_calculator: Callable[[Any, Any], Any] | None,
     scope: str = "windowed-market-current-slice",
 ) -> StatefulMarketCollectionResult:
     """Collect current slices by consuming durable non-stale collection batches."""
+
+    if max_batches is not None and max_batches < 1:
+        raise ValueError("max_batches must be positive when provided.")
 
     started_at = datetime.now(UTC).isoformat()
     plan = build_market_collection_plan(
@@ -83,6 +88,7 @@ def collect_market_batches(
     pending_batches = state_repo.list_batches(
         scope=scope,
         statuses=("pending", "failed"),
+        limit=max_batches,
     )
     results = tuple(
         _collect_batch(
@@ -101,6 +107,7 @@ def collect_market_batches(
         finished_at=datetime.now(UTC).isoformat(),
         scope=scope,
         max_underlyings=max_underlyings,
+        max_batches=max_batches,
         start_after_underlying=start_after_underlying,
         option_batch_size=option_batch_size,
         planned_underlyings=plan.underlying_count,

@@ -248,6 +248,7 @@ INDEX_HTML = """<!doctype html>
               <label>Port<input class="form-control form-control-sm" id="setting-api-port" type="number" min="1" max="65535" /></label>
               <label>刷新间隔秒<input class="form-control form-control-sm" id="setting-refresh-interval" type="number" min="1" /></label>
               <label>分片大小<input class="form-control form-control-sm" id="setting-batch-size" type="number" min="1" /></label>
+              <label>每次最多分片<input class="form-control form-control-sm" id="setting-max-batches" type="number" min="1" /></label>
               <label class="checkline"><input class="form-check-input" id="setting-auth-required" type="checkbox" /> 强制 API Key</label>
               <button class="btn btn-sm btn-primary" type="button" id="save-runtime-settings">保存运行设置</button>
               <button class="btn btn-sm btn-warning" type="button" id="trigger-refresh">手动刷新</button>
@@ -771,6 +772,7 @@ async function loadSettings() {
     $("#setting-auth-required").checked = Boolean(settings.api.auth_required);
     $("#setting-refresh-interval").value = settings.collection.refresh_interval_seconds ?? 30;
     $("#setting-batch-size").value = settings.collection.option_batch_size ?? 20;
+    $("#setting-max-batches").value = settings.collection.max_batches ?? 10;
     $("#settings-message").textContent = settings.tqsdk.password_configured ? "TQSDK 密码已配置。" : "TQSDK 密码尚未配置。";
     await loadApiKeys();
   } catch (error) {
@@ -803,6 +805,7 @@ async function saveRuntimeSettings() {
     ["api.auth_required", $("#setting-auth-required").checked ? "true" : "false"],
     ["collection.refresh_interval_seconds", $("#setting-refresh-interval").value || "30"],
     ["collection.option_batch_size", $("#setting-batch-size").value || "20"],
+    ["collection.max_batches", $("#setting-max-batches").value || "10"],
   ];
   for (const [key, value] of updates) {
     await fetchJsonWithBody(`/api/settings/${encodeURIComponent(key)}`, "PUT", { value });

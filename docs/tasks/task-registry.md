@@ -7,4 +7,4 @@
 | REL-003 | Done | Codex | Consolidate local API, settings, API keys, and refresh endpoint | pytest API tests |
 | REL-004 | Done | Codex | Preserve WebUI baseline and wire real settings/API information | WebUI TestClient smoke |
 | REL-005 | Done | Codex | Add focused unit/API tests and sample database fixtures | `uv run pytest -q` |
-| REL-006 | Pending | Sponsor/Codex | Run live full-market TQSDK acceptance and tune batch thresholds | Live report under ignored QA evidence path |
+| REL-006 | In Progress | Codex | Run bounded live TQSDK collection windows and tune batch thresholds | `odm-collect --max-batches` live reports |

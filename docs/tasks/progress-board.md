@@ -2,11 +2,12 @@
 
 ## In Progress
 
-- Live full-market acceptance evidence
+- Bounded live full-market acceptance windows
 
 ## Pending
 
-- Full-market batch threshold tuning
+- Final full-market completion report
+- Full-market batch threshold tuning from complete coverage evidence
 
 ## Done
 
@@ -16,3 +17,4 @@
 - Unified local API and API Key management.
 - WebUI mounted local API settings/key/refresh endpoints.
 - Test harness and smoke validation.
+- `odm-collect --max-batches` bounded window control.

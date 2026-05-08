@@ -14,12 +14,13 @@
 
 ## Verification
 
-- `uv run pytest -q`: passed, 9 tests.
+- `uv run pytest -q`: passed, 10 tests.
 - `uv run python -m compileall -q src tests option_data_manager`: passed.
 - `scripts/agentic-sdlc/check-agentic-sdlc.ps1 -Root .`: passed.
 - API factory smoke test: `/api/health`, `/api/status`, and `/api/settings` returned 200.
 - WebUI factory smoke test: `/`, `/api/settings`, and `/api/webui/overview` returned 200.
+- Live bounded collection smoke: `uv run odm-collect --max-underlyings 1 --max-batches 1 --option-batch-size 5 --wait-cycles 1` completed and wrote a partial-failure report without secrets.
 
 ## Remaining Acceptance Work
 
-- Run live full-market `odm-collect` with configured TQSDK credentials and record coverage/performance evidence under ignored QA evidence paths.
+- Continue live bounded `odm-collect` windows until all full-market batches are complete, then record coverage/performance evidence under ignored QA evidence paths.

@@ -81,6 +81,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             source_database_path=source_database_path,
             option_batch_size=args.option_batch_size,
             max_underlyings=args.max_underlyings,
+            max_batches=args.max_batches,
             start_after_underlying=args.start_after_underlying,
             wait_cycles=max(args.wait_cycles, 0),
             scope=args.scope,
@@ -105,6 +106,7 @@ def run_collection_command(
     source_database_path: Path,
     option_batch_size: int,
     max_underlyings: int,
+    max_batches: int | None,
     start_after_underlying: str | None,
     wait_cycles: int,
     scope: str = DEFAULT_SCOPE,
@@ -133,6 +135,7 @@ def run_collection_command(
                 connection,
                 option_batch_size=option_batch_size,
                 max_underlyings=max_underlyings,
+                max_batches=max_batches,
                 start_after_underlying=start_after_underlying,
                 wait_cycles=wait_cycles,
                 iv_calculator=create_iv_calculator(),
@@ -279,6 +282,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--report", default=str(DEFAULT_REPORT_PATH))
     parser.add_argument("--option-batch-size", type=int, default=20)
     parser.add_argument("--max-underlyings", type=int, default=1_000_000)
+    parser.add_argument("--max-batches", type=int, default=None)
     parser.add_argument("--start-after-underlying", default=None)
     parser.add_argument("--wait-cycles", type=int, default=2)
     parser.add_argument("--scope", default=DEFAULT_SCOPE)
@@ -435,6 +439,7 @@ def _command_result_to_dict(
         "discovery": discovery.__dict__ if discovery is not None else None,
         "window": {
             "max_underlyings": result.max_underlyings,
+            "max_batches": result.max_batches,
             "start_after_underlying": result.start_after_underlying,
             "option_batch_size": result.option_batch_size,
             "planned_underlyings": result.planned_underlyings,
