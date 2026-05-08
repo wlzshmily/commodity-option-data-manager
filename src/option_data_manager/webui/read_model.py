@@ -296,7 +296,9 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
                 COUNT(DISTINCT m.symbol) AS metrics_count,
                 COUNT(DISTINCT CASE WHEN m.iv IS NOT NULL THEN m.symbol END) AS iv_count,
                 COUNT(DISTINCT k.symbol) AS kline_count,
-                MAX(COALESCE(q.received_at, m.received_at, k.received_at)) AS latest_update
+                MAX(COALESCE(q.received_at, m.received_at, k.received_at)) AS latest_update,
+                MAX(q.source_datetime) AS latest_quote_time,
+                MAX(k.bar_datetime) AS latest_kline_time
             FROM instruments i
             LEFT JOIN quote_current q ON q.symbol = i.symbol
             LEFT JOIN option_source_metrics_current m ON m.symbol = i.symbol
@@ -320,6 +322,8 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
             COALESCE(c.iv_count, 0) AS iv_count,
             COALESCE(c.kline_count, 0) AS kline_count,
             c.latest_update,
+            c.latest_quote_time,
+            c.latest_kline_time,
             uq.source_datetime AS book_time,
             uq.last_price AS underlying_last
         FROM option_counts oc
@@ -346,6 +350,11 @@ def _format_underlying_row(row: sqlite3.Row) -> dict[str, Any]:
     data["metrics_coverage"] = _ratio(int(data["metrics_count"]), option_count)
     data["iv_coverage"] = _ratio(int(data["iv_count"]), option_count)
     data["kline_coverage"] = _ratio(int(data["kline_count"]), option_count)
+    data["display_market_time"] = data.get("book_time") or data.get("latest_quote_time")
+    data["display_kline_time"] = _daily_kline_close_datetime(
+        data.get("latest_kline_time"),
+        reference_datetime=data.get("display_market_time") or data.get("latest_update"),
+    )
     data["status"] = _status_from_counts(data, option_count)
     return data
 

@@ -38,6 +38,7 @@ API_BIND_KEY = "api.bind"
 API_PORT_KEY = "api.port"
 REFRESH_INTERVAL_KEY = "collection.refresh_interval_seconds"
 OPTION_BATCH_SIZE_KEY = "collection.option_batch_size"
+DEFAULT_BACKGROUND_MAX_BATCHES = "100"
 
 
 class TqsdkCredentialUpdate(BaseModel):
@@ -361,7 +362,10 @@ def create_app(
                 "refresh_interval_seconds": int(settings.get_value(REFRESH_INTERVAL_KEY) or "30"),
                 "option_batch_size": int(settings.get_value(OPTION_BATCH_SIZE_KEY) or "20"),
                 "max_underlyings": int(settings.get_value("collection.max_underlyings") or "1000000"),
-                "max_batches": int(settings.get_value("collection.max_batches") or "10"),
+                "max_batches": int(
+                    settings.get_value("collection.max_batches")
+                    or DEFAULT_BACKGROUND_MAX_BATCHES
+                ),
                 "auto_retry": (settings.get_value("collection.auto_retry") or "true") == "true",
                 "kline_backfill": (settings.get_value("collection.kline_backfill") or "true") == "true",
                 "inactive_handling": settings.get_value("collection.inactive_handling") or "mark_inactive",
@@ -536,7 +540,7 @@ def _collection_args(
         "--max-underlyings",
         settings.get_value("collection.max_underlyings") or "1000000",
         "--max-batches",
-        settings.get_value("collection.max_batches") or "10",
+        settings.get_value("collection.max_batches") or DEFAULT_BACKGROUND_MAX_BATCHES,
     ]
 
 

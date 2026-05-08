@@ -226,7 +226,7 @@ INDEX_HTML = """<!doctype html>
             </div>
             <div class="table-responsive table-shell">
               <table class="table table-sm align-middle summary-table">
-                <thead><tr><th>交易所</th><th>品种</th><th>标的合约</th><th>到期月</th><th>CALL</th><th>PUT</th><th>Quote</th><th>Greeks/IV</th><th>20D K线</th><th>最近更新</th><th>状态</th><th>操作</th></tr></thead>
+                <thead><tr><th>交易所</th><th>品种</th><th>标的合约</th><th>到期月</th><th>CALL</th><th>PUT</th><th>Quote</th><th>Greeks/IV</th><th>20D K线</th><th>行情时间</th><th>状态</th><th>操作</th></tr></thead>
                 <tbody id="underlying-rows"></tbody>
               </table>
               <div class="empty-state d-none" id="overview-empty">
@@ -305,7 +305,7 @@ INDEX_HTML = """<!doctype html>
               <label>Port<input class="form-control form-control-sm" id="setting-api-port" type="number" min="1" max="65535" /></label>
               <label>刷新间隔秒<input class="form-control form-control-sm" id="setting-refresh-interval" type="number" min="1" /></label>
               <label>分片大小<input class="form-control form-control-sm" id="setting-batch-size" type="number" min="1" /></label>
-              <label>每次最多分片<input class="form-control form-control-sm" id="setting-max-batches" type="number" min="1" /></label>
+              <label>后台窗口分片<input class="form-control form-control-sm" id="setting-max-batches" type="number" min="1" /></label>
               <label class="checkline"><input class="form-check-input" id="setting-auth-required" type="checkbox" /> 强制 API Key</label>
               <button class="btn btn-sm btn-primary" type="button" id="save-runtime-settings">保存运行设置</button>
               <button class="btn btn-sm btn-warning" type="button" id="trigger-refresh">手动刷新</button>
@@ -745,7 +745,27 @@ function fmtPct(value) {
 
 function fmtDateTime(value) {
   if (!value) return "--";
-  return String(value)
+  const text = String(value);
+  if (text.includes("T") && /(?:Z|[+-]\d{2}:?\d{2})$/.test(text)) {
+    const date = new Date(text);
+    if (!Number.isNaN(date.getTime())) {
+      const parts = new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Hong_Kong",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }).formatToParts(date).reduce((acc, part) => {
+        acc[part.type] = part.value;
+        return acc;
+      }, {});
+      return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+    }
+  }
+  return text
     .replace("T", " ")
     .replace(/(\.\d+)(?=(Z|[+-]\d{2}:?\d{2})?$)/, "")
     .replace(/(Z|[+-]\d{2}:?\d{2})$/, "");
@@ -840,7 +860,7 @@ async function loadSettings() {
     $("#setting-auth-required").checked = Boolean(settings.api.auth_required);
     $("#setting-refresh-interval").value = settings.collection.refresh_interval_seconds ?? 30;
     $("#setting-batch-size").value = settings.collection.option_batch_size ?? 20;
-    $("#setting-max-batches").value = settings.collection.max_batches ?? 10;
+    $("#setting-max-batches").value = settings.collection.max_batches ?? 100;
     $("#settings-message").textContent = settings.tqsdk.password_configured ? "TQSDK 密码已配置。" : "TQSDK 密码尚未配置。";
     await loadApiKeys();
   } catch (error) {
@@ -873,7 +893,7 @@ async function saveRuntimeSettings() {
     ["api.auth_required", $("#setting-auth-required").checked ? "true" : "false"],
     ["collection.refresh_interval_seconds", $("#setting-refresh-interval").value || "30"],
     ["collection.option_batch_size", $("#setting-batch-size").value || "20"],
-    ["collection.max_batches", $("#setting-max-batches").value || "10"],
+    ["collection.max_batches", $("#setting-max-batches").value || "100"],
   ];
   for (const [key, value] of updates) {
     await fetchJsonWithBody(`/api/settings/${encodeURIComponent(key)}`, "PUT", { value });
@@ -1000,8 +1020,8 @@ function renderUnderlyingRows() {
       <td class="mono">${fmtNum(row.put_count)}</td>
       <td class="good">${fmtPct(row.quote_coverage)}</td>
       <td class="${row.iv_coverage < 0.98 ? "warn" : "good"}">${fmtPct(row.iv_coverage)}</td>
-      <td class="${row.kline_count ? "good" : "warn"}">${row.kline_count ? "正常" : "缺口"}</td>
-      <td class="mono">${escapeHtml(fmtDateTime(row.latest_update ?? row.latest_quote_at))}</td>
+      <td class="${row.kline_count ? "good" : "warn"}">${row.kline_count ? escapeHtml(fmtDateTime(row.display_kline_time ?? row.latest_kline_time)) : "缺口"}</td>
+      <td class="mono">${escapeHtml(fmtDateTime(row.display_market_time ?? row.latest_quote_time))}</td>
       <td><span class="tag ${statusClass}">${escapeHtml(row.status)}</span></td>
       <td><button class="btn btn-sm btn-light" type="button">进入T型</button></td>
     </tr>`;

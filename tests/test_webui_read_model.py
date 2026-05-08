@@ -43,3 +43,76 @@ def test_overview_includes_collection_progress() -> None:
     assert progress["remaining_batches"] == 2
     assert progress["completion_ratio"] == 0.3333
     assert progress["recent_failures"][0]["last_error"] == "source_unavailable"
+
+
+def test_underlying_rows_expose_market_time_separately_from_received_at() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    connection.executemany(
+        """
+        INSERT INTO instruments (
+            symbol,
+            exchange_id,
+            product_id,
+            instrument_id,
+            instrument_name,
+            ins_class,
+            underlying_symbol,
+            option_class,
+            strike_price,
+            expire_datetime,
+            price_tick,
+            volume_multiple,
+            expired,
+            active,
+            inactive_reason,
+            last_seen_at,
+            raw_payload_json
+        )
+        VALUES (?, 'SHFE', 'cu', ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, 0, 1, NULL, '2026-05-08T00:00:00+00:00', '{}')
+        """,
+        [
+            ("SHFE.cu2606", "cu2606", "FUTURE", None, None, None),
+            ("SHFE.cu2606C70000", "cu2606C70000", "OPTION", "SHFE.cu2606", "CALL", 70000),
+        ],
+    )
+    connection.executemany(
+        """
+        INSERT INTO quote_current (
+            symbol,
+            source_datetime,
+            received_at,
+            raw_payload_json
+        )
+        VALUES (?, ?, ?, '{}')
+        """,
+        [
+            (
+                "SHFE.cu2606",
+                "2026-05-08 22:59:59.000000",
+                "2026-05-08T16:25:24+00:00",
+            ),
+            (
+                "SHFE.cu2606C70000",
+                "2026-05-08 22:59:58.000000",
+                "2026-05-08T16:25:24+00:00",
+            ),
+        ],
+    )
+    connection.execute(
+        """
+        INSERT INTO kline_20d_current (
+            symbol,
+            bar_datetime,
+            received_at,
+            raw_payload_json
+        )
+        VALUES ('SHFE.cu2606C70000', '2026-05-08T00:00:00+08:00', '2026-05-08T16:25:24+00:00', '{}')
+        """
+    )
+
+    row = read_model.overview()["underlyings"][0]
+
+    assert row["latest_update"] == "2026-05-08T16:25:24+00:00"
+    assert row["display_market_time"] == "2026-05-08 22:59:59.000000"
+    assert row["display_kline_time"] is not None
