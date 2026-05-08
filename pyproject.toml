@@ -1,0 +1,36 @@
+[project]
+name = "option-data-manager"
+version = "0.1.0"
+description = "Local current-slice data manager for China commodity options."
+readme = "项目需求文档.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.136.1",
+    "tqsdk>=3.9.5",
+    "uvicorn>=0.38.0",
+]
+
+[project.scripts]
+odm-api = "option_data_manager.api.app:main"
+odm-collect = "option_data_manager.cli.collect_market:main"
+odm-webui = "option_data_manager.webui.app:main"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.0.2",
+]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/option_data_manager"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/option_data_manager", "项目需求文档.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
