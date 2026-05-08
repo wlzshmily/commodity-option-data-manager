@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 import uvicorn
 
 from option_data_manager.api.app import create_app as create_local_api_app
+from option_data_manager.service_state import ServiceStateRepository
 from .read_model import WebuiReadModel
 
 
@@ -27,6 +28,7 @@ def create_webui_app(
 
     connection.row_factory = sqlite3.Row
     read_model = WebuiReadModel(connection)
+    service_state = ServiceStateRepository(connection)
     app = FastAPI(title="期权数据管理工具 WebUI")
     local_api = create_local_api_app(connection, database_path=database_path)
     for route in local_api.router.routes:
@@ -36,7 +38,12 @@ def create_webui_app(
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
-        overview = read_model.overview(limit=500)
+        overview = _overview_payload(
+            read_model,
+            service_state=service_state,
+            database_path=database_path,
+            limit=500,
+        )
         selected = (
             overview["underlyings"][0]["underlying_symbol"]
             if overview["underlyings"]
@@ -67,8 +74,12 @@ def create_webui_app(
     @app.get("/api/webui/overview")
     def overview(limit: int = Query(default=80, ge=1, le=500)) -> dict:
         return {
-            "database_path": database_path,
-            **read_model.overview(limit=limit),
+            **_overview_payload(
+                read_model,
+                service_state=service_state,
+                database_path=database_path,
+                limit=limit,
+            ),
         }
 
     @app.get("/api/webui/tquote")
@@ -80,6 +91,43 @@ def create_webui_app(
         return read_model.runs(limit=limit)
 
     return app
+
+
+def _overview_payload(
+    read_model: WebuiReadModel,
+    *,
+    service_state: ServiceStateRepository,
+    database_path: str | None,
+    limit: int,
+) -> dict:
+    return {
+        "database_path": database_path,
+        **read_model.overview(limit=limit),
+        "refresh": {
+            "running": (
+                service_state.get_value("collection.refresh_running") or "false"
+            )
+            == "true",
+            "message": service_state.get_value("collection.refresh_message"),
+            "window_count": _int_or_none(
+                service_state.get_value("collection.refresh_window_count")
+            ),
+            "remaining_batches": _int_or_none(
+                service_state.get_value("collection.refresh_remaining_batches")
+            ),
+            "started_at": service_state.get_value("collection.refresh_started_at"),
+            "finished_at": service_state.get_value("collection.refresh_finished_at"),
+        },
+    }
+
+
+def _int_or_none(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def create_app_from_database() -> FastAPI:
@@ -437,7 +485,7 @@ body {
 .panel-title { font-size: 15px; font-weight: 800; }
 .panel-note { color: var(--muted); font-size: 12px; margin-left: 8px; }
 .exchange-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
-.progress-cards { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 12px; }
+.progress-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
 .settings-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(160px, 1fr));
@@ -910,12 +958,18 @@ function fmtCollectionProgress(progress) {
 
 function renderCollectionProgress() {
   const progress = state.overview.collection ?? {};
+  const refresh = state.overview.refresh ?? {};
   const active = Number(progress.active_batches ?? 0);
   const cards = [
     ["总分片", fmtNum(active), `${fmtNum(progress.planned_underlyings ?? 0)} 标的`],
     ["已完成", fmtNum(progress.success_batches ?? 0), fmtPct(progress.completion_ratio ?? 0)],
     ["待采集", fmtNum(progress.pending_batches ?? 0), "等待窗口执行"],
     ["失败待重试", fmtNum(progress.failed_batches ?? 0), "不会丢失进度"],
+    [
+      "后台任务",
+      refresh.running ? "运行中" : "空闲",
+      refresh.message ?? (refresh.finished_at ? fmtDateTime(refresh.finished_at) : "等待触发"),
+    ],
     ["最近分片更新", fmtDateTime(progress.latest_batch_update), progress.scope ?? "--"],
   ];
   $("#collection-progress").innerHTML = cards.map(([label, value, hint]) => `

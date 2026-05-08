@@ -464,7 +464,7 @@ def _command_result_to_dict(
 
 def _collection_status(result: Mapping[str, Any]) -> str:
     statuses = {
-        item.get("run", {}).get("status", item.get("collection_batch_status"))
+        item.get("collection_batch_status")
         for item in result["results"]
     }
     if not statuses:

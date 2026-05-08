@@ -154,7 +154,7 @@ def _collect_batch(
         )
         return _failed_batch_result(batch, failed.status, exc)
 
-    if result.run.status == "success":
+    if _batch_has_current_quotes(batch, result):
         batch_state = state_repo.mark_succeeded(
             scope=scope,
             underlying_symbol=batch.underlying_symbol,
@@ -168,6 +168,15 @@ def _collect_batch(
             error=result.run.message or result.run.status,
         )
     return _successful_batch_result(batch, result, batch_state.status)
+
+
+def _batch_has_current_quotes(
+    batch: CollectionBatchRecord,
+    result: ChainCollectionResult,
+) -> bool:
+    """Treat source-missing Greeks/IV as a quality gap, not a batch blocker."""
+
+    return result.quotes_written >= len(batch.option_symbols)
 
 
 def _successful_batch_result(

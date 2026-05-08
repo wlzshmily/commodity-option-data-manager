@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import os
 from pathlib import Path
 import sqlite3
+import threading
 import time
 from typing import Any
 
@@ -114,6 +115,14 @@ def create_app(
     api_keys = ApiKeyRepository(connection)
     service_state = ServiceStateRepository(connection)
     read_model = WebuiReadModel(connection)
+    refresh_lock = threading.Lock()
+    refresh_worker: dict[str, threading.Thread | None] = {"thread": None}
+    if (service_state.get_value("collection.refresh_running") or "false") == "true":
+        service_state.set_value("collection.refresh_running", "false")
+        service_state.set_value(
+            "collection.refresh_message",
+            "Refresh stopped because the local service restarted.",
+        )
 
     app = FastAPI(title="Option Data Manager API")
 
@@ -179,6 +188,7 @@ def create_app(
             "database_path": database_path,
             "summary": overview["summary"],
             "collection": overview["collection"],
+            "refresh": _refresh_status(service_state),
             "latest_run": latest_run[0].__dict__ if latest_run else None,
             "api": {
                 "bind": settings.get_value(API_BIND_KEY) or "127.0.0.1",
@@ -192,28 +202,40 @@ def create_app(
 
     @app.post("/api/refresh", response_model=RefreshResponse)
     def refresh(_: ApiKeyRecord | None = Depends(require_auth)) -> RefreshResponse:
-        from option_data_manager.cli.collect_market import main as collect_main
-
         report_path = Path("docs/qa/sdk-contract-reports/latest-collection-command-report.md")
-        exit_code = collect_main(
-            [
-                "--database",
-                database_path or DEFAULT_DATABASE_PATH,
-                "--report",
-                str(report_path),
-                "--option-batch-size",
-                settings.get_value(OPTION_BATCH_SIZE_KEY) or "20",
-                "--max-underlyings",
-                settings.get_value("collection.max_underlyings") or "1000000",
-                "--max-batches",
-                settings.get_value("collection.max_batches") or "10",
-            ]
-        )
-        service_state.set_value("collection.last_refresh_exit_code", str(exit_code))
+        with refresh_lock:
+            worker = refresh_worker.get("thread")
+            if worker is not None and worker.is_alive():
+                return RefreshResponse(
+                    status="running",
+                    report_path=str(report_path),
+                    message="Refresh is already running in the background.",
+                )
+            args = _collection_args(
+                database_path=database_path or DEFAULT_DATABASE_PATH,
+                report_path=report_path,
+                settings=settings,
+            )
+            started_at = datetime.now(UTC).isoformat()
+            service_state.set_value("collection.refresh_running", "true")
+            service_state.set_value("collection.refresh_started_at", started_at)
+            service_state.set_value("collection.refresh_finished_at", None)
+            service_state.set_value("collection.refresh_message", "Background refresh started.")
+            worker = threading.Thread(
+                target=_run_refresh_until_complete,
+                kwargs={
+                    "args": args,
+                    "database_path": database_path or DEFAULT_DATABASE_PATH,
+                    "started_at": started_at,
+                },
+                daemon=True,
+            )
+            refresh_worker["thread"] = worker
+            worker.start()
         return RefreshResponse(
-            status="completed" if exit_code == 0 else "failed",
+            status="started",
             report_path=str(report_path),
-            message="Refresh command completed. Check the report for collection details.",
+            message="Refresh started in the background. The WebUI will update as batches finish.",
         )
 
     @app.get("/api/exchanges")
@@ -496,6 +518,124 @@ def _extract_api_key(authorization: str | None, x_api_key: str | None) -> str | 
 
 def _api_key_response(record: ApiKeyRecord) -> ApiKeyResponse:
     return ApiKeyResponse(**record.__dict__)
+
+
+def _collection_args(
+    *,
+    database_path: str,
+    report_path: Path,
+    settings: SettingsRepository,
+) -> list[str]:
+    return [
+        "--database",
+        database_path,
+        "--report",
+        str(report_path),
+        "--option-batch-size",
+        settings.get_value(OPTION_BATCH_SIZE_KEY) or "20",
+        "--max-underlyings",
+        settings.get_value("collection.max_underlyings") or "1000000",
+        "--max-batches",
+        settings.get_value("collection.max_batches") or "10",
+    ]
+
+
+def _run_refresh_until_complete(
+    *,
+    args: list[str],
+    database_path: str,
+    started_at: str,
+) -> None:
+    from option_data_manager.cli.collect_market import main as collect_main
+
+    state_connection = sqlite3.connect(database_path, check_same_thread=False)
+    state_connection.row_factory = sqlite3.Row
+    state = ServiceStateRepository(state_connection)
+    stalled_windows = 0
+    previous_remaining: int | None = None
+    window_count = 0
+    try:
+        while True:
+            window_count += 1
+            state.set_value("collection.refresh_window_count", str(window_count))
+            state.set_value(
+                "collection.refresh_message",
+                f"Collecting window {window_count}.",
+            )
+            exit_code = collect_main(args)
+            state.set_value("collection.last_refresh_exit_code", str(exit_code))
+            progress = WebuiReadModel(state_connection).overview(limit=1)["collection"]
+            active_batches = int(progress["active_batches"])
+            remaining_batches = int(progress["remaining_batches"])
+            state.set_value("collection.refresh_remaining_batches", str(remaining_batches))
+            if active_batches == 0:
+                state.set_value(
+                    "collection.refresh_message",
+                    "Refresh stopped because no active collection plan exists.",
+                )
+                break
+            if remaining_batches == 0:
+                state.set_value(
+                    "collection.refresh_message",
+                    "Full-market refresh completed.",
+                )
+                break
+            if previous_remaining is not None and remaining_batches >= previous_remaining:
+                stalled_windows += 1
+            else:
+                stalled_windows = 0
+            previous_remaining = remaining_batches
+            if stalled_windows >= 3:
+                state.set_value(
+                    "collection.refresh_message",
+                    "Refresh paused after three windows without progress.",
+                )
+                break
+            if exit_code != 0:
+                state.set_value(
+                    "collection.refresh_message",
+                    f"Refresh stopped with exit code {exit_code}.",
+                )
+                break
+    except Exception as exc:
+        state.set_value("collection.last_refresh_exit_code", "1")
+        state.set_value(
+            "collection.refresh_message",
+            f"Refresh failed: {type(exc).__name__}: {exc}",
+        )
+    finally:
+        state.set_value("collection.refresh_running", "false")
+        state.set_value("collection.refresh_started_at", started_at)
+        state.set_value("collection.refresh_finished_at", datetime.now(UTC).isoformat())
+        state_connection.close()
+
+
+def _refresh_status(service_state: ServiceStateRepository) -> dict[str, Any]:
+    return {
+        "running": (service_state.get_value("collection.refresh_running") or "false")
+        == "true",
+        "started_at": service_state.get_value("collection.refresh_started_at"),
+        "finished_at": service_state.get_value("collection.refresh_finished_at"),
+        "message": service_state.get_value("collection.refresh_message"),
+        "window_count": _int_or_none(
+            service_state.get_value("collection.refresh_window_count")
+        ),
+        "remaining_batches": _int_or_none(
+            service_state.get_value("collection.refresh_remaining_batches")
+        ),
+        "last_exit_code": _int_or_none(
+            service_state.get_value("collection.last_refresh_exit_code")
+        ),
+    }
+
+
+def _int_or_none(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _overall_status(overview: dict[str, Any], latest_run: list[Any]) -> str:

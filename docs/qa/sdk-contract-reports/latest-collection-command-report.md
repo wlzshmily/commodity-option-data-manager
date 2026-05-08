@@ -2,7 +2,7 @@
 
 ## Status
 
-partial_failure
+success
 
 ## SQLite Evidence
 
@@ -13,12 +13,12 @@ partial_failure
 
 ```json
 {
-  "max_batches": 1,
-  "max_underlyings": 1,
-  "option_batch_size": 5,
-  "planned_batches": 15,
-  "planned_options": 74,
-  "planned_underlyings": 1,
+  "max_batches": 3,
+  "max_underlyings": 1000000,
+  "option_batch_size": 20,
+  "planned_batches": 1544,
+  "planned_options": 27386,
+  "planned_underlyings": 380,
   "start_after_underlying": null
 }
 ```
@@ -111,13 +111,13 @@ partial_failure
 
 ```json
 {
-  "active_batch_count": 15,
-  "inserted_count": 0,
-  "pending_or_failed_selected": 1,
-  "preserved_count": 15,
-  "reset_count": 0,
+  "active_batch_count": 1544,
+  "inserted_count": 1540,
+  "pending_or_failed_selected": 3,
+  "preserved_count": 0,
+  "reset_count": 4,
   "scope": "routine-market-current-slice",
-  "stale_count": 0
+  "stale_count": 11
 }
 ```
 
@@ -128,31 +128,140 @@ partial_failure
   {
     "batch_count": 1,
     "batch_index": 1,
-    "collection_batch_status": "failed",
+    "collection_batch_status": "success",
     "error": null,
-    "error_count": 2,
-    "kline_rows_written": 120,
-    "metrics_written": 5,
-    "option_count": 5,
+    "error_count": 3,
+    "kline_rows_written": 420,
+    "metrics_written": 20,
+    "option_count": 20,
     "option_symbols": [
       "CZCE.AP610C6500",
       "CZCE.AP610C6600",
       "CZCE.AP610C6700",
       "CZCE.AP610C6800",
-      "CZCE.AP610C6900"
+      "CZCE.AP610C6900",
+      "CZCE.AP610C7000",
+      "CZCE.AP610C7100",
+      "CZCE.AP610C7200",
+      "CZCE.AP610C7300",
+      "CZCE.AP610C7400",
+      "CZCE.AP610C7500",
+      "CZCE.AP610C7600",
+      "CZCE.AP610C7700",
+      "CZCE.AP610C7800",
+      "CZCE.AP610C7900",
+      "CZCE.AP610C8000",
+      "CZCE.AP610C8100",
+      "CZCE.AP610C8200",
+      "CZCE.AP610C8300",
+      "CZCE.AP610C8400"
     ],
-    "quotes_written": 6,
+    "quotes_written": 21,
     "run": {
-      "error_count": 2,
-      "finished_at": "2026-05-08T15:59:19.651469+00:00",
-      "kline_rows_written": 120,
+      "error_count": 3,
+      "finished_at": "2026-05-08T16:12:51.851245+00:00",
+      "kline_rows_written": 420,
       "message": "Chain collection completed with errors",
-      "metrics_written": 5,
-      "quotes_written": 6,
-      "run_id": 16,
-      "started_at": "2026-05-08T15:59:16.848065+00:00",
+      "metrics_written": 20,
+      "quotes_written": 21,
+      "run_id": 17,
+      "started_at": "2026-05-08T16:12:41.397050+00:00",
       "status": "partial_failure",
-      "symbols_discovered": 6,
+      "symbols_discovered": 21,
+      "trigger": "chain-collector"
+    },
+    "underlying_symbol": "CZCE.AP610"
+  },
+  {
+    "batch_count": 1,
+    "batch_index": 2,
+    "collection_batch_status": "success",
+    "error": null,
+    "error_count": 0,
+    "kline_rows_written": 420,
+    "metrics_written": 20,
+    "option_count": 20,
+    "option_symbols": [
+      "CZCE.AP610C8500",
+      "CZCE.AP610C8600",
+      "CZCE.AP610C8700",
+      "CZCE.AP610C8800",
+      "CZCE.AP610C8900",
+      "CZCE.AP610C9000",
+      "CZCE.AP610C9100",
+      "CZCE.AP610C9200",
+      "CZCE.AP610C9300",
+      "CZCE.AP610C9400",
+      "CZCE.AP610C9500",
+      "CZCE.AP610C9600",
+      "CZCE.AP610C9700",
+      "CZCE.AP610C9800",
+      "CZCE.AP610C9900",
+      "CZCE.AP610C10000",
+      "CZCE.AP610C10200",
+      "CZCE.AP610P6500",
+      "CZCE.AP610P6600",
+      "CZCE.AP610P6700"
+    ],
+    "quotes_written": 21,
+    "run": {
+      "error_count": 0,
+      "finished_at": "2026-05-08T16:13:02.270366+00:00",
+      "kline_rows_written": 420,
+      "message": "Chain collection completed",
+      "metrics_written": 20,
+      "quotes_written": 21,
+      "run_id": 18,
+      "started_at": "2026-05-08T16:12:51.861229+00:00",
+      "status": "success",
+      "symbols_discovered": 21,
+      "trigger": "chain-collector"
+    },
+    "underlying_symbol": "CZCE.AP610"
+  },
+  {
+    "batch_count": 1,
+    "batch_index": 3,
+    "collection_batch_status": "success",
+    "error": null,
+    "error_count": 0,
+    "kline_rows_written": 420,
+    "metrics_written": 20,
+    "option_count": 20,
+    "option_symbols": [
+      "CZCE.AP610P6800",
+      "CZCE.AP610P6900",
+      "CZCE.AP610P7000",
+      "CZCE.AP610P7100",
+      "CZCE.AP610P7200",
+      "CZCE.AP610P7300",
+      "CZCE.AP610P7400",
+      "CZCE.AP610P7500",
+      "CZCE.AP610P7600",
+      "CZCE.AP610P7700",
+      "CZCE.AP610P7800",
+      "CZCE.AP610P7900",
+      "CZCE.AP610P8000",
+      "CZCE.AP610P8100",
+      "CZCE.AP610P8200",
+      "CZCE.AP610P8300",
+      "CZCE.AP610P8400",
+      "CZCE.AP610P8500",
+      "CZCE.AP610P8600",
+      "CZCE.AP610P8700"
+    ],
+    "quotes_written": 21,
+    "run": {
+      "error_count": 0,
+      "finished_at": "2026-05-08T16:13:13.868926+00:00",
+      "kline_rows_written": 420,
+      "message": "Chain collection completed",
+      "metrics_written": 20,
+      "quotes_written": 21,
+      "run_id": 19,
+      "started_at": "2026-05-08T16:13:02.284327+00:00",
+      "status": "success",
+      "symbols_discovered": 21,
       "trigger": "chain-collector"
     },
     "underlying_symbol": "CZCE.AP610"
@@ -164,11 +273,11 @@ partial_failure
 
 ```json
 {
-  "acquisition_errors": 8,
-  "acquisition_runs": 16,
-  "collection_plan_batches": 15,
+  "acquisition_errors": 11,
+  "acquisition_runs": 19,
+  "collection_plan_batches": 1555,
   "instruments": 27766,
-  "kline_20d_current": 1340,
+  "kline_20d_current": 1346,
   "option_source_metrics_current": 74,
   "quote_current": 75
 }
