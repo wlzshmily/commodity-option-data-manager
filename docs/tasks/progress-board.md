@@ -22,3 +22,4 @@
 - Background refresh worker for continuous bounded full-market collection.
 - Metric-only Greeks/IV gaps are treated as visible quality gaps instead of batch blockers.
 - Overview time columns now distinguish exchange market time from collector update time.
+- Background collection wait cycles are configurable and default to one wait round.

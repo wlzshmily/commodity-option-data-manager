@@ -38,6 +38,7 @@ API_BIND_KEY = "api.bind"
 API_PORT_KEY = "api.port"
 REFRESH_INTERVAL_KEY = "collection.refresh_interval_seconds"
 OPTION_BATCH_SIZE_KEY = "collection.option_batch_size"
+WAIT_CYCLES_KEY = "collection.wait_cycles"
 DEFAULT_BACKGROUND_MAX_BATCHES = "100"
 
 
@@ -361,6 +362,7 @@ def create_app(
             "collection": {
                 "refresh_interval_seconds": int(settings.get_value(REFRESH_INTERVAL_KEY) or "30"),
                 "option_batch_size": int(settings.get_value(OPTION_BATCH_SIZE_KEY) or "20"),
+                "wait_cycles": int(settings.get_value(WAIT_CYCLES_KEY) or "1"),
                 "max_underlyings": int(settings.get_value("collection.max_underlyings") or "1000000"),
                 "max_batches": int(
                     settings.get_value("collection.max_batches")
@@ -537,6 +539,8 @@ def _collection_args(
         str(report_path),
         "--option-batch-size",
         settings.get_value(OPTION_BATCH_SIZE_KEY) or "20",
+        "--wait-cycles",
+        settings.get_value(WAIT_CYCLES_KEY) or "1",
         "--max-underlyings",
         settings.get_value("collection.max_underlyings") or "1000000",
         "--max-batches",

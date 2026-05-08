@@ -17,6 +17,7 @@ def test_api_status_and_settings_do_not_require_key_by_default() -> None:
     settings = client.get("/api/settings").json()
     assert settings["api"]["auth_required"] is False
     assert settings["tqsdk"]["password_configured"] is False
+    assert settings["collection"]["wait_cycles"] == 1
 
 
 def test_api_key_required_when_setting_enabled() -> None:
