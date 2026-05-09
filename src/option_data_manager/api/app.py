@@ -25,7 +25,7 @@ from option_data_manager.settings import (
     SettingsRepository,
     TQSDK_ACCOUNT_KEY,
     TQSDK_PASSWORD_KEY,
-    WindowsDpapiProtector,
+    default_secret_protector,
 )
 from option_data_manager.source_quality import SourceQualityRepository
 from option_data_manager.service_state import ServiceStateRepository
@@ -500,9 +500,9 @@ def _ensure_runtime_tables(connection: sqlite3.Connection, *, protector: Any | N
 
 
 def _default_protector() -> Any:
-    if os.name == "nt":
-        return WindowsDpapiProtector()
-    return PlainTextProtector()
+    if os.environ.get("ODM_SECRET_PROTECTOR") == "plaintext":
+        return PlainTextProtector()
+    return default_secret_protector()
 
 
 def _auth_required(settings: SettingsRepository) -> bool:

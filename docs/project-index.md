@@ -9,8 +9,8 @@
 - Progress board: `docs/tasks/progress-board.md`
 - Risk register: `docs/governance/risk-register.md`
 - Release plan: `docs/release/release-plan.md`
+- WSL2 Ubuntu operations: `docs/operations/wsl2-ubuntu.md`
 
 ## Current Active Plan
 
 Bring the half-finished source to a local production release covering five commodity option exchanges, with working package metadata, API, WebUI, collection, tests, and acceptance evidence.
-

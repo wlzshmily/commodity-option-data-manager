@@ -8,3 +8,4 @@
 | REL-004 | Done | Codex | Preserve WebUI baseline and wire real settings/API information | WebUI TestClient smoke |
 | REL-005 | Done | Codex | Add focused unit/API tests and sample database fixtures | `uv run pytest -q` |
 | REL-006 | In Progress | Codex | Run bounded live TQSDK collection windows and tune batch thresholds | Background refresh worker; `odm-collect --max-batches` live reports; WebUI batch-progress read model |
+| REL-007 | Done | Codex | Move local development target to WSL2 Ubuntu and align cloud Linux runtime setup | WSL setup script; Linux secret protector; pytest |

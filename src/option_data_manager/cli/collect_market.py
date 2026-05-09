@@ -24,7 +24,7 @@ from option_data_manager.settings import (
     SecretProtector,
     TQSDK_ACCOUNT_KEY,
     TQSDK_PASSWORD_KEY,
-    WindowsDpapiProtector,
+    default_secret_protector,
 )
 
 
@@ -364,7 +364,7 @@ def _resolve_credentials(
 
 
 def _default_secret_protector() -> SecretProtector:
-    return WindowsDpapiProtector()
+    return default_secret_protector()
 
 
 def _load_credentials_from_database(

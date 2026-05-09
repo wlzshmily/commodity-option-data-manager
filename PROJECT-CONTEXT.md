@@ -20,7 +20,6 @@ Option Data Manager is a local data support service for a future option ratio sp
 
 ## Runtime Rules
 
-- Use `uv` for development and verification.
-- TQSDK secrets are stored only in the local runtime SQLite database with Windows DPAPI protection where available.
+- Use `uv` for development and verification; local development now targets WSL2 Ubuntu first.
+- TQSDK secrets are stored only in local runtime state: Windows uses DPAPI, and WSL/Linux uses a per-user Fernet key file.
 - QA and sample databases must not contain real TQSDK passwords or full API keys.
-

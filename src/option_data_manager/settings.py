@@ -8,8 +8,11 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import os
+from pathlib import Path
 import sqlite3
 from typing import Protocol
+
+from cryptography.fernet import Fernet
 
 from .storage import Migration, apply_migrations
 
@@ -53,6 +56,26 @@ class PlainTextProtector:
 
     def unprotect(self, value: str) -> str:
         return value
+
+
+class FernetFileProtector:
+    """Protect secrets with a per-user file key on Linux, WSL, and servers."""
+
+    _prefix = "fernet:"
+
+    def __init__(self, key_path: Path | None = None) -> None:
+        self._key_path = key_path or _default_secret_key_path()
+        self._fernet = Fernet(_load_or_create_fernet_key(self._key_path))
+
+    def protect(self, value: str) -> str:
+        token = self._fernet.encrypt(value.encode("utf-8")).decode("ascii")
+        return f"{self._prefix}{token}"
+
+    def unprotect(self, value: str) -> str:
+        if not value.startswith(self._prefix):
+            raise ValueError("Unsupported protected secret format.")
+        token = value[len(self._prefix) :].encode("ascii")
+        return self._fernet.decrypt(token).decode("utf-8")
 
 
 class WindowsDpapiProtector:
@@ -124,6 +147,34 @@ def _crypt_unprotect_data(data: bytes) -> bytes:
         return ctypes.string_at(blob_out.pbData, blob_out.cbData)
     finally:
         kernel32.LocalFree(blob_out.pbData)
+
+
+def default_secret_protector() -> SecretProtector:
+    """Return the platform default secret protector for runtime settings."""
+
+    if os.name == "nt":
+        return WindowsDpapiProtector()
+    return FernetFileProtector()
+
+
+def _default_secret_key_path() -> Path:
+    configured = os.environ.get("ODM_SECRET_KEY_FILE")
+    if configured:
+        return Path(configured).expanduser()
+    return Path("~/.config/option-data-manager/secret.key").expanduser()
+
+
+def _load_or_create_fernet_key(path: Path) -> bytes:
+    if path.exists():
+        return path.read_bytes().strip()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = Fernet.generate_key()
+    path.write_bytes(key)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return key
 
 
 @dataclass(frozen=True)
