@@ -277,8 +277,10 @@ INDEX_HTML = """<!doctype html>
         </section>
 
         <section id="runs" class="page">
-          <div class="hero-card card"><div class="hero-title-block"><h1>采集日志</h1><p>追踪发现、Quote、Greeks/IV、20D K线写入和自动重试结果。</p></div><div class="hero-metrics"><div class="metric-card"><span>最近运行</span><strong id="latest-run">--</strong></div><div class="metric-card"><span>异常</span><strong id="latest-errors">--</strong></div></div></div>
+          <div class="hero-card card"><div class="hero-title-block"><h1>日志与诊断</h1><p>追踪采集运行、API/设置/后台刷新事件和可重试异常。</p></div><div class="hero-metrics"><div class="metric-card"><span>最近运行</span><strong id="latest-run">--</strong></div><div class="metric-card"><span>采集异常</span><strong id="latest-errors">--</strong></div><div class="metric-card"><span>系统日志</span><strong id="latest-service-logs">--</strong></div></div></div>
+          <section class="panel card"><div class="panel-header"><span class="panel-title">系统日志</span><span class="panel-note">记录本地 API、设置保存、后台刷新窗口等事件，不写入明文密码或完整 API Key。</span></div><div id="service-logs-list" class="log-list"></div></section>
           <section class="panel card"><div class="panel-header"><span class="panel-title">采集运行记录</span></div><div id="runs-list" class="log-list"></div></section>
+          <section class="panel card"><div class="panel-header"><span class="panel-title">最近采集异常</span></div><div id="run-errors-list" class="log-list"></div></section>
         </section>
 
         <section id="api" class="page">
@@ -811,6 +813,7 @@ async function init() {
   }
   setInterval(refreshCurrentQuote, 2500);
   setInterval(refreshOverview, 10000);
+  setInterval(() => { if ($("#runs").classList.contains("active")) renderRuns(); }, 10000);
 }
 
 function bindNavigation() {
@@ -1273,15 +1276,35 @@ function applyLatestAnimation(animate) {
 
 async function renderRuns() {
   try {
-    const data = await fetchJson("/api/webui/runs?limit=20");
-    $("#latest-run").textContent = data.runs[0]?.finished_at ?? "--";
+    const data = await fetchJson("/api/webui/runs?limit=30");
+    $("#latest-run").textContent = fmtDateTime(data.runs[0]?.finished_at ?? data.runs[0]?.started_at);
     $("#latest-errors").textContent = fmtNum(data.errors.length);
-    $("#runs-list").innerHTML = data.runs.map((run) => `<div class="log-row">
-      <strong>${escapeHtml(run.status)}</strong>
-      <span class="mono">${escapeHtml(run.finished_at ?? run.started_at ?? "--")}</span>
-      <div class="muted">${escapeHtml(run.message ?? "")}</div>
-    </div>`).join("");
+    $("#latest-service-logs").textContent = fmtNum(data.service_logs?.length ?? 0);
+    $("#service-logs-list").innerHTML = (data.service_logs ?? []).length
+      ? data.service_logs.map((log) => `<div class="log-row log-${escapeHtml(log.level)}">
+        <strong class="tag ${log.level === "error" ? "bad" : log.level === "warning" ? "warn" : "good"}">${escapeHtml(log.level)}</strong>
+        <span class="mono">${escapeHtml(fmtDateTime(log.created_at))}</span>
+        <span class="muted">${escapeHtml(log.category)}</span>
+        <div>${escapeHtml(log.message)}</div>
+      </div>`).join("")
+      : `<div class="empty-state">暂无系统日志。触发刷新、保存设置或测试连接后会出现在这里。</div>`;
+    $("#runs-list").innerHTML = data.runs.length
+      ? data.runs.map((run) => `<div class="log-row">
+        <strong>${escapeHtml(run.status)}</strong>
+        <span class="mono">${escapeHtml(fmtDateTime(run.finished_at ?? run.started_at))}</span>
+        <div class="muted">${escapeHtml(run.message ?? "")}</div>
+      </div>`).join("")
+      : `<div class="empty-state">暂无采集运行记录。</div>`;
+    $("#run-errors-list").innerHTML = data.errors.length
+      ? data.errors.slice(0, 20).map((error) => `<div class="log-row">
+        <strong class="tag bad">${escapeHtml(error.error_type)}</strong>
+        <span class="mono">${escapeHtml(fmtDateTime(error.created_at))}</span>
+        <span class="muted">${escapeHtml(error.stage)} ${escapeHtml(error.symbol ?? "")}</span>
+        <div>${escapeHtml(error.message)}</div>
+      </div>`).join("")
+      : `<div class="empty-state">暂无采集异常。</div>`;
   } catch {
+    $("#service-logs-list").innerHTML = `<div class="notice">系统日志暂不可用。</div>`;
     $("#runs-list").innerHTML = `<div class="notice">采集日志暂不可用。</div>`;
   }
 }

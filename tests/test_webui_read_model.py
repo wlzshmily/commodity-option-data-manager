@@ -179,3 +179,19 @@ def test_empty_quote_source_time_is_not_displayed_as_market_time() -> None:
     assert overview["summary"]["option_quote_rows"] == 0
     assert row["quote_coverage"] == 0
     assert row["display_market_time"] is None
+
+
+def test_runs_include_service_logs() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    connection.execute(
+        """
+        INSERT INTO service_logs (created_at, level, category, message, context_json)
+        VALUES ('2026-05-09T00:00:00+00:00', 'info', 'collection', 'window started', '{}')
+        """
+    )
+
+    logs = read_model.runs()["service_logs"]
+
+    assert logs[0]["category"] == "collection"
+    assert logs[0]["message"] == "window started"

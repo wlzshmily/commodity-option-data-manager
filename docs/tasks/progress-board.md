@@ -24,3 +24,4 @@
 - Overview time columns now distinguish exchange market time from collector update time.
 - Background collection wait cycles are configurable and default to one wait round.
 - WSL2 Ubuntu setup, documentation, and Linux secret protection.
+- Persistent service logs and WebUI diagnostics for API/settings/background refresh events.

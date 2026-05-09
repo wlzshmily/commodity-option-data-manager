@@ -14,6 +14,7 @@ from option_data_manager.instruments import InstrumentRepository
 from option_data_manager.klines import KlineRepository
 from option_data_manager.option_metrics import OptionMetricsRepository
 from option_data_manager.quotes import QuoteRepository
+from option_data_manager.service_state import ServiceLogRepository
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,11 @@ class WebuiReadModel:
         ]
         for error in errors:
             error["retryable"] = bool(error["retryable"])
-        return {"runs": runs, "errors": errors}
+        service_logs = [
+            log.__dict__
+            for log in ServiceLogRepository(self.connection).list_logs(limit=limit)
+        ]
+        return {"runs": runs, "errors": errors, "service_logs": service_logs}
 
 
 def _ensure_tables(connection: sqlite3.Connection) -> None:
@@ -114,6 +119,7 @@ def _ensure_tables(connection: sqlite3.Connection) -> None:
     OptionMetricsRepository(connection)
     AcquisitionRepository(connection)
     CollectionStateRepository(connection)
+    ServiceLogRepository(connection)
 
 
 def _overview_totals(connection: sqlite3.Connection) -> dict[str, int]:

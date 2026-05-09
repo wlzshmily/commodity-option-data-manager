@@ -28,7 +28,7 @@ from option_data_manager.settings import (
     default_secret_protector,
 )
 from option_data_manager.source_quality import SourceQualityRepository
-from option_data_manager.service_state import ServiceStateRepository
+from option_data_manager.service_state import ServiceLogRepository, ServiceStateRepository
 from option_data_manager.tqsdk_connection import create_tqsdk_api_with_retries
 from option_data_manager.webui.read_model import WebuiReadModel
 
@@ -117,6 +117,7 @@ def create_app(
     settings = SettingsRepository(connection, protector or _default_protector())
     api_keys = ApiKeyRepository(connection)
     service_state = ServiceStateRepository(connection)
+    service_logs = ServiceLogRepository(connection)
     read_model = WebuiReadModel(connection)
     refresh_lock = threading.Lock()
     refresh_worker: dict[str, threading.Thread | None] = {"thread": None}
@@ -132,7 +133,27 @@ def create_app(
     @app.middleware("http")
     async def record_metrics(request: Request, call_next: Any) -> Any:
         started = time.perf_counter()
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            if request.url.path.startswith("/api/"):
+                service_state.record_request(
+                    path=request.url.path,
+                    method=request.method,
+                    status_code=500,
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                )
+                service_logs.append(
+                    level="error",
+                    category="api",
+                    message="Unhandled API request error.",
+                    context={
+                        "path": request.url.path,
+                        "method": request.method,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+            raise
         if request.url.path.startswith("/api/"):
             service_state.record_request(
                 path=request.url.path,
@@ -140,6 +161,17 @@ def create_app(
                 status_code=response.status_code,
                 latency_ms=(time.perf_counter() - started) * 1000,
             )
+            if response.status_code >= 500:
+                service_logs.append(
+                    level="error",
+                    category="api",
+                    message="API request returned a server error.",
+                    context={
+                        "path": request.url.path,
+                        "method": request.method,
+                        "status_code": response.status_code,
+                    },
+                )
         return response
 
     def require_auth(
@@ -209,6 +241,14 @@ def create_app(
         with refresh_lock:
             worker = refresh_worker.get("thread")
             if worker is not None and worker.is_alive():
+                service_logs.append(
+                    level="info",
+                    category="collection",
+                    message=(
+                        "Refresh trigger ignored because a background refresh "
+                        "is already running."
+                    ),
+                )
                 return RefreshResponse(
                     status="running",
                     report_path=str(report_path),
@@ -224,6 +264,12 @@ def create_app(
             service_state.set_value("collection.refresh_started_at", started_at)
             service_state.set_value("collection.refresh_finished_at", None)
             service_state.set_value("collection.refresh_message", "Background refresh started.")
+            service_logs.append(
+                level="info",
+                category="collection",
+                message="Background refresh started.",
+                context={"report_path": str(report_path)},
+            )
             worker = threading.Thread(
                 target=_run_refresh_until_complete,
                 kwargs={
@@ -347,6 +393,17 @@ def create_app(
         ).fetchall()
         return [dict(row) for row in rows]
 
+    @app.get("/api/logs")
+    def service_log_entries(
+        limit: int = Query(default=100, ge=1, le=500),
+        category: str | None = None,
+        _: ApiKeyRecord | None = Depends(require_auth),
+    ) -> list[dict[str, Any]]:
+        return [
+            record.__dict__
+            for record in service_logs.list_logs(limit=limit, category=category)
+        ]
+
     @app.get("/api/settings")
     def get_settings(_: ApiKeyRecord | None = Depends(require_auth)) -> dict[str, Any]:
         account = settings.get_value(TQSDK_ACCOUNT_KEY)
@@ -389,6 +446,12 @@ def create_app(
             raise HTTPException(status_code=400, detail="TQSDK password must not be empty.")
         settings.set_value(TQSDK_ACCOUNT_KEY, account)
         settings.set_secret(TQSDK_PASSWORD_KEY, payload.password)
+        service_logs.append(
+            level="info",
+            category="settings",
+            message="TQSDK credentials updated.",
+            context={"account_configured": True, "password_configured": True},
+        )
         return {"account": account, "password_configured": True}
 
     @app.post("/api/settings/test-tqsdk-connection")
@@ -396,8 +459,18 @@ def create_app(
         account = settings.get_value(TQSDK_ACCOUNT_KEY)
         password = settings.get_secret(TQSDK_PASSWORD_KEY)
         if not account or not password:
+            service_logs.append(
+                level="warning",
+                category="settings",
+                message="TQSDK connection test blocked because credentials are missing.",
+            )
             return {"status": "blocked", "message": "TQSDK credentials are not configured."}
         if os.environ.get("ODM_ENABLE_TQSDK_CONNECTION_TEST") != "1":
+            service_logs.append(
+                level="info",
+                category="settings",
+                message="TQSDK connection test skipped by local safety setting.",
+            )
             return {
                 "status": "skipped",
                 "message": (
@@ -409,7 +482,18 @@ def create_app(
             api = create_tqsdk_api_with_retries(account, password)
             api.close()
         except Exception as exc:
+            service_logs.append(
+                level="error",
+                category="settings",
+                message="TQSDK connection test failed.",
+                context={"error_type": type(exc).__name__},
+            )
             return {"status": "failed", "message": f"{type(exc).__name__}: {exc}"}
+        service_logs.append(
+            level="info",
+            category="settings",
+            message="TQSDK connection test completed.",
+        )
         return {"status": "ok", "message": "TQSDK connection test completed."}
 
     @app.put("/api/settings/{key}")
@@ -421,6 +505,12 @@ def create_app(
         if key in {TQSDK_PASSWORD_KEY, "password", "secret"}:
             raise HTTPException(status_code=400, detail="Use the credential endpoint for secrets.")
         settings.set_value(key, payload.value)
+        service_logs.append(
+            level="info",
+            category="settings",
+            message="Runtime setting updated.",
+            context={"key": key},
+        )
         return {"key": key, "updated": True}
 
     @app.get("/api/api-keys", response_model=list[ApiKeyResponse])
@@ -433,6 +523,16 @@ def create_app(
         _: ApiKeyRecord | None = Depends(require_auth),
     ) -> ApiKeyCreatedResponse:
         created = api_keys.create_key(name=payload.name, scope=payload.scope)
+        service_logs.append(
+            level="info",
+            category="security",
+            message="Local API key created.",
+            context={
+                "key_id": created.record.key_id,
+                "name": payload.name,
+                "scope": payload.scope,
+            },
+        )
         return ApiKeyCreatedResponse(
             **created.record.__dict__,
             secret=created.secret,
@@ -499,6 +599,7 @@ def _ensure_runtime_tables(connection: sqlite3.Connection, *, protector: Any | N
     SettingsRepository(connection, protector or _default_protector())
     ApiKeyRepository(connection)
     ServiceStateRepository(connection)
+    ServiceLogRepository(connection)
 
 
 def _default_protector() -> Any:
@@ -561,6 +662,7 @@ def _run_refresh_until_complete(
     state_connection = sqlite3.connect(database_path, check_same_thread=False)
     state_connection.row_factory = sqlite3.Row
     state = ServiceStateRepository(state_connection)
+    logs = ServiceLogRepository(state_connection)
     stalled_windows = 0
     previous_remaining: int | None = None
     window_count = 0
@@ -572,12 +674,25 @@ def _run_refresh_until_complete(
                 "collection.refresh_message",
                 f"Collecting window {window_count}.",
             )
+            logs.append(
+                level="info",
+                category="collection",
+                message="Collection refresh window started.",
+                context={"window_count": window_count},
+            )
             exit_code = collect_main(args)
             state.set_value("collection.last_refresh_exit_code", str(exit_code))
             if exit_code != 0:
+                message = _refresh_failure_message(exit_code)
                 state.set_value(
                     "collection.refresh_message",
-                    _refresh_failure_message(exit_code),
+                    message,
+                )
+                logs.append(
+                    level="error",
+                    category="collection",
+                    message=message,
+                    context={"window_count": window_count, "exit_code": exit_code},
                 )
                 break
             progress = WebuiReadModel(state_connection).overview(limit=1)["collection"]
@@ -585,15 +700,24 @@ def _run_refresh_until_complete(
             remaining_batches = int(progress["remaining_batches"])
             state.set_value("collection.refresh_remaining_batches", str(remaining_batches))
             if active_batches == 0:
+                message = "Refresh stopped because no active collection plan exists."
                 state.set_value(
                     "collection.refresh_message",
-                    "Refresh stopped because no active collection plan exists.",
+                    message,
                 )
+                logs.append(level="warning", category="collection", message=message)
                 break
             if remaining_batches == 0:
+                message = "Full-market refresh completed."
                 state.set_value(
                     "collection.refresh_message",
-                    "Full-market refresh completed.",
+                    message,
+                )
+                logs.append(
+                    level="info",
+                    category="collection",
+                    message=message,
+                    context={"window_count": window_count},
                 )
                 break
             if previous_remaining is not None and remaining_batches >= previous_remaining:
@@ -602,16 +726,33 @@ def _run_refresh_until_complete(
                 stalled_windows = 0
             previous_remaining = remaining_batches
             if stalled_windows >= 3:
+                message = "Refresh paused after three windows without progress."
                 state.set_value(
                     "collection.refresh_message",
-                    "Refresh paused after three windows without progress.",
+                    message,
+                )
+                logs.append(
+                    level="warning",
+                    category="collection",
+                    message=message,
+                    context={
+                        "window_count": window_count,
+                        "remaining_batches": remaining_batches,
+                    },
                 )
                 break
     except Exception as exc:
         state.set_value("collection.last_refresh_exit_code", "1")
+        message = f"Refresh failed: {type(exc).__name__}: {exc}"
         state.set_value(
             "collection.refresh_message",
-            f"Refresh failed: {type(exc).__name__}: {exc}",
+            message,
+        )
+        logs.append(
+            level="error",
+            category="collection",
+            message=message,
+            context={"error_type": type(exc).__name__},
         )
     finally:
         state.set_value("collection.refresh_running", "false")

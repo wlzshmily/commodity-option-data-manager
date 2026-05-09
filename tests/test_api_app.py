@@ -55,3 +55,20 @@ def test_saving_tqsdk_credentials_masks_password_in_settings() -> None:
     settings = client.get("/api/settings").json()
     assert settings["tqsdk"] == {"account": "demo", "password_configured": True}
     assert "super-secret" not in str(settings)
+
+
+def test_service_logs_capture_safe_settings_events() -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    client = TestClient(app)
+
+    response = client.put(
+        "/api/settings/tqsdk-credentials",
+        json={"account": "demo", "password": "super-secret"},
+    )
+    logs = client.get("/api/logs").json()
+
+    assert response.status_code == 200
+    assert logs[0]["category"] == "settings"
+    assert logs[0]["message"] == "TQSDK credentials updated."
+    assert "super-secret" not in str(logs)
