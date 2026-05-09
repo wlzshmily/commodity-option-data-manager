@@ -82,20 +82,23 @@ def test_underlying_rows_expose_market_time_separately_from_received_at() -> Non
             symbol,
             source_datetime,
             received_at,
+            bid_price1,
             raw_payload_json
         )
-        VALUES (?, ?, ?, '{}')
+        VALUES (?, ?, ?, ?, '{}')
         """,
         [
             (
                 "SHFE.cu2606",
                 "2026-05-08 22:59:59.000000",
                 "2026-05-08T16:25:24+00:00",
+                70100,
             ),
             (
                 "SHFE.cu2606C70000",
                 "2026-05-08 22:59:58.000000",
                 "2026-05-08T16:25:24+00:00",
+                100,
             ),
         ],
     )
@@ -116,3 +119,63 @@ def test_underlying_rows_expose_market_time_separately_from_received_at() -> Non
     assert row["latest_update"] == "2026-05-08T16:25:24+00:00"
     assert row["display_market_time"] == "2026-05-08 22:59:59.000000"
     assert row["display_kline_time"] is not None
+
+
+def test_empty_quote_source_time_is_not_displayed_as_market_time() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    connection.executemany(
+        """
+        INSERT INTO instruments (
+            symbol,
+            exchange_id,
+            product_id,
+            instrument_id,
+            instrument_name,
+            ins_class,
+            underlying_symbol,
+            option_class,
+            strike_price,
+            expire_datetime,
+            price_tick,
+            volume_multiple,
+            expired,
+            active,
+            inactive_reason,
+            last_seen_at,
+            raw_payload_json
+        )
+        VALUES (?, 'CZCE', 'AP', ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, 0, 1, NULL, '2026-05-08T00:00:00+00:00', '{}')
+        """,
+        [
+            ("CZCE.AP610", "AP610", "FUTURE", None, None, None),
+            ("CZCE.AP610C6500", "AP610C6500", "OPTION", "CZCE.AP610", "CALL", 6500),
+        ],
+    )
+    connection.executemany(
+        """
+        INSERT INTO quote_current (
+            symbol,
+            source_datetime,
+            received_at,
+            volume,
+            raw_payload_json
+        )
+        VALUES (?, ?, ?, 0, '{}')
+        """,
+        [
+            ("CZCE.AP610", "2026-05-08 19:05:00.000000", "2026-05-09T06:38:36+00:00"),
+            (
+                "CZCE.AP610C6500",
+                "2026-05-08 19:05:00.000000",
+                "2026-05-09T06:38:02+00:00",
+            ),
+        ],
+    )
+
+    overview = read_model.overview()
+    row = overview["underlyings"][0]
+
+    assert overview["summary"]["option_quote_rows"] == 0
+    assert row["quote_coverage"] == 0
+    assert row["display_market_time"] is None

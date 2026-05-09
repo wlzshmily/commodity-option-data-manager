@@ -127,11 +127,12 @@ def _overview_totals(connection: sqlite3.Connection) -> dict[str, int]:
     )
     option_quote_rows = _scalar(
         connection,
-        """
+        f"""
         SELECT COUNT(*)
         FROM instruments i
         JOIN quote_current q ON q.symbol = i.symbol
         WHERE i.active = 1 AND i.option_class IN ('CALL', 'PUT')
+          AND {_quote_has_market_data_sql("q")}
         """,
     )
     option_kline_symbols = _scalar(
@@ -276,7 +277,7 @@ def _collection_failures(
 
 def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict[str, Any]]:
     rows = connection.execute(
-        """
+        f"""
         WITH option_counts AS (
             SELECT
                 underlying_symbol,
@@ -292,12 +293,16 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
         coverage AS (
             SELECT
                 i.underlying_symbol,
-                COUNT(DISTINCT q.symbol) AS quote_count,
+                COUNT(DISTINCT CASE
+                    WHEN {_quote_has_market_data_sql("q")} THEN q.symbol
+                END) AS quote_count,
                 COUNT(DISTINCT m.symbol) AS metrics_count,
                 COUNT(DISTINCT CASE WHEN m.iv IS NOT NULL THEN m.symbol END) AS iv_count,
                 COUNT(DISTINCT k.symbol) AS kline_count,
                 MAX(COALESCE(q.received_at, m.received_at, k.received_at)) AS latest_update,
-                MAX(q.source_datetime) AS latest_quote_time,
+                MAX(CASE
+                    WHEN {_quote_has_market_data_sql("q")} THEN q.source_datetime
+                END) AS latest_quote_time,
                 MAX(k.bar_datetime) AS latest_kline_time
             FROM instruments i
             LEFT JOIN quote_current q ON q.symbol = i.symbol
@@ -307,8 +312,12 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
             GROUP BY i.underlying_symbol
         ),
         underlying_quote AS (
-            SELECT symbol, source_datetime, received_at, last_price
-            FROM quote_current
+            SELECT
+                q.symbol,
+                CASE WHEN {_quote_has_market_data_sql("q")} THEN q.source_datetime END AS source_datetime,
+                q.received_at,
+                q.last_price
+            FROM quote_current q
         )
         SELECT
             oc.underlying_symbol,
@@ -361,7 +370,7 @@ def _format_underlying_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def _exchange_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = connection.execute(
-        """
+        f"""
         WITH options AS (
             SELECT *
             FROM instruments
@@ -372,7 +381,7 @@ def _exchange_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
             COUNT(DISTINCT o.product_id) AS product_count,
             COUNT(DISTINCT o.underlying_symbol) AS underlying_count,
             COUNT(*) AS option_count,
-            COUNT(q.symbol) AS quote_count,
+            COUNT(CASE WHEN {_quote_has_market_data_sql("q")} THEN q.symbol END) AS quote_count,
             COUNT(m.symbol) AS metrics_count,
             SUM(CASE WHEN m.iv IS NOT NULL THEN 1 ELSE 0 END) AS iv_count
         FROM options o
@@ -394,13 +403,13 @@ def _exchange_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
 
 def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str, Any]:
     row = connection.execute(
-        """
+        f"""
         SELECT
             i.symbol,
             i.exchange_id,
             i.product_id,
             i.instrument_id,
-            q.source_datetime,
+            CASE WHEN {_quote_has_market_data_sql("q")} THEN q.source_datetime END AS source_datetime,
             q.received_at,
             COALESCE(q.last_price, k.last_kline_close_price) AS last_price,
             q.ask_price1,
@@ -443,7 +452,7 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
 
 def _option_rows(connection: sqlite3.Connection, underlying_symbol: str) -> list[dict[str, Any]]:
     rows = connection.execute(
-        """
+        f"""
         SELECT
             i.symbol,
             i.option_class,
@@ -455,7 +464,7 @@ def _option_rows(connection: sqlite3.Connection, underlying_symbol: str) -> list
             q.ask_volume1,
             COALESCE(NULLIF(q.volume, 0), k.volume, q.volume) AS volume,
             q.open_interest,
-            q.source_datetime,
+            CASE WHEN {_quote_has_market_data_sql("q")} THEN q.source_datetime END AS source_datetime,
             q.received_at AS quote_received_at,
             k.bar_datetime AS last_kline_bar_datetime,
             k.close_price AS last_kline_close_price,
@@ -489,6 +498,16 @@ def _option_rows(connection: sqlite3.Connection, underlying_symbol: str) -> list
         (underlying_symbol,),
     ).fetchall()
     return [_row_dict(row) for row in rows]
+
+
+def _quote_has_market_data_sql(alias: str) -> str:
+    return (
+        f"({alias}.last_price IS NOT NULL "
+        f"OR {alias}.ask_price1 IS NOT NULL "
+        f"OR {alias}.bid_price1 IS NOT NULL "
+        f"OR {alias}.close_price IS NOT NULL "
+        f"OR {alias}.average_price IS NOT NULL)"
+    )
 
 
 def _strike_rows(option_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
