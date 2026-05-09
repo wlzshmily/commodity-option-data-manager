@@ -40,6 +40,35 @@ REFRESH_INTERVAL_KEY = "collection.refresh_interval_seconds"
 OPTION_BATCH_SIZE_KEY = "collection.option_batch_size"
 WAIT_CYCLES_KEY = "collection.wait_cycles"
 DEFAULT_BACKGROUND_MAX_BATCHES = "100"
+SAFE_RUNTIME_SETTING_KEYS = frozenset(
+    {
+        API_AUTH_REQUIRED_KEY,
+        API_BIND_KEY,
+        API_PORT_KEY,
+        REFRESH_INTERVAL_KEY,
+        OPTION_BATCH_SIZE_KEY,
+        WAIT_CYCLES_KEY,
+        "collection.max_underlyings",
+        "collection.max_batches",
+        "collection.auto_retry",
+        "collection.kline_backfill",
+        "collection.inactive_handling",
+    }
+)
+BOOLEAN_SETTING_KEYS = frozenset(
+    {API_AUTH_REQUIRED_KEY, "collection.auto_retry", "collection.kline_backfill"}
+)
+POSITIVE_INTEGER_SETTING_KEYS = frozenset(
+    {
+        API_PORT_KEY,
+        REFRESH_INTERVAL_KEY,
+        OPTION_BATCH_SIZE_KEY,
+        "collection.max_underlyings",
+        "collection.max_batches",
+    }
+)
+NON_NEGATIVE_INTEGER_SETTING_KEYS = frozenset({WAIT_CYCLES_KEY})
+INACTIVE_HANDLING_VALUES = frozenset({"mark_inactive", "exclude", "keep"})
 
 
 class TqsdkCredentialUpdate(BaseModel):
@@ -416,10 +445,12 @@ def create_app(
         payload: SettingUpdate,
         _: ApiKeyRecord | None = Depends(require_auth),
     ) -> dict[str, Any]:
-        if key in {TQSDK_PASSWORD_KEY, "password", "secret"}:
-            raise HTTPException(status_code=400, detail="Use the credential endpoint for secrets.")
-        settings.set_value(key, payload.value)
-        return {"key": key, "updated": True}
+        try:
+            cleaned_value = _validate_safe_setting_update(key, payload.value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        settings.set_value(key, cleaned_value)
+        return {"key": key, "value": cleaned_value, "updated": True}
 
     @app.get("/api/api-keys", response_model=list[ApiKeyResponse])
     def list_api_keys(_: ApiKeyRecord | None = Depends(require_auth)) -> list[ApiKeyResponse]:
@@ -520,6 +551,50 @@ def _extract_api_key(authorization: str | None, x_api_key: str | None) -> str | 
     if authorization and authorization.lower().startswith("bearer "):
         return authorization[7:].strip()
     return None
+
+
+def _validate_safe_setting_update(key: str, value: str) -> str:
+    """Validate user-editable runtime settings before they are persisted."""
+
+    if key not in SAFE_RUNTIME_SETTING_KEYS:
+        raise ValueError("Unsupported or unsafe setting key.")
+    cleaned = value.strip()
+    if key in BOOLEAN_SETTING_KEYS:
+        lowered = cleaned.lower()
+        if lowered not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+            raise ValueError("Boolean settings must be true or false.")
+        return "true" if lowered in {"1", "true", "yes", "on"} else "false"
+    if key in POSITIVE_INTEGER_SETTING_KEYS:
+        number = _parse_int_setting(cleaned, minimum=1)
+        if key == API_PORT_KEY and number > 65535:
+            raise ValueError("API port must be between 1 and 65535.")
+        return str(number)
+    if key in NON_NEGATIVE_INTEGER_SETTING_KEYS:
+        return str(_parse_int_setting(cleaned, minimum=0))
+    if key == API_BIND_KEY:
+        if not cleaned:
+            raise ValueError("API bind address must not be empty.")
+        if any(character.isspace() for character in cleaned):
+            raise ValueError("API bind address must not contain whitespace.")
+        return cleaned
+    if key == "collection.inactive_handling":
+        lowered = cleaned.lower()
+        if lowered not in INACTIVE_HANDLING_VALUES:
+            raise ValueError("Inactive handling must be mark_inactive, exclude, or keep.")
+        return lowered
+    return cleaned
+
+
+def _parse_int_setting(value: str, *, minimum: int) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise ValueError("Numeric settings must be whole numbers.") from exc
+    if number < minimum:
+        if minimum == 0:
+            raise ValueError("Numeric setting must be zero or greater.")
+        raise ValueError("Numeric setting must be greater than zero.")
+    return number
 
 
 def _api_key_response(record: ApiKeyRecord) -> ApiKeyResponse:

@@ -23,3 +23,5 @@
 - Metric-only Greeks/IV gaps are treated as visible quality gaps instead of batch blockers.
 - Overview time columns now distinguish exchange market time from collector update time.
 - Background collection wait cycles are configurable and default to one wait round.
+- Runtime settings updates are allowlisted and validated before persistence.
+- WebUI can store a local browser API Key and automatically attach it to API requests after auth enforcement is enabled.

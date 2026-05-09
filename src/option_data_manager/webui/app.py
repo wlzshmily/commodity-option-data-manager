@@ -317,7 +317,9 @@ INDEX_HTML = """<!doctype html>
             <div class="settings-grid">
               <label>名称<input class="form-control form-control-sm" id="api-key-name" placeholder="local-monitor" /></label>
               <label>Scope<input class="form-control form-control-sm" id="api-key-scope" value="read" /></label>
+              <label>当前浏览器 API Key<input class="form-control form-control-sm" id="api-key-secret" type="password" autocomplete="off" placeholder="粘贴已创建的 Key" /></label>
               <button class="btn btn-sm btn-primary" type="button" id="create-api-key">创建 Key</button>
+              <button class="btn btn-sm btn-light" type="button" id="save-browser-api-key">保存到浏览器</button>
             </div>
             <div class="table-responsive table-shell mt-3">
               <table class="table table-sm align-middle summary-table">
@@ -779,8 +781,13 @@ function symbolParts(symbol) {
   return { exchange, product, productName: productNames[product] ?? product, expiry };
 }
 
+function apiAuthHeaders() {
+  const secret = window.localStorage.getItem("odm_api_key") ?? "";
+  return secret ? { Authorization: `Bearer ${secret}` } : {};
+}
+
 async function fetchJson(url) {
-  const response = await fetch(url);
+  const response = await fetch(url, { headers: apiAuthHeaders() });
   if (!response.ok) throw new Error(`${url} ${response.status}`);
   return response.json();
 }
@@ -850,10 +857,12 @@ function bindControls() {
   $("#save-runtime-settings").addEventListener("click", saveRuntimeSettings);
   $("#trigger-refresh").addEventListener("click", triggerRefresh);
   $("#create-api-key").addEventListener("click", createApiKey);
+  $("#save-browser-api-key").addEventListener("click", saveBrowserApiKey);
 }
 
 async function loadSettings() {
   try {
+    $("#api-key-secret").value = window.localStorage.getItem("odm_api_key") ?? "";
     const settings = await fetchJson("/api/settings");
     $("#setting-account").value = settings.tqsdk.account ?? "";
     $("#setting-api-bind").value = settings.api.bind ?? "127.0.0.1";
@@ -928,14 +937,27 @@ async function createApiKey() {
     return;
   }
   const created = await fetchJsonWithBody("/api/api-keys", "POST", { name, scope });
-  $("#settings-message").textContent = `新 API Key：${created.secret}`;
+  $("#api-key-secret").value = created.secret;
+  window.localStorage.setItem("odm_api_key", created.secret);
+  $("#settings-message").textContent = `新 API Key 已保存到当前浏览器：${created.secret}`;
   await loadApiKeys();
+}
+
+function saveBrowserApiKey() {
+  const secret = $("#api-key-secret").value.trim();
+  if (!secret) {
+    window.localStorage.removeItem("odm_api_key");
+    $("#settings-message").textContent = "已清除当前浏览器保存的 API Key。";
+    return;
+  }
+  window.localStorage.setItem("odm_api_key", secret);
+  $("#settings-message").textContent = "当前浏览器 API Key 已保存，后续请求会自动带 Authorization 头。";
 }
 
 async function fetchJsonWithBody(url, method, body) {
   const response = await fetch(url, {
     method,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...apiAuthHeaders() },
     body: JSON.stringify(body),
   });
   if (!response.ok) throw new Error(`${url} ${response.status}`);
