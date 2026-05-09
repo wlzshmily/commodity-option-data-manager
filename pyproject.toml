@@ -3,7 +3,7 @@ name = "option-data-manager"
 version = "0.1.0"
 description = "Local current-slice data manager for China commodity options."
 readme = "项目需求文档.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "cryptography>=46.0.3",
     "fastapi>=0.136.1",

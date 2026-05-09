@@ -24,6 +24,7 @@ bash scripts/setup-wsl-ubuntu.sh
 ```
 
 The script checks Python 3.11+, verifies `uv`, runs `uv sync --dev`, creates runtime folders, and creates `.env` from `.env.example` when missing.
+The project is pinned to Python 3.11 through `.python-version`; this avoids TQSDK/requests TLS issues observed with Ubuntu 26.04's default Python 3.14.
 
 Install `uv` in Ubuntu when needed:
 
@@ -72,6 +73,7 @@ http://127.0.0.1:8765/
 ## Verification
 
 ```bash
+uv run python --version  # should be Python 3.11.x
 uv run pytest -q
 uv run python -m compileall -q src tests option_data_manager
 bash scripts/agentic-sdlc/check-agentic-sdlc.sh

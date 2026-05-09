@@ -33,15 +33,6 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! python3 - <<'PY' >/dev/null 2>&1
-import sys
-raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
-PY
-then
-  echo "Python 3.11+ is required." >&2
-  exit 1
-fi
-
 if ! command -v uv >/dev/null 2>&1; then
   echo "uv is not installed. Install it in Ubuntu with:"
   echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"
@@ -52,7 +43,8 @@ mkdir -p data docs/qa/live-evidence docs/qa/sdk-contract-reports
 mkdir -p "${HOME}/.config/option-data-manager"
 chmod 700 "${HOME}/.config/option-data-manager" || true
 
-uv sync --dev
+uv python install 3.11
+uv sync --dev --python 3.11
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
