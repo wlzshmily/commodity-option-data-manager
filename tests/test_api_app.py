@@ -141,3 +141,75 @@ def test_quote_stream_start_blocks_without_credentials() -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "blocked"
     assert response.json()["running"] is False
+
+
+def test_api_key_can_be_deleted() -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    client = TestClient(app)
+    created = client.post("/api/api-keys", json={"name": "monitor"}).json()
+
+    response = client.delete(f"/api/api-keys/{created['key_id']}")
+
+    assert response.status_code == 200
+    assert response.json() == {"key_id": created["key_id"], "deleted": True}
+    assert client.get("/api/api-keys").json() == []
+
+
+def test_options_api_exposes_tqsdk_date_fields_and_derived_days() -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    client = TestClient(app)
+    connection.execute(
+        """
+        INSERT INTO instruments (
+            symbol,
+            exchange_id,
+            product_id,
+            instrument_id,
+            instrument_name,
+            ins_class,
+            underlying_symbol,
+            option_class,
+            strike_price,
+            expire_datetime,
+            last_exercise_datetime,
+            price_tick,
+            volume_multiple,
+            expired,
+            active,
+            inactive_reason,
+            last_seen_at,
+            raw_payload_json
+        )
+        VALUES (
+            'SHFE.cu2606C70000',
+            'SHFE',
+            'cu',
+            'cu2606C70000',
+            NULL,
+            'OPTION',
+            'SHFE.cu2606',
+            'CALL',
+            70000,
+            '2026-06-10',
+            '2026-06-09',
+            NULL,
+            NULL,
+            0,
+            1,
+            NULL,
+            '2026-05-08T00:00:00+00:00',
+            '{}'
+        )
+        """
+    )
+
+    row = client.get("/api/options?underlying=SHFE.cu2606").json()[0]
+
+    assert row["expire_datetime"] == "2026-06-10"
+    assert row["last_exercise_datetime"] == "2026-06-09"
+    assert "expire_date" not in row
+    assert "days_to_expiry" not in row
+    assert "days_to_expire_datetime" in row
+    assert "days_to_last_exercise_datetime" in row

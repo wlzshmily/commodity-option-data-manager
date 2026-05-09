@@ -39,3 +39,4 @@
 - Final verification rerun passed: `uv run pytest -q` passed 41 tests, compileall, agentic-SDLC check, and real runtime API/WebUI smoke.
 - WebUI/API quote stream controls delivered: operators can start, stop, and inspect quote-only worker shards from the settings page through `/api/quote-stream`.
 - Live quote stream control smoke passed and left no running worker process.
+- Local acceptance UI polish delivered for settings and overview pages, including clearer progress/status messaging, fixed table widths, Chinese product labels, API Key copy/delete/full fingerprint display, and TQSDK same-name date fields exposed through API payloads.

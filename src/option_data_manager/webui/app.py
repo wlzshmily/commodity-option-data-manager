@@ -222,12 +222,12 @@ INDEX_HTML = """<!doctype html>
             <div class="exchange-cards" id="exchange-cards"></div>
           </section>
 
-          <section class="panel card">
+          <section class="panel card collection-panel">
             <div class="panel-header">
               <div><span class="panel-title">采集分片进度</span><span class="panel-note">手动刷新会按分片窗口推进，失败分片会保留以便后续重试。</span></div>
             </div>
             <div class="progress-cards" id="collection-progress"></div>
-            <div class="notice d-none mt-3" id="collection-failures"></div>
+            <div class="collection-failures notice warn mt-3" id="collection-failures" hidden></div>
           </section>
 
           <section class="panel card">
@@ -239,7 +239,8 @@ INDEX_HTML = """<!doctype html>
               </div>
             </div>
             <div class="table-responsive table-shell">
-              <table class="table table-sm align-middle summary-table">
+              <table class="table table-sm align-middle summary-table underlying-table">
+                <colgroup><col class="underlying-exchange"><col class="underlying-product"><col class="underlying-symbol"><col class="underlying-expiry"><col class="underlying-count"><col class="underlying-count"><col class="underlying-ratio"><col class="underlying-ratio"><col class="underlying-kline"><col class="underlying-time"><col class="underlying-status"><col class="underlying-action"></colgroup>
                 <thead><tr><th>交易所</th><th>品种</th><th>标的合约</th><th>到期月</th><th>CALL</th><th>PUT</th><th>Quote</th><th>Greeks/IV</th><th>20D K线</th><th>行情时间</th><th>状态</th><th>操作</th></tr></thead>
                 <tbody id="underlying-rows"></tbody>
               </table>
@@ -324,8 +325,10 @@ INDEX_HTML = """<!doctype html>
               <label>等待轮数<input class="form-control form-control-sm" id="setting-wait-cycles" type="number" min="0" /></label>
               <label>后台窗口分片<input class="form-control form-control-sm" id="setting-max-batches" type="number" min="1" /></label>
               <label class="checkline"><input class="form-check-input" id="setting-auth-required" type="checkbox" /> 强制 API Key</label>
-              <button class="btn btn-sm btn-primary" type="button" id="save-runtime-settings">保存运行设置</button>
-              <button class="btn btn-sm btn-warning" type="button" id="trigger-refresh">手动刷新</button>
+              <div class="settings-actions">
+                <button class="btn btn-sm btn-primary" type="button" id="save-runtime-settings">保存运行设置</button>
+                <button class="btn btn-sm btn-warning" type="button" id="trigger-refresh">手动刷新</button>
+              </div>
             </div>
           </section>
           <section class="panel card">
@@ -334,8 +337,10 @@ INDEX_HTML = """<!doctype html>
               <label>Worker 数<select class="form-select form-select-sm" id="setting-quote-workers"><option value="1">1 个 worker</option><option value="2">2 个 worker</option><option value="3">3 个 worker</option><option value="4">4 个 worker</option></select></label>
               <label>订阅分片大小<input class="form-control form-control-sm" id="setting-quote-shard-size" type="number" min="1" /></label>
               <label>最大 symbols<input class="form-control form-control-sm" id="setting-quote-max-symbols" type="number" min="1" placeholder="留空为全量" /></label>
-              <button class="btn btn-sm btn-primary" type="button" id="start-quote-stream">启动实时订阅</button>
-              <button class="btn btn-sm btn-light" type="button" id="stop-quote-stream">停止实时订阅</button>
+              <div class="settings-actions">
+                <button class="btn btn-sm btn-primary" type="button" id="start-quote-stream">启动实时订阅</button>
+                <button class="btn btn-sm btn-light" type="button" id="stop-quote-stream">停止实时订阅</button>
+              </div>
             </div>
             <div class="notice mt-3" id="quote-stream-message">实时订阅状态加载中。</div>
           </section>
@@ -343,12 +348,14 @@ INDEX_HTML = """<!doctype html>
             <div class="panel-header"><span class="panel-title">API Key</span><span class="panel-note">完整 Key 只在创建时显示。</span></div>
             <div class="settings-grid">
               <label>名称<input class="form-control form-control-sm" id="api-key-name" placeholder="local-monitor" /></label>
-              <label>Scope<input class="form-control form-control-sm" id="api-key-scope" value="read" /></label>
+              <label>权限范围<select class="form-select form-select-sm" id="api-key-scope"><option value="read">只读访问</option></select></label>
               <button class="btn btn-sm btn-primary" type="button" id="create-api-key">创建 Key</button>
             </div>
+            <div class="notice mt-3" id="api-key-message">API Key 创建后只显示一次完整密钥。</div>
             <div class="table-responsive table-shell mt-3">
-              <table class="table table-sm align-middle summary-table">
-                <thead><tr><th>ID</th><th>名称</th><th>指纹</th><th>Scope</th><th>状态</th><th>最后使用</th></tr></thead>
+              <table class="table table-sm align-middle summary-table api-key-table">
+                <colgroup><col class="api-key-id"><col class="api-key-name"><col class="api-key-fingerprint"><col class="api-key-scope"><col class="api-key-status"><col class="api-key-used"><col class="api-key-actions"></colgroup>
+                <thead><tr><th>ID</th><th>名称</th><th>指纹</th><th>权限范围</th><th>状态</th><th>最后使用</th><th>操作</th></tr></thead>
                 <tbody id="api-key-rows"></tbody>
               </table>
             </div>
@@ -513,24 +520,60 @@ body {
 .panel-title { font-size: 15px; font-weight: 800; }
 .panel-note { color: var(--muted); font-size: 12px; margin-left: 8px; }
 .exchange-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+.collection-panel {
+  margin-top: 22px;
+  margin-bottom: 20px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.collection-panel .panel-header {
+  margin-bottom: 10px;
+  padding: 0 2px;
+}
 .progress-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
 .settings-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(160px, 1fr));
-  gap: 12px;
+  gap: 14px 18px;
   align-items: end;
 }
 .settings-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
   color: var(--muted);
   font-size: 12px;
 }
+.settings-grid input,
+.settings-grid select {
+  min-height: 30px;
+}
+.settings-grid button {
+  min-height: 32px;
+}
+.settings-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+.settings-grid button:disabled,
+.settings-grid input:disabled,
+.settings-grid select:disabled {
+  cursor: not-allowed;
+  opacity: .58;
+}
 .settings-grid .checkline {
   display: flex;
+  flex-direction: row;
   align-items: center;
   gap: 8px;
   min-height: 32px;
   color: var(--ink);
 }
+.settings-grid + .notice,
+.settings-grid + .table-shell { margin-top: 18px; }
 .exchange-card {
   min-height: 74px;
   padding: 12px 14px;
@@ -547,15 +590,30 @@ body {
   border-radius: 4px;
   background: #fffdf8;
 }
+.progress-card.good {
+  border-color: rgba(59,143,143,.22);
+  background: #f4fbf1;
+}
+.progress-card.warn {
+  border-color: rgba(163,108,46,.24);
+  background: #fffaf0;
+}
+.progress-card.bad {
+  border-color: rgba(138,66,70,.28);
+  background: #fff3f4;
+}
 .progress-card span { display: block; color: var(--muted); font-size: 11px; font-weight: 800; }
 .progress-card strong { display: block; margin-top: 5px; font: 800 16px/1.2 var(--mono); color: var(--text); }
 .progress-card small { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; }
+.collection-failures[hidden] {
+  display: none !important;
+}
 .table-shell, .quote-table-wrap {
   border: 1px solid var(--line);
   border-radius: 4px;
   background: var(--panel);
 }
-.table { table-layout: fixed; margin: 0; }
+.table { width: 100%; table-layout: fixed; margin: 0; }
 .table th, .table td {
   height: 34px;
   padding: 0 10px;
@@ -569,6 +627,61 @@ body {
 .table td { color: var(--text); background: rgba(255, 253, 248, .98); }
 .summary-table tbody tr:nth-child(even) td { background: #f7fbf3; }
 .summary-table tbody tr.clickable:hover td { background: rgba(242, 198, 212, .22); }
+.summary-table .empty-row td {
+  height: 54px;
+  padding: 0 16px;
+  color: var(--muted);
+  text-align: center;
+  background: rgba(255, 253, 248, .78);
+  border-bottom: 0;
+}
+.underlying-table col.underlying-exchange { width: 7%; }
+.underlying-table col.underlying-product { width: 7%; }
+.underlying-table col.underlying-symbol { width: 15%; }
+.underlying-table col.underlying-expiry { width: 7%; }
+.underlying-table col.underlying-count { width: 6%; }
+.underlying-table col.underlying-ratio { width: 8%; }
+.underlying-table col.underlying-kline { width: 8%; }
+.underlying-table col.underlying-time { width: 13%; }
+.underlying-table col.underlying-status { width: 8%; }
+.underlying-table col.underlying-action { width: 7%; }
+.api-key-table {
+  border-collapse: separate;
+  border-spacing: 0;
+}
+.api-key-table col.api-key-id { width: 5%; }
+.api-key-table col.api-key-name { width: 11%; }
+.api-key-table col.api-key-fingerprint { width: 49%; }
+.api-key-table col.api-key-scope { width: 9%; }
+.api-key-table col.api-key-status { width: 7%; }
+.api-key-table col.api-key-used { width: 9%; }
+.api-key-table col.api-key-actions { width: 10%; }
+.api-key-table th,
+.api-key-table td {
+  padding: 0 14px;
+  border-right: 1px solid rgba(234, 222, 214, .75);
+}
+.api-key-table th:last-child,
+.api-key-table td:last-child {
+  border-right: 0;
+}
+.api-key-fingerprint-text {
+  display: block;
+  font-size: 10px;
+  line-height: 1.15;
+  white-space: nowrap;
+}
+.api-key-actions-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.table .btn.table-action {
+  min-width: auto;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11px;
+}
 .mono, .num { font-family: var(--mono); font-weight: 800; }
 .tag {
   display: inline-flex;
@@ -686,7 +799,9 @@ body {
   background: #fff2dc;
   color: var(--warn);
 }
+.notice.warn { border-color: rgba(163, 108, 46, .22); background: #fff2dc; color: var(--warn); }
 .notice.good { border-color: rgba(59,143,143,.25); background: var(--matcha); color: var(--aqua); }
+.notice.bad { border-color: rgba(138,66,70,.25); background: #fae3e6; color: var(--brand); }
 .empty-state {
   padding: 18px;
   color: var(--muted);
@@ -730,20 +845,70 @@ const state = {
 };
 
 const productNames = {
-  AP: "苹果",
+  a: "黄大豆1号",
+  ad: "氧化铝",
+  ag: "白银",
+  al: "铝",
+  ao: "氧化铝",
   ap: "苹果",
-  JD: "鸡蛋",
-  jd: "鸡蛋",
-  M: "豆粕",
-  m: "豆粕",
-  CU: "铜",
-  cu: "铜",
-  SC: "原油",
-  sc: "原油",
-  C: "玉米",
+  au: "黄金",
+  b: "黄大豆2号",
+  bc: "国际铜",
+  br: "丁二烯橡胶",
+  bu: "沥青",
+  bz: "苯乙烯",
   c: "玉米",
-  CS: "玉米淀粉",
+  cf: "棉花",
+  cj: "红枣",
   cs: "玉米淀粉",
+  cu: "铜",
+  eb: "苯乙烯",
+  eg: "乙二醇",
+  fg: "玻璃",
+  fu: "燃料油",
+  i: "铁矿石",
+  jd: "鸡蛋",
+  jm: "焦煤",
+  l: "聚乙烯",
+  lc: "碳酸锂",
+  lg: "原木",
+  lh: "生猪",
+  m: "豆粕",
+  ma: "甲醇",
+  ni: "镍",
+  nr: "20号胶",
+  oi: "菜籽油",
+  op: "氧化铝",
+  p: "棕榈油",
+  pb: "铅",
+  pd: "工业硅",
+  pf: "短纤",
+  pg: "液化石油气",
+  pk: "花生",
+  pl: "瓶片",
+  pp: "聚丙烯",
+  pr: "对二甲苯",
+  ps: "多晶硅",
+  pt: "铂",
+  px: "对二甲苯",
+  rb: "螺纹钢",
+  rm: "菜粕",
+  ru: "橡胶",
+  sa: "纯碱",
+  sc: "原油",
+  sf: "硅铁",
+  sh: "烧碱",
+  si: "工业硅",
+  sm: "锰硅",
+  sn: "锡",
+  sp: "纸浆",
+  sr: "白糖",
+  ta: "PTA",
+  ur: "尿素",
+  v: "聚氯乙烯",
+  y: "豆油",
+  zc: "动力煤",
+  zn: "锌",
 };
 
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -753,6 +918,30 @@ const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => 
   '"': "&quot;",
   "'": "&#39;",
 }[char]));
+
+function productLabel(product) {
+  const key = String(product ?? "").toLowerCase();
+  return productNames[key] ?? product ?? "--";
+}
+
+function localizeStatusMessage(message) {
+  if (!message) return null;
+  const text = String(message);
+  const known = {
+    "Refresh stopped because the local service restarted.": "本地服务已重启，本次刷新已停止。",
+    "Background refresh started.": "后台刷新已启动。",
+    "Refresh is already running in the background.": "后台刷新正在运行。",
+    "Refresh started in the background. The WebUI will update as batches finish.": "后台刷新已启动，分片完成后页面会自动更新。",
+    "Collection refresh window started.": "采集刷新窗口已启动。",
+    "Refresh stopped because no active collection plan exists.": "没有可执行的采集计划，刷新已停止。",
+    "Full-market refresh completed.": "全市场刷新已完成。",
+    "Refresh paused after three windows without progress.": "连续三个窗口无进展，刷新已暂停。",
+    "TQSDK credentials are not configured.": "TQSDK 凭据尚未配置。",
+  };
+  if (known[text]) return known[text];
+  if (text.startsWith("Refresh failed:")) return `刷新失败：${text.slice("Refresh failed:".length).trim()}`;
+  return text;
+}
 
 function fmtNum(value, digits = 0, dash = "--") {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return dash;
@@ -803,7 +992,7 @@ function symbolParts(symbol) {
   const [exchange = "--", instrument = symbol ?? "--"] = String(symbol ?? "--").split(".");
   const product = instrument.match(/^[A-Za-z]+/)?.[0] ?? "--";
   const expiry = instrument.match(/(\d{3,4})/)?.[1] ?? "--";
-  return { exchange, product, productName: productNames[product] ?? product, expiry };
+  return { exchange, product, productName: productLabel(product), expiry };
 }
 
 async function fetchJson(url) {
@@ -897,10 +1086,14 @@ async function loadSettings() {
     $("#setting-quote-shard-size").value = settings.quote_stream?.quote_shard_size ?? 1000;
     $("#setting-quote-max-symbols").value = settings.quote_stream?.max_symbols ?? "";
     renderQuoteStreamStatus(settings.quote_stream?.status);
-    $("#settings-message").textContent = settings.tqsdk.password_configured ? "TQSDK 密码已配置。" : "TQSDK 密码尚未配置。";
+    setNotice(
+      "#settings-message",
+      settings.tqsdk.password_configured ? "TQSDK 密码已配置。" : "TQSDK 密码尚未配置。",
+      settings.tqsdk.password_configured ? "good" : "warn",
+    );
     await loadApiKeys();
   } catch (error) {
-    $("#settings-message").textContent = `设置加载失败：${error.message}`;
+    setNotice("#settings-message", `设置加载失败：${error.message}`, "bad");
   }
 }
 
@@ -908,18 +1101,19 @@ async function saveCredentials() {
   const account = $("#setting-account").value.trim();
   const password = $("#setting-password").value;
   if (!account || !password) {
-    $("#settings-message").textContent = "账号和新密码都不能为空。";
+    setNotice("#settings-message", "账号和新密码都不能为空。", "warn");
     return;
   }
   await fetchJsonWithBody("/api/settings/tqsdk-credentials", "PUT", { account, password });
   $("#setting-password").value = "";
-  $("#settings-message").textContent = "TQSDK 凭据已保存。";
+  setNotice("#settings-message", "TQSDK 凭据已保存。", "good");
   await loadSettings();
 }
 
 async function testCredentials() {
   const result = await fetchJsonWithBody("/api/settings/test-tqsdk-connection", "POST", {});
-  $("#settings-message").textContent = result.message;
+  const tone = result.status === "ok" ? "good" : result.status === "failed" ? "bad" : "warn";
+  setNotice("#settings-message", result.message, tone);
 }
 
 async function saveRuntimeSettings() {
@@ -938,42 +1132,55 @@ async function saveRuntimeSettings() {
   for (const [key, value] of updates) {
     await fetchJsonWithBody(`/api/settings/${encodeURIComponent(key)}`, "PUT", { value });
   }
-  $("#settings-message").textContent = "运行设置已保存。";
+  setNotice("#settings-message", "运行设置已保存。", "good");
   await loadSettings();
 }
 
 async function triggerRefresh() {
-  $("#settings-message").textContent = "正在触发采集刷新。";
+  setNotice("#settings-message", "正在触发采集刷新。", "warn");
   const result = await fetchJsonWithBody("/api/refresh", "POST", {});
-  $("#settings-message").textContent = `${result.message} 报告：${result.report_path}`;
+  setNotice("#settings-message", `${result.message} 报告：${result.report_path}`, result.status === "started" ? "good" : "warn");
   await refreshOverview();
 }
 
 async function startQuoteStream() {
-  $("#quote-stream-message").textContent = "正在启动实时订阅 worker。";
-  await saveRuntimeSettings();
-  const payload = {
-    workers: Number($("#setting-quote-workers").value || 1),
-    quote_shard_size: Number($("#setting-quote-shard-size").value || 1000),
-    discover: false,
-  };
-  const maxSymbols = $("#setting-quote-max-symbols").value;
-  if (maxSymbols) payload.max_symbols = Number(maxSymbols);
-  const result = await fetchJsonWithBody("/api/quote-stream/start", "POST", payload);
-  renderQuoteStreamStatus(result);
-  await refreshOverview();
+  setQuoteStreamControls({ running: true, busy: true });
+  setNotice("#quote-stream-message", "正在启动实时订阅 worker。", "warn");
+  try {
+    await saveRuntimeSettings();
+    const payload = {
+      workers: Number($("#setting-quote-workers").value || 1),
+      quote_shard_size: Number($("#setting-quote-shard-size").value || 1000),
+      discover: false,
+    };
+    const maxSymbols = $("#setting-quote-max-symbols").value;
+    if (maxSymbols) payload.max_symbols = Number(maxSymbols);
+    const result = await fetchJsonWithBody("/api/quote-stream/start", "POST", payload);
+    renderQuoteStreamStatus(result);
+    await refreshOverview();
+  } catch (error) {
+    setNotice("#quote-stream-message", `实时订阅启动失败：${error.message}`, "bad");
+    setQuoteStreamControls({ running: false });
+  }
 }
 
 async function stopQuoteStream() {
-  $("#quote-stream-message").textContent = "正在停止实时订阅 worker。";
-  const result = await fetchJsonWithBody("/api/quote-stream/stop", "POST", {});
-  renderQuoteStreamStatus(result);
-  await refreshOverview();
+  setQuoteStreamControls({ running: true, busy: true });
+  setNotice("#quote-stream-message", "正在停止实时订阅 worker。", "warn");
+  try {
+    const result = await fetchJsonWithBody("/api/quote-stream/stop", "POST", {});
+    renderQuoteStreamStatus(result);
+    await refreshOverview();
+  } catch (error) {
+    setNotice("#quote-stream-message", `实时订阅停止失败：${error.message}`, "bad");
+    setQuoteStreamControls({ running: true });
+  }
 }
 
 function renderQuoteStreamStatus(status) {
   if (!status) {
-    $("#quote-stream-message").textContent = "实时订阅状态暂不可用。";
+    setNotice("#quote-stream-message", "实时订阅状态暂不可用。", "warn");
+    setQuoteStreamControls({ running: false });
     return;
   }
   const configuredWorkers = Number($("#setting-quote-workers")?.value || status.worker_count || 1);
@@ -983,34 +1190,94 @@ function renderQuoteStreamStatus(status) {
     : `配置为启动 ${fmtNum(configuredWorkers)} 个独立 worker 进程`;
   const message = status.message ? `上次状态：${status.message}` : "等待启动。";
   const reports = status.report_dir ? `报告目录：${status.report_dir}` : "";
-  $("#quote-stream-message").textContent = [stateText, workerText, message, reports].filter(Boolean).join(" · ");
+  const tone = status.running ? "good" : status.status === "blocked" ? "bad" : "warn";
+  setNotice("#quote-stream-message", [stateText, workerText, message, reports].filter(Boolean).join(" · "), tone);
+  setQuoteStreamControls({ running: Boolean(status.running) });
+}
+
+function setQuoteStreamControls({ running, busy = false }) {
+  $("#start-quote-stream").disabled = Boolean(running || busy);
+  $("#stop-quote-stream").disabled = Boolean(!running || busy);
+  ["setting-quote-workers", "setting-quote-shard-size", "setting-quote-max-symbols"].forEach((id) => {
+    $(`#${id}`).disabled = Boolean(running || busy);
+  });
+}
+
+function setNotice(selector, text, tone = "warn") {
+  const element = typeof selector === "string" ? $(selector) : selector;
+  if (!element) return;
+  element.textContent = text;
+  element.classList.remove("good", "warn", "bad");
+  element.classList.add(tone);
 }
 
 async function loadApiKeys() {
   const keys = await fetchJson("/api/api-keys");
-  $("#api-key-rows").innerHTML = keys.map((key) => `<tr>
-    <td>${key.key_id}</td><td>${escapeHtml(key.name)}</td><td class="mono">${escapeHtml(key.fingerprint)}</td>
-    <td>${escapeHtml(key.scope)}</td><td>${key.enabled ? "启用" : "停用"}</td><td>${escapeHtml(fmtDateTime(key.last_used_at))}</td>
-  </tr>`).join("");
+  $("#api-key-rows").innerHTML = keys.length ? keys.map((key) => `<tr>
+    <td>${key.key_id}</td><td>${escapeHtml(key.name)}</td><td class="mono" title="${escapeHtml(key.fingerprint)}"><span class="api-key-fingerprint-text">${escapeHtml(key.fingerprint)}</span></td>
+    <td>${escapeHtml(apiScopeLabel(key.scope))}</td><td>${key.enabled ? "启用" : "停用"}</td><td>${escapeHtml(fmtDateTime(key.last_used_at))}</td>
+    <td><div class="api-key-actions-cell">
+      <button class="btn btn-sm btn-light table-action" type="button" data-copy="${escapeHtml(key.fingerprint)}">复制</button>
+      <button class="btn btn-sm btn-light table-action" type="button" data-delete-key="${key.key_id}">删除</button>
+    </div></td>
+  </tr>`).join("") : `<tr class="empty-row"><td colspan="7">暂无 API Key</td></tr>`;
+  $$("#api-key-rows [data-copy]").forEach((button) => {
+    button.addEventListener("click", () => copyText(button.dataset.copy, "#api-key-message"));
+  });
+  $$("#api-key-rows [data-delete-key]").forEach((button) => {
+    button.addEventListener("click", () => deleteApiKey(button.dataset.deleteKey));
+  });
 }
 
 async function createApiKey() {
   const name = $("#api-key-name").value.trim();
   const scope = $("#api-key-scope").value.trim() || "read";
   if (!name) {
-    $("#settings-message").textContent = "API Key 名称不能为空。";
+    setNotice("#settings-message", "API Key 名称不能为空。", "warn");
     return;
   }
   const created = await fetchJsonWithBody("/api/api-keys", "POST", { name, scope });
-  $("#settings-message").textContent = `新 API Key：${created.secret}`;
+  setApiKeySecretNotice(created.secret);
   await loadApiKeys();
 }
 
+function apiScopeLabel(scope) {
+  return scope === "read" ? "只读访问" : scope;
+}
+
+function setApiKeySecretNotice(secret) {
+  const element = $("#api-key-message");
+  element.classList.remove("good", "warn", "bad");
+  element.classList.add("good");
+  element.innerHTML = `
+    <span>新 API Key：<strong class="mono">${escapeHtml(secret)}</strong></span>
+    <button class="btn btn-sm btn-light table-action" type="button" id="copy-new-api-key">复制</button>
+  `;
+  $("#copy-new-api-key").addEventListener("click", () => copyText(secret, "#api-key-message"));
+}
+
+async function deleteApiKey(keyId) {
+  const confirmed = window.confirm("删除后这个 API Key 将无法继续使用，确定删除吗？");
+  if (!confirmed) return;
+  await fetchJsonWithBody(`/api/api-keys/${encodeURIComponent(keyId)}`, "DELETE", {});
+  setNotice("#api-key-message", "API Key 已删除。", "good");
+  await loadApiKeys();
+}
+
+async function copyText(value, noticeSelector) {
+  try {
+    await navigator.clipboard.writeText(value ?? "");
+    setNotice(noticeSelector, "已复制。", "good");
+  } catch {
+    setNotice(noticeSelector, "复制失败，请手动选中文本复制。", "bad");
+  }
+}
+
 async function fetchJsonWithBody(url, method, body) {
+  const options = { method, headers: { "Content-Type": "application/json" } };
+  if (body !== undefined) options.body = JSON.stringify(body);
   const response = await fetch(url, {
-    method,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    ...options,
   });
   if (!response.ok) throw new Error(`${url} ${response.status}`);
   return response.json();
@@ -1058,33 +1325,39 @@ function renderCollectionProgress() {
   const refresh = state.overview.refresh ?? {};
   const quoteStream = state.overview.quote_stream ?? {};
   const active = Number(progress.active_batches ?? 0);
+  const pending = Number(progress.pending_batches ?? 0);
+  const failed = Number(progress.failed_batches ?? 0);
+  const complete = active > 0 && Number(progress.success_batches ?? 0) >= active;
   const cards = [
-    ["总分片", fmtNum(active), `${fmtNum(progress.planned_underlyings ?? 0)} 标的`],
-    ["已完成", fmtNum(progress.success_batches ?? 0), fmtPct(progress.completion_ratio ?? 0)],
-    ["待采集", fmtNum(progress.pending_batches ?? 0), "等待窗口执行"],
-    ["失败待重试", fmtNum(progress.failed_batches ?? 0), "不会丢失进度"],
+    ["总分片", fmtNum(active), `${fmtNum(progress.planned_underlyings ?? 0)} 标的`, ""],
+    ["已完成", fmtNum(progress.success_batches ?? 0), fmtPct(progress.completion_ratio ?? 0), complete ? "good" : ""],
+    ["待采集", fmtNum(pending), "等待窗口执行", pending > 0 ? "warn" : ""],
+    ["失败待重试", fmtNum(failed), "不会丢失进度", failed > 0 ? "bad" : "good"],
     [
       "后台任务",
       refresh.running ? "运行中" : "空闲",
-      refresh.message ?? (refresh.finished_at ? fmtDateTime(refresh.finished_at) : "等待触发"),
+      localizeStatusMessage(refresh.message) ?? (refresh.finished_at ? fmtDateTime(refresh.finished_at) : "等待触发"),
+      refresh.running ? "warn" : "",
     ],
     [
       "实时 Quote",
       quoteStream.running ? "运行中" : "空闲",
-      quoteStream.message ?? (quoteStream.finished_at ? fmtDateTime(quoteStream.finished_at) : "等待启动"),
+      localizeStatusMessage(quoteStream.message) ?? (quoteStream.finished_at ? fmtDateTime(quoteStream.finished_at) : "等待启动"),
+      quoteStream.running ? "warn" : "",
     ],
-    ["最近分片更新", fmtDateTime(progress.latest_batch_update), progress.scope ?? "--"],
+    ["最近分片更新", fmtDateTime(progress.latest_batch_update), progress.latest_batch_update ? "进度已保存" : "暂无更新", ""],
   ];
-  $("#collection-progress").innerHTML = cards.map(([label, value, hint]) => `
-    <div class="progress-card">
+  $("#collection-progress").innerHTML = cards.map(([label, value, hint, tone]) => `
+    <div class="progress-card ${escapeHtml(tone)}">
       <span>${escapeHtml(label)}</span>
       <strong>${escapeHtml(value)}</strong>
       <small>${escapeHtml(hint)}</small>
     </div>
   `).join("");
   const failures = progress.recent_failures ?? [];
-  $("#collection-failures").classList.toggle("d-none", failures.length === 0);
-  $("#collection-failures").innerHTML = failures.length
+  const failureNotice = $("#collection-failures");
+  failureNotice.hidden = failures.length === 0;
+  failureNotice.innerHTML = failures.length
     ? `最近失败分片：${failures.map((item) => `${escapeHtml(item.underlying_symbol)}#${escapeHtml(item.batch_index)} ${escapeHtml(item.last_error ?? item.status)}`).join("；")}`
     : "";
 }
@@ -1096,7 +1369,7 @@ function renderUnderlyingRows() {
     const statusClass = row.status === "正常" ? "good" : row.status === "数据缺口" ? "warn" : "bad";
     return `<tr class="clickable" data-underlying="${escapeHtml(row.underlying_symbol)}">
       <td>${escapeHtml(row.exchange_id)}</td>
-      <td>${escapeHtml(productNames[row.product_id] ?? row.product_id)}</td>
+      <td>${escapeHtml(productLabel(row.product_id))}</td>
       <td class="mono">${escapeHtml(row.underlying_symbol)}</td>
       <td class="mono">${escapeHtml(row.expiry_month ?? "--")}</td>
       <td class="mono">${fmtNum(row.call_count)}</td>
@@ -1128,7 +1401,7 @@ function renderSelectors() {
   const exchangeRows = rows.filter((row) => row.exchange_id === current.exchange_id);
   const productRows = exchangeRows.filter((row) => row.product_id === current.product_id);
   fillSelect($("#exchange-select"), unique(rows.map((row) => row.exchange_id)), current.exchange_id);
-  fillSelect($("#product-select"), unique(exchangeRows.map((row) => row.product_id)), current.product_id, (value) => productNames[value] ?? value);
+  fillSelect($("#product-select"), unique(exchangeRows.map((row) => row.product_id)), current.product_id, productLabel);
   fillSelectOptions(
     $("#expiry-select"),
     productRows.map((row) => ({

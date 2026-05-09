@@ -46,6 +46,10 @@ def test_stream_quotes_writes_initial_snapshot_only_when_unchanged() -> None:
                     "last_price": float(index + 1),
                     "bid_price1": 1.0,
                     "ask_price1": 2.0,
+                    "expire_datetime": "2026-06-10",
+                    "last_exercise_datetime": "2026-06-09",
+                    "exercise_year": 2026,
+                    "exercise_month": 6,
                 }
                 for index, _ in enumerate(symbols)
             ]
@@ -67,6 +71,14 @@ def test_stream_quotes_writes_initial_snapshot_only_when_unchanged() -> None:
     assert result.quotes_written == 3
     assert result.changed_quotes_written == 0
     assert connection.execute("SELECT COUNT(*) FROM quote_current").fetchone()[0] == 3
+    row = connection.execute(
+        """
+        SELECT expire_datetime, last_exercise_datetime, exercise_year, exercise_month
+        FROM instruments
+        WHERE symbol = 'DCE.a2601C100'
+        """
+    ).fetchone()
+    assert tuple(row) == ("2026-06-10", "2026-06-09", 2026, 6)
 
 
 def test_stream_quotes_honors_stop_requested_before_next_cycle() -> None:

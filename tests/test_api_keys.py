@@ -12,6 +12,8 @@ def test_api_key_secret_is_only_stored_as_hash() -> None:
     row = connection.execute("SELECT * FROM api_keys").fetchone()
     assert created.secret.startswith("odm_")
     assert created.secret not in row
+    assert len(created.record.fingerprint) == 64
+    assert "..." not in created.record.fingerprint
     assert repository.verify(created.secret).fingerprint == created.record.fingerprint
 
 
@@ -23,4 +25,3 @@ def test_revoked_key_no_longer_verifies() -> None:
     repository.revoke(created.record.key_id)
 
     assert repository.verify(created.secret) is None
-

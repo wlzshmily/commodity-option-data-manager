@@ -33,7 +33,10 @@ from option_data_manager.settings import (
 from option_data_manager.source_quality import SourceQualityRepository
 from option_data_manager.service_state import ServiceLogRepository, ServiceStateRepository
 from option_data_manager.tqsdk_connection import create_tqsdk_api_with_retries
-from option_data_manager.webui.read_model import WebuiReadModel
+from option_data_manager.webui.read_model import (
+    WebuiReadModel,
+    _days_to_expiry,
+)
 
 
 DEFAULT_DATABASE_PATH = "data/option-data-current.sqlite3"
@@ -516,7 +519,7 @@ def create_app(
             """,
             (underlying, underlying, limit),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [_option_api_row(row) for row in rows]
 
     @app.get("/api/options/{symbol}/quote")
     def option_quote(
@@ -756,6 +759,23 @@ def create_app(
             return _api_key_response(api_keys.revoke(key_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/api-keys/{key_id}")
+    def delete_api_key(
+        key_id: int,
+        _: ApiKeyRecord | None = Depends(require_auth),
+    ) -> dict[str, Any]:
+        try:
+            api_keys.delete_key(key_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        service_logs.append(
+            level="info",
+            category="security",
+            message="Local API key deleted.",
+            context={"key_id": key_id},
+        )
+        return {"key_id": key_id, "deleted": True}
 
     return app
 
@@ -1131,6 +1151,15 @@ def _int_or_none(value: str | None) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def _option_api_row(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    data["days_to_expire_datetime"] = _days_to_expiry(data.get("expire_datetime"))
+    data["days_to_last_exercise_datetime"] = _days_to_expiry(
+        data.get("last_exercise_datetime")
+    )
+    return data
 
 
 def _overall_status(overview: dict[str, Any], latest_run: list[Any]) -> str:

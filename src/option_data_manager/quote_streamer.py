@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from .instruments import InstrumentRepository
 from .quotes import QUOTE_SOURCE_FIELDS, QuoteRepository, normalize_quote
 
 
@@ -80,6 +81,7 @@ def stream_quotes(
     if not symbols:
         raise ValueError("No active quote symbols are available for this worker shard.")
     repository = QuoteRepository(connection)
+    instrument_repository = InstrumentRepository(connection)
     quote_refs = _quote_refs(api, symbols, quote_shard_size=quote_shard_size)
     deadline_at = time.monotonic() + duration_seconds if duration_seconds else None
     cycle_count = 0
@@ -107,6 +109,7 @@ def stream_quotes(
                 repository.upsert_quote(
                     normalize_quote(symbol, quote_ref, received_at=received_at)
                 )
+                instrument_repository.update_tqsdk_quote_fields(symbol, quote_ref)
                 quotes_written += 1
                 if cycle_count > 1:
                     changed_quotes_written += 1

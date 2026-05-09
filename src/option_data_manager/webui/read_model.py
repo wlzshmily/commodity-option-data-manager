@@ -415,6 +415,8 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
                 underlying_symbol,
                 exchange_id,
                 product_id,
+                MIN(expire_datetime) AS option_expire_datetime,
+                MIN(last_exercise_datetime) AS option_last_exercise_datetime,
                 SUM(CASE WHEN option_class = 'CALL' THEN 1 ELSE 0 END) AS call_count,
                 SUM(CASE WHEN option_class = 'PUT' THEN 1 ELSE 0 END) AS put_count,
                 COUNT(*) AS option_count
@@ -455,6 +457,8 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
             oc.underlying_symbol,
             oc.exchange_id,
             oc.product_id,
+            oc.option_expire_datetime,
+            oc.option_last_exercise_datetime,
             oc.call_count,
             oc.put_count,
             oc.option_count,
@@ -466,10 +470,14 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
             c.latest_quote_time,
             c.latest_kline_time,
             uq.source_datetime AS book_time,
-            uq.last_price AS underlying_last
+            uq.last_price AS underlying_last,
+            future.expire_datetime AS future_expire_datetime,
+            future.delivery_year,
+            future.delivery_month
         FROM option_counts oc
         LEFT JOIN coverage c ON c.underlying_symbol = oc.underlying_symbol
         LEFT JOIN underlying_quote uq ON uq.symbol = oc.underlying_symbol
+        LEFT JOIN instruments future ON future.symbol = oc.underlying_symbol
         ORDER BY
             CASE WHEN COALESCE(c.quote_count, 0) > 0 THEN 0 ELSE 1 END,
             c.latest_update DESC,
@@ -487,6 +495,12 @@ def _format_underlying_row(row: sqlite3.Row) -> dict[str, Any]:
     data = _row_dict(row)
     option_count = int(data["option_count"])
     data["expiry_month"] = _expiry_month(str(data["underlying_symbol"]))
+    data["days_to_option_expire_datetime"] = _days_to_expiry(
+        data.get("option_expire_datetime")
+    )
+    data["days_to_option_last_exercise_datetime"] = _days_to_expiry(
+        data.get("option_last_exercise_datetime")
+    )
     data["quote_coverage"] = _ratio(int(data["quote_count"]), option_count)
     data["metrics_coverage"] = _ratio(int(data["metrics_count"]), option_count)
     data["iv_coverage"] = _ratio(int(data["iv_count"]), option_count)
@@ -541,6 +555,11 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
             i.exchange_id,
             i.product_id,
             i.instrument_id,
+            i.expire_datetime AS future_expire_datetime,
+            i.delivery_year,
+            i.delivery_month,
+            expiry.option_expire_datetime,
+            expiry.option_last_exercise_datetime,
             CASE WHEN {_quote_has_market_data_sql("q")} THEN q.source_datetime END AS source_datetime,
             q.received_at,
             COALESCE(q.last_price, k.last_kline_close_price) AS last_price,
@@ -555,6 +574,17 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
             k.last_kline_volume
         FROM instruments i
         LEFT JOIN quote_current q ON q.symbol = i.symbol
+        LEFT JOIN (
+            SELECT
+                underlying_symbol,
+                MIN(expire_datetime) AS option_expire_datetime,
+                MIN(last_exercise_datetime) AS option_last_exercise_datetime
+            FROM instruments
+            WHERE active = 1
+              AND option_class IN ('CALL', 'PUT')
+              AND (expire_datetime IS NOT NULL OR last_exercise_datetime IS NOT NULL)
+            GROUP BY underlying_symbol
+        ) expiry ON expiry.underlying_symbol = i.symbol
         LEFT JOIN (
             SELECT k1.symbol,
                    k1.bar_datetime AS last_kline_bar_datetime,
@@ -575,6 +605,12 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
         return {"symbol": symbol, "missing": True}
     data = _row_dict(row)
     data["expiry_month"] = _expiry_month(symbol)
+    data["days_to_option_expire_datetime"] = _days_to_expiry(
+        data.get("option_expire_datetime")
+    )
+    data["days_to_option_last_exercise_datetime"] = _days_to_expiry(
+        data.get("option_last_exercise_datetime")
+    )
     data["last_kline_display_datetime"] = _daily_kline_close_datetime(
         data.get("last_kline_bar_datetime"),
         reference_datetime=data.get("source_datetime") or data.get("received_at"),
@@ -589,6 +625,10 @@ def _option_rows(connection: sqlite3.Connection, underlying_symbol: str) -> list
             i.symbol,
             i.option_class,
             i.strike_price,
+            i.expire_datetime,
+            i.last_exercise_datetime,
+            i.exercise_year,
+            i.exercise_month,
             q.bid_price1,
             q.ask_price1,
             COALESCE(q.last_price, k.close_price) AS last_price,
@@ -629,7 +669,16 @@ def _option_rows(connection: sqlite3.Connection, underlying_symbol: str) -> list
         """,
         (underlying_symbol,),
     ).fetchall()
-    return [_row_dict(row) for row in rows]
+    return [_format_option_row(row) for row in rows]
+
+
+def _format_option_row(row: sqlite3.Row) -> dict[str, Any]:
+    data = _row_dict(row)
+    data["days_to_expire_datetime"] = _days_to_expiry(data.get("expire_datetime"))
+    data["days_to_last_exercise_datetime"] = _days_to_expiry(
+        data.get("last_exercise_datetime")
+    )
+    return data
 
 
 def _quote_has_market_data_sql(alias: str) -> str:
@@ -782,6 +831,43 @@ def _datetime_display_text(value: Any) -> str | None:
     if parsed is None:
         return str(value).strip() if value is not None else None
     return parsed.isoformat()
+
+
+def _parse_expiry_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{8}", text):
+        try:
+            return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+        except ValueError:
+            return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        try:
+            return datetime.fromtimestamp(float(text)).date()
+        except (OverflowError, OSError, ValueError):
+            return None
+    parsed_datetime = _parse_datetime(text)
+    if parsed_datetime is not None:
+        return parsed_datetime.date()
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _expiry_date_text(value: Any) -> str | None:
+    parsed = _parse_expiry_date(value)
+    return parsed.isoformat() if parsed is not None else None
+
+
+def _days_to_expiry(value: Any) -> int | None:
+    parsed = _parse_expiry_date(value)
+    if parsed is None:
+        return None
+    return (parsed - date.today()).days
 
 
 def _atm_strike(strike_rows: list[dict[str, Any]], last_price: Any) -> float | None:

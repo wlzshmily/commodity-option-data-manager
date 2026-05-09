@@ -63,6 +63,12 @@ QUOTE_SOURCE_FIELDS = (
     "average",
     "price_tick",
     "volume_multiple",
+    "expire_datetime",
+    "delivery_year",
+    "delivery_month",
+    "last_exercise_datetime",
+    "exercise_year",
+    "exercise_month",
 )
 
 

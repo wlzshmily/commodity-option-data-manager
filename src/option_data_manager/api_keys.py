@@ -89,7 +89,18 @@ class ApiKeyRepository:
     def list_keys(self) -> list[ApiKeyRecord]:
         rows = self._connection.execute(
             """
-            SELECT key_id, name, fingerprint, scope, enabled, created_at, last_used_at, revoked_at
+            SELECT
+                key_id,
+                name,
+                CASE
+                    WHEN instr(fingerprint, '...') > 0 THEN key_hash
+                    ELSE fingerprint
+                END AS fingerprint,
+                scope,
+                enabled,
+                created_at,
+                last_used_at,
+                revoked_at
             FROM api_keys
             ORDER BY key_id DESC
             """
@@ -99,7 +110,18 @@ class ApiKeyRepository:
     def get_key(self, key_id: int) -> ApiKeyRecord | None:
         row = self._connection.execute(
             """
-            SELECT key_id, name, fingerprint, scope, enabled, created_at, last_used_at, revoked_at
+            SELECT
+                key_id,
+                name,
+                CASE
+                    WHEN instr(fingerprint, '...') > 0 THEN key_hash
+                    ELSE fingerprint
+                END AS fingerprint,
+                scope,
+                enabled,
+                created_at,
+                last_used_at,
+                revoked_at
             FROM api_keys
             WHERE key_id = ?
             """,
@@ -137,10 +159,30 @@ class ApiKeyRepository:
             raise KeyError(f"Unknown API key id: {key_id}")
         return record
 
+    def delete_key(self, key_id: int) -> None:
+        cursor = self._connection.execute(
+            "DELETE FROM api_keys WHERE key_id = ?",
+            (key_id,),
+        )
+        self._connection.commit()
+        if cursor.rowcount == 0:
+            raise KeyError(f"Unknown API key id: {key_id}")
+
     def verify(self, secret: str) -> ApiKeyRecord | None:
         row = self._connection.execute(
             """
-            SELECT key_id, name, fingerprint, scope, enabled, created_at, last_used_at, revoked_at
+            SELECT
+                key_id,
+                name,
+                CASE
+                    WHEN instr(fingerprint, '...') > 0 THEN key_hash
+                    ELSE fingerprint
+                END AS fingerprint,
+                scope,
+                enabled,
+                created_at,
+                last_used_at,
+                revoked_at
             FROM api_keys
             WHERE key_hash = ?
               AND enabled = 1
@@ -163,8 +205,7 @@ def _hash_secret(secret: str) -> str:
 
 
 def _fingerprint(secret: str) -> str:
-    digest = _hash_secret(secret)
-    return f"{digest[:8]}...{digest[-6:]}"
+    return _hash_secret(secret)
 
 
 def _record_from_row(row: sqlite3.Row) -> ApiKeyRecord:
@@ -178,4 +219,3 @@ def _record_from_row(row: sqlite3.Row) -> ApiKeyRecord:
         last_used_at=row["last_used_at"],
         revoked_at=row["revoked_at"],
     )
-

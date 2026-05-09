@@ -43,6 +43,18 @@ INSTRUMENTS_MIGRATION = Migration(
     ),
 )
 
+INSTRUMENT_TQSDK_FIELDS_MIGRATION = Migration(
+    101,
+    "add tqsdk instrument date fields",
+    (
+        "ALTER TABLE instruments ADD COLUMN delivery_year INTEGER",
+        "ALTER TABLE instruments ADD COLUMN delivery_month INTEGER",
+        "ALTER TABLE instruments ADD COLUMN last_exercise_datetime TEXT",
+        "ALTER TABLE instruments ADD COLUMN exercise_year INTEGER",
+        "ALTER TABLE instruments ADD COLUMN exercise_month INTEGER",
+    ),
+)
+
 
 class InstrumentNormalizationError(ValueError):
     """Raised when a discovered instrument cannot be normalized safely."""
@@ -69,6 +81,11 @@ class InstrumentRecord:
     inactive_reason: str | None
     last_seen_at: str
     raw_payload_json: str
+    delivery_year: int | None = None
+    delivery_month: int | None = None
+    last_exercise_datetime: str | None = None
+    exercise_year: int | None = None
+    exercise_month: int | None = None
 
 
 class InstrumentRepository:
@@ -77,7 +94,10 @@ class InstrumentRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         connection.row_factory = sqlite3.Row
         self._connection = connection
-        apply_migrations(connection, (INSTRUMENTS_MIGRATION,))
+        apply_migrations(
+            connection,
+            (INSTRUMENTS_MIGRATION, INSTRUMENT_TQSDK_FIELDS_MIGRATION),
+        )
 
     def upsert_instruments(self, records: list[InstrumentRecord]) -> None:
         """Insert or update discovered instruments."""
@@ -95,6 +115,11 @@ class InstrumentRepository:
                 option_class,
                 strike_price,
                 expire_datetime,
+                delivery_year,
+                delivery_month,
+                last_exercise_datetime,
+                exercise_year,
+                exercise_month,
                 price_tick,
                 volume_multiple,
                 expired,
@@ -114,6 +139,11 @@ class InstrumentRepository:
                 :option_class,
                 :strike_price,
                 :expire_datetime,
+                :delivery_year,
+                :delivery_month,
+                :last_exercise_datetime,
+                :exercise_year,
+                :exercise_month,
                 :price_tick,
                 :volume_multiple,
                 :expired,
@@ -132,6 +162,11 @@ class InstrumentRepository:
                 option_class = excluded.option_class,
                 strike_price = excluded.strike_price,
                 expire_datetime = excluded.expire_datetime,
+                delivery_year = excluded.delivery_year,
+                delivery_month = excluded.delivery_month,
+                last_exercise_datetime = excluded.last_exercise_datetime,
+                exercise_year = excluded.exercise_year,
+                exercise_month = excluded.exercise_month,
                 price_tick = excluded.price_tick,
                 volume_multiple = excluded.volume_multiple,
                 expired = excluded.expired,
@@ -143,6 +178,33 @@ class InstrumentRepository:
             [_record_to_row(record) for record in records],
         )
         self._connection.commit()
+
+    def update_tqsdk_quote_fields(
+        self,
+        symbol: str,
+        raw_quote: Mapping[str, Any] | object,
+    ) -> bool:
+        """Update persisted instrument metadata with TQSDK same-name quote fields."""
+
+        payload = _payload_from_object(raw_quote)
+        values = {
+            "expire_datetime": _optional_text(payload, "expire_datetime"),
+            "delivery_year": _optional_int(payload, "delivery_year"),
+            "delivery_month": _optional_int(payload, "delivery_month"),
+            "last_exercise_datetime": _optional_text(payload, "last_exercise_datetime"),
+            "exercise_year": _optional_int(payload, "exercise_year"),
+            "exercise_month": _optional_int(payload, "exercise_month"),
+        }
+        updates = {key: value for key, value in values.items() if value is not None}
+        if not updates:
+            return False
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        cursor = self._connection.execute(
+            f"UPDATE instruments SET {assignments} WHERE symbol = ?",
+            (*updates.values(), symbol),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
 
     def mark_missing_inactive(
         self,
@@ -343,7 +405,7 @@ def normalize_instrument(
         underlying_symbol=_optional_text(record, "underlying_symbol"),
         option_class=_normalize_option_class(record),
         strike_price=_optional_float(record, "strike_price", "strike"),
-        expire_datetime=_optional_text(record, "expire_datetime", "expire_date"),
+        expire_datetime=_optional_text(record, "expire_datetime"),
         price_tick=_optional_float(record, "price_tick"),
         volume_multiple=_optional_int(record, "volume_multiple"),
         expired=expired,
@@ -351,6 +413,11 @@ def normalize_instrument(
         inactive_reason=inactive_reason,
         last_seen_at=last_seen_at,
         raw_payload_json=json.dumps(record, ensure_ascii=False, sort_keys=True),
+        delivery_year=_optional_int(record, "delivery_year"),
+        delivery_month=_optional_int(record, "delivery_month"),
+        last_exercise_datetime=_optional_text(record, "last_exercise_datetime"),
+        exercise_year=_optional_int(record, "exercise_year"),
+        exercise_month=_optional_int(record, "exercise_month"),
     )
 
 
@@ -431,6 +498,23 @@ def _optional_int(record: Mapping[str, Any], key: str) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
+
+
+def _payload_from_object(raw: Mapping[str, Any] | object) -> dict[str, Any]:
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    payload: dict[str, Any] = {}
+    for field in (
+        "expire_datetime",
+        "delivery_year",
+        "delivery_month",
+        "last_exercise_datetime",
+        "exercise_year",
+        "exercise_month",
+    ):
+        if hasattr(raw, field):
+            payload[field] = getattr(raw, field)
+    return payload
 
 
 def _first_value(

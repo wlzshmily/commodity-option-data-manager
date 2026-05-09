@@ -1,3 +1,4 @@
+from datetime import date
 import sqlite3
 
 from option_data_manager.webui.read_model import WebuiReadModel
@@ -222,6 +223,79 @@ def test_empty_quote_source_time_is_not_displayed_as_market_time() -> None:
     assert overview["summary"]["option_quote_rows"] == 0
     assert row["quote_coverage"] == 0
     assert row["display_market_time"] is None
+
+
+def test_underlying_rows_expose_future_last_trade_and_option_expiry_days() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    connection.executemany(
+        """
+        INSERT INTO instruments (
+            symbol,
+            exchange_id,
+            product_id,
+            instrument_id,
+            instrument_name,
+            ins_class,
+            underlying_symbol,
+            option_class,
+            strike_price,
+            expire_datetime,
+            last_exercise_datetime,
+            price_tick,
+            volume_multiple,
+            expired,
+            active,
+            inactive_reason,
+            last_seen_at,
+            raw_payload_json
+        )
+        VALUES (?, 'SHFE', 'cu', ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 1, NULL, '2026-05-08T00:00:00+00:00', '{}')
+        """,
+        [
+            ("SHFE.cu2606", "cu2606", "FUTURE", None, None, None, "2026-06-15", None),
+            (
+                "SHFE.cu2606C70000",
+                "cu2606C70000",
+                "OPTION",
+                "SHFE.cu2606",
+                "CALL",
+                70000,
+                "2026-06-10",
+                "2026-06-09",
+            ),
+            (
+                "SHFE.cu2606P70000",
+                "cu2606P70000",
+                "OPTION",
+                "SHFE.cu2606",
+                "PUT",
+                70000,
+                "2026-06-10",
+                "2026-06-09",
+            ),
+        ],
+    )
+
+    row = read_model.overview()["underlyings"][0]
+    quote = read_model.tquote(underlying_symbol="SHFE.cu2606")
+
+    assert row["future_expire_datetime"] == "2026-06-15"
+    assert row["option_expire_datetime"] == "2026-06-10"
+    assert row["option_last_exercise_datetime"] == "2026-06-09"
+    assert row["days_to_option_expire_datetime"] == (
+        date(2026, 6, 10) - date.today()
+    ).days
+    assert row["days_to_option_last_exercise_datetime"] == (
+        date(2026, 6, 9) - date.today()
+    ).days
+    assert quote["underlying"]["future_expire_datetime"] == "2026-06-15"
+    assert quote["underlying"]["option_expire_datetime"] == "2026-06-10"
+    assert quote["strikes"][0]["CALL"]["expire_datetime"] == "2026-06-10"
+    assert quote["strikes"][0]["CALL"]["last_exercise_datetime"] == "2026-06-09"
+    assert quote["strikes"][0]["CALL"]["days_to_expire_datetime"] == (
+        date(2026, 6, 10) - date.today()
+    ).days
 
 
 def test_runs_include_service_logs() -> None:

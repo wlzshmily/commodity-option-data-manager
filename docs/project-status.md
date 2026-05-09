@@ -63,6 +63,9 @@
 - WebUI/API quote stream controls are implemented: `/api/quote-stream` status, `/api/quote-stream/start`, `/api/quote-stream/stop`, settings-page worker count/shard-size/max-symbol controls, cooperative stop-file worker shutdown, and safe service-log events.
 - Targeted verification for quote stream controls passed; final full suite now passes 41 tests and compileall passed.
 - Live quote stream control smoke passed with local TQSDK credentials: API started 1 worker with 10 symbols, stopped it through `/api/quote-stream/stop`, left no running worker process, and wrote a secret-safe runtime report under ignored `docs\qa\live-evidence\quote-stream-runtime`.
+- Local acceptance UI/API polish completed after browser review: settings and overview page spacing/status/table issues resolved; API Key rows support full fingerprint display, copy, and delete; overview product labels are consistently Chinese; collection progress hides empty message areas.
+- TQSDK same-name expiry metadata fields are now supported in `instruments` and API payloads: `expire_datetime`, `last_exercise_datetime`, `delivery_year`, `delivery_month`, `exercise_year`, and `exercise_month`. Quote-only workers backfill those fields from live TQSDK quote objects when available; `/api/options`, `/api/underlyings`, and WebUI tquote payloads expose original fields plus clearly-derived remaining-day fields.
+- Targeted final verification for local acceptance polish passed: `uv run pytest tests/test_webui_read_model.py tests/test_api_app.py tests/test_quote_streamer.py -q` passed 17 tests; compileall passed; local 8766 WebUI/API smoke returned 200.
 
 ## Remaining Acceptance Work
 
