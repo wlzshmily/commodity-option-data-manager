@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 import sqlite3
@@ -24,8 +25,9 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     """Run a live TQSDK credential check without printing secrets."""
 
     args = _parse_args(argv)
+    runtime_env = os.environ if env is None else env
     credentials = resolve_credentials(
-        env or {},
+        runtime_env,
         database_path=Path(args.database),
         protector=default_secret_protector(),
     )

@@ -12,5 +12,6 @@
 - Delivered: persistent `service_logs` table, `/api/logs`, WebUI 日志与诊断页, and safe event logging for settings/API/security/background refresh flows.
 - Verification: `python -m compileall -q src tests` and service-log repository smoke passed; full `uv run pytest -q` could not recreate dependencies because PyPI scipy download failed through the tunnel.
 - Safety note: service-log contexts intentionally record booleans, setting keys, event categories, and key metadata only; do not add raw TQSDK passwords or full API keys.
-- Follow-up verification: dependency recovery succeeded; `uv run pytest -q` now passes 28 tests, API/WebUI factory smoke passes via `scripts/smoke-local-app.py`, and bound localhost server smoke passed for `odm-api`/`odm-webui`.
+- Follow-up verification: dependency recovery succeeded; `uv run pytest -q` now passes 30 tests, API/WebUI factory smoke passes via `scripts/smoke-local-app.py`, and bound localhost server smoke passed for `odm-api`/`odm-webui`.
 - Remaining blocker: live full-market completion still requires configured local TQSDK credentials and a completed evidence window.
+- TQSDK follow-up: transient credentials were supplied only through environment variables; `odm-test-tqsdk` env resolution bug was fixed, then both connection check and bounded collection reached outbound proxy denial to `auth.shinnytech.com` before authentication could complete.

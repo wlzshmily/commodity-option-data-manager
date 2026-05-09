@@ -11,3 +11,4 @@
 | REL-007 | Done | Codex | Move local development target to WSL2 Ubuntu and align cloud Linux runtime setup | WSL setup script; Linux secret protector; pytest |
 | REL-008 | Done | Codex | Add persistent local service logs and WebUI diagnostics for API/settings/refresh events | `python -m compileall -q src tests`; service log repository smoke |
 | REL-009 | Done | Codex | Add repeatable local API/WebUI smoke command and rerun release-gate checks | `uv run pytest -q`; `uv run python scripts/smoke-local-app.py --database data/tmp-smoke/script-smoke.sqlite3`; server smoke checks |
+| REL-010 | Done | Codex | Fix `odm-test-tqsdk` process environment credential resolution and record proxy-blocked live TQSDK attempt | `uv run pytest tests/test_tqsdk_cli.py -q`; transient-env `odm-test-tqsdk`; bounded `odm-collect` smoke attempt |

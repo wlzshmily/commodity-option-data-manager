@@ -26,3 +26,4 @@
 - WSL2 Ubuntu setup, documentation, and Linux secret protection.
 - Persistent service logs and WebUI diagnostics for API/settings/background refresh events.
 - Repeatable local API/WebUI smoke command and passing 28-test suite after dependency recovery.
+- `odm-test-tqsdk` process environment credential resolution fixed; live TQSDK validation reached runtime proxy denial without printing credentials.

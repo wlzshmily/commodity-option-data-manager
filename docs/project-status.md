@@ -12,16 +12,18 @@
 ## Current Blockers
 
 - Full-market performance thresholds must be confirmed with real collection evidence.
-- Live full-market completion still needs valid local TQSDK credentials and a completed background refresh evidence window.
+- Live full-market completion is blocked in this cloud runtime by outbound proxy denial to `auth.shinnytech.com` (`Tunnel connection failed: 403 Forbidden`) even when transient TQSDK credentials are supplied.
 
 ## Verification
 
-- `uv run pytest -q`: passed, 28 tests.
+- `uv run pytest -q`: passed, 30 tests.
 - `python -m compileall -q src tests`: passed.
 - `uv run python scripts/smoke-local-app.py --database data/tmp-smoke/script-smoke.sqlite3`: passed for API/WebUI factory endpoints.
 - `odm-api` server smoke on `127.0.0.1:18770`: `/api/health`, `/api/status`, and `/docs` returned 200.
 - `odm-webui` server smoke on `127.0.0.1:18765`: `/`, `/api/webui/overview`, `/api/webui/runs`, `/api/settings`, and `/assets/webui.js` returned 200.
-- `ODM_DATABASE_PATH=data/tmp-smoke/tqsdk-check.sqlite3 ODM_SECRET_PROTECTOR=plaintext uv run odm-test-tqsdk`: blocked as expected because TQSDK credentials are not configured in this environment.
+- `TQSDK_ACCOUNT`/`TQSDK_PASSWORD` transient-env `uv run odm-test-tqsdk --database data/live-tqsdk-check.sqlite3 --attempts 2 --retry-delay 2`: failed before authentication could complete because the runtime proxy denied the HTTPS tunnel to `auth.shinnytech.com` with 403; no credential value was printed.
+- `TQSDK_ACCOUNT`/`TQSDK_PASSWORD` transient-env `uv run odm-collect --database data/live-smoke.sqlite3 --report docs/qa/live-evidence/2026-05-09-live-smoke-report.md --max-underlyings 1 --max-batches 1 --option-batch-size 5 --wait-cycles 1`: failed for the same proxy tunnel denial; the ignored report confirmed credential values were not written.
+- `odm-test-tqsdk` now correctly reads process environment credentials when no test env mapping is injected.
 - `scripts/agentic-sdlc/check-agentic-sdlc.ps1 -Root .`: passed.
 - WSL2 Ubuntu setup path documented in `docs/operations/wsl2-ubuntu.md`; Linux SDLC checker added at `scripts/agentic-sdlc/check-agentic-sdlc.sh`.
 - WSL setup guard verified: setup refuses `/mnt/c` Windows-mounted paths and requires a WSL-native clone.

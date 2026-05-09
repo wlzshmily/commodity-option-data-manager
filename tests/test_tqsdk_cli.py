@@ -98,3 +98,47 @@ def test_resolve_credentials_from_database(tmp_path: Path) -> None:
         database_path=database_path,
         protector=PlainTextProtector(),
     ) == ("demo", "super-secret")
+
+
+def test_main_uses_provided_environment_credentials(monkeypatch, tmp_path, capsys) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_check_connection(account: str, password: str, **_: object) -> dict[str, str]:
+        calls.append((account, password))
+        return {"status": "ok", "message": "ok: checked"}
+
+    monkeypatch.setattr(
+        "option_data_manager.cli.check_tqsdk.check_connection",
+        fake_check_connection,
+    )
+    from option_data_manager.cli.check_tqsdk import main
+
+    exit_code = main(
+        ["--database", str(tmp_path / "missing.sqlite3")],
+        env={"TQSDK_ACCOUNT": "demo-account", "TQSDK_PASSWORD": "demo-password"},
+    )
+
+    assert exit_code == 0
+    assert calls == [("demo-account", "demo-password")]
+    assert capsys.readouterr().out == "ok: checked\n"
+
+
+def test_main_uses_process_environment_when_env_not_injected(monkeypatch, tmp_path) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_check_connection(account: str, password: str, **_: object) -> dict[str, str]:
+        calls.append((account, password))
+        return {"status": "ok", "message": "ok: checked"}
+
+    monkeypatch.setenv("TQSDK_ACCOUNT", "process-account")
+    monkeypatch.setenv("TQSDK_PASSWORD", "process-password")
+    monkeypatch.setattr(
+        "option_data_manager.cli.check_tqsdk.check_connection",
+        fake_check_connection,
+    )
+    from option_data_manager.cli.check_tqsdk import main
+
+    exit_code = main(["--database", str(tmp_path / "missing.sqlite3")])
+
+    assert exit_code == 0
+    assert calls == [("process-account", "process-password")]
