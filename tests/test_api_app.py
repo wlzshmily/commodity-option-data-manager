@@ -55,3 +55,27 @@ def test_saving_tqsdk_credentials_masks_password_in_settings() -> None:
     settings = client.get("/api/settings").json()
     assert settings["tqsdk"] == {"account": "demo", "password_configured": True}
     assert "super-secret" not in str(settings)
+
+
+def test_runtime_settings_are_validated_before_persisting() -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    client = TestClient(app)
+
+    port_response = client.put("/api/settings/api.port", json={"value": "70000"})
+    assert port_response.status_code == 400
+
+    secret_response = client.put(
+        "/api/settings/tqsdk.password",
+        json={"value": "must-not-be-stored-here"},
+    )
+    assert secret_response.status_code == 400
+    assert "must-not-be-stored-here" not in str(client.get("/api/settings").json())
+
+    ok_response = client.put(
+        "/api/settings/collection.wait_cycles",
+        json={"value": "0"},
+    )
+    assert ok_response.status_code == 200
+    assert ok_response.json()["value"] == "0"
+    assert client.get("/api/settings").json()["collection"]["wait_cycles"] == 0

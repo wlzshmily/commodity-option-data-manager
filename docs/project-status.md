@@ -21,6 +21,8 @@
 - WebUI factory smoke test: `/`, `/api/settings`, and `/api/webui/overview` returned 200.
 - WebUI/API status now expose collection batch progress, including success, pending, failed, remaining, and recent failed batches.
 - WebUI overview now separates exchange market time from local collector update time and renders UTC timestamps in Asia/Hong_Kong.
+- Runtime settings updates now use an allowlist with value validation so invalid ports, booleans, or batch sizes cannot be persisted through the API.
+- WebUI API calls now support a browser-stored local API Key so operators can continue using the UI after enabling optional API Key enforcement.
 - Metric-only Greeks/IV source gaps no longer block collection batch success when current Quote rows are written.
 - Live bounded collection smoke: `uv run odm-collect --max-underlyings 1 --max-batches 1 --option-batch-size 5 --wait-cycles 1` completed and wrote a partial-failure report without secrets.
 - Live full-market planning smoke: `uv run odm-collect --max-underlyings 1000000 --max-batches 3 --option-batch-size 20 --wait-cycles 1` materialized 380 underlyings, 27,386 options, and 1,544 active batches; the selected 3 batches completed successfully without secrets in the report.

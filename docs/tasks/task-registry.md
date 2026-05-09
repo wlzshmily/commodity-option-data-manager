@@ -8,3 +8,4 @@
 | REL-004 | Done | Codex | Preserve WebUI baseline and wire real settings/API information | WebUI TestClient smoke |
 | REL-005 | Done | Codex | Add focused unit/API tests and sample database fixtures | `uv run pytest -q` |
 | REL-006 | In Progress | Codex | Run bounded live TQSDK collection windows and tune batch thresholds | Background refresh worker; `odm-collect --max-batches` live reports; WebUI batch-progress read model |
+| REL-007 | Done | Codex | Harden runtime settings validation and WebUI API Key workflow for local production use | `uv run pytest -q`; `uv run python -m compileall -q src tests option_data_manager` |
