@@ -29,6 +29,7 @@ from option_data_manager.settings import (
 )
 from option_data_manager.source_quality import SourceQualityRepository
 from option_data_manager.service_state import ServiceStateRepository
+from option_data_manager.tqsdk_connection import create_tqsdk_api_with_retries
 from option_data_manager.webui.read_model import WebuiReadModel
 
 
@@ -399,12 +400,13 @@ def create_app(
         if os.environ.get("ODM_ENABLE_TQSDK_CONNECTION_TEST") != "1":
             return {
                 "status": "skipped",
-                "message": "Set ODM_ENABLE_TQSDK_CONNECTION_TEST=1 to run a live TQSDK connection test.",
+                "message": (
+                    "Live TQSDK test is disabled in the WebUI. "
+                    "Run odm-test-tqsdk for the standalone credential check."
+                ),
             }
         try:
-            from tqsdk import TqApi, TqAuth
-
-            api = TqApi(auth=TqAuth(account, password), web_gui=False, disable_print=True)
+            api = create_tqsdk_api_with_retries(account, password)
             api.close()
         except Exception as exc:
             return {"status": "failed", "message": f"{type(exc).__name__}: {exc}"}
@@ -572,6 +574,12 @@ def _run_refresh_until_complete(
             )
             exit_code = collect_main(args)
             state.set_value("collection.last_refresh_exit_code", str(exit_code))
+            if exit_code != 0:
+                state.set_value(
+                    "collection.refresh_message",
+                    _refresh_failure_message(exit_code),
+                )
+                break
             progress = WebuiReadModel(state_connection).overview(limit=1)["collection"]
             active_batches = int(progress["active_batches"])
             remaining_batches = int(progress["remaining_batches"])
@@ -597,12 +605,6 @@ def _run_refresh_until_complete(
                 state.set_value(
                     "collection.refresh_message",
                     "Refresh paused after three windows without progress.",
-                )
-                break
-            if exit_code != 0:
-                state.set_value(
-                    "collection.refresh_message",
-                    f"Refresh stopped with exit code {exit_code}.",
                 )
                 break
     except Exception as exc:
@@ -635,6 +637,12 @@ def _refresh_status(service_state: ServiceStateRepository) -> dict[str, Any]:
             service_state.get_value("collection.last_refresh_exit_code")
         ),
     }
+
+
+def _refresh_failure_message(exit_code: int) -> str:
+    if exit_code == 2:
+        return "Refresh blocked: TQSDK credentials are not configured."
+    return f"Refresh failed with exit code {exit_code}; see the collection report."
 
 
 def _int_or_none(value: str | None) -> int | None:

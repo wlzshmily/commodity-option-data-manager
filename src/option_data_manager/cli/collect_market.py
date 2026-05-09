@@ -26,6 +26,7 @@ from option_data_manager.settings import (
     TQSDK_PASSWORD_KEY,
     default_secret_protector,
 )
+from option_data_manager.tqsdk_connection import create_tqsdk_api_with_retries
 
 
 DEFAULT_DATABASE_PATH = Path("data/option-data-current.sqlite3")
@@ -71,7 +72,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             ),
         )
         print(f"Wrote blocked collection command report: {report_path}")
-        return 0
+        return 2
 
     try:
         result = run_collection_command(
@@ -93,6 +94,10 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             error=f"{type(exc).__name__}: {exc}",
             traceback_text=traceback.format_exc(),
         )
+        _write_report(report_path, report)
+        print(f"failed: {type(exc).__name__}: {exc}")
+        print(f"Wrote collection command report: {report_path}")
+        return 1
     _write_report(report_path, report)
     print(f"Wrote collection command report: {report_path}")
     return 0
@@ -290,9 +295,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _create_tqsdk_api(account: str, password: str) -> Any:
-    from tqsdk import TqApi, TqAuth
-
-    return TqApi(auth=TqAuth(account, password), web_gui=False, disable_print=True)
+    return create_tqsdk_api_with_retries(account, password)
 
 
 def _create_option_impv_calculator() -> Callable[[Any, Any], Any]:

@@ -14,6 +14,7 @@ from option_data_manager.settings import (
     TQSDK_PASSWORD_KEY,
     default_secret_protector,
 )
+from option_data_manager.tqsdk_connection import create_tqsdk_api_with_retries
 
 
 DEFAULT_DATABASE_PATH = Path("data/option-data-current.sqlite3")
@@ -31,7 +32,12 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     if credentials is None:
         print("blocked: TQSDK credentials are not configured.")
         return 2
-    result = check_connection(credentials[0], credentials[1])
+    result = check_connection(
+        credentials[0],
+        credentials[1],
+        attempts=args.attempts,
+        retry_delay_seconds=args.retry_delay,
+    )
     print(result["message"])
     return 0 if result["status"] == "ok" else 1
 
@@ -92,12 +98,20 @@ def check_connection(
     account: str,
     password: str,
     *,
+    attempts: int | None = None,
+    retry_delay_seconds: float | None = None,
     api_factory: Callable[[str, str], Any] | None = None,
 ) -> dict[str, str]:
     """Open and close TQSDK to validate auth and network connectivity."""
 
     try:
-        api = (api_factory or _create_tqsdk_api)(account, password)
+        api = _create_tqsdk_api(
+            account,
+            password,
+            attempts=attempts,
+            retry_delay_seconds=retry_delay_seconds,
+            api_factory=api_factory,
+        )
         close = getattr(api, "close", None)
         if callable(close):
             close()
@@ -106,10 +120,21 @@ def check_connection(
     return {"status": "ok", "message": "ok: TQSDK connection test completed."}
 
 
-def _create_tqsdk_api(account: str, password: str) -> Any:
-    from tqsdk import TqApi, TqAuth
-
-    return TqApi(auth=TqAuth(account, password), web_gui=False, disable_print=True)
+def _create_tqsdk_api(
+    account: str,
+    password: str,
+    *,
+    attempts: int | None,
+    retry_delay_seconds: float | None,
+    api_factory: Callable[[str, str], Any] | None,
+) -> Any:
+    return create_tqsdk_api_with_retries(
+        account,
+        password,
+        attempts=attempts,
+        retry_delay_seconds=retry_delay_seconds,
+        api_factory=api_factory,
+    )
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -117,6 +142,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         description="Validate TQSDK credentials from env vars or the runtime database.",
     )
     parser.add_argument("--database", default=str(DEFAULT_DATABASE_PATH))
+    parser.add_argument("--attempts", type=int, default=None)
+    parser.add_argument("--retry-delay", type=float, default=None)
     return parser.parse_args(argv)
 
 
