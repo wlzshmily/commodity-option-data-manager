@@ -97,8 +97,9 @@ class CollectionStateRepository:
         """Sync the latest active plan into durable batch state.
 
         Existing completed batches are preserved only when their option-symbol
-        payload is unchanged. New, stale, or changed batches become pending so
-        dynamic contract additions/removals cannot be silently skipped.
+        payload is unchanged. New, stale, changed, or previously running
+        batches become pending so contract changes and interrupted workers
+        cannot be silently skipped.
         """
 
         cleaned_scope = _required_text(scope, "Collection plan scope")
@@ -133,6 +134,7 @@ class CollectionStateRepository:
                     current["option_symbols_json"] != option_symbols_json
                     or bool(current["stale"])
                     or current["status"] == "stale"
+                    or current["status"] == "running"
                 ):
                     self._reset_batch(
                         scope=cleaned_scope,

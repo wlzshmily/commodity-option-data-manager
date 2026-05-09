@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import sqlite3
@@ -301,7 +301,23 @@ def _quote_refs(
     options: list[InstrumentRecord],
 ) -> dict[str, Any]:
     symbols = [underlying_symbol] + [record.symbol for record in options]
+    quote_list = _get_quote_list(api, symbols)
+    if quote_list is not None:
+        return dict(zip(symbols, quote_list, strict=True))
     return {symbol: api.get_quote(symbol) for symbol in symbols}
+
+
+def _get_quote_list(api: Any, symbols: Sequence[str]) -> Any | None:
+    get_quote_list = getattr(api, "get_quote_list", None)
+    if not callable(get_quote_list):
+        return None
+    try:
+        quote_list = get_quote_list(list(symbols))
+    except (AttributeError, TypeError):
+        return None
+    if len(quote_list) != len(symbols):
+        return None
+    return quote_list
 
 
 def _wait_updates(api: Any, *, wait_cycles: int) -> None:
