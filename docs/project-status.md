@@ -11,13 +11,13 @@
 
 ## Current Blockers
 
-- Full-market performance thresholds must be confirmed with real collection evidence.
-- Live full-market completion is blocked in this cloud runtime by outbound proxy denial to `auth.shinnytech.com` (`Tunnel connection failed: 403 Forbidden`) even when transient TQSDK credentials are supplied.
+- No release-blocking data collection or display issue remains after the local tuned full-market run.
+- Cloud-only live TQSDK runs remain blocked by outbound proxy denial to `auth.shinnytech.com` (`Tunnel connection failed: 403 Forbidden`); release acceptance evidence therefore uses the local direct TQSDK runtime.
 
 ## Verification
 
-- `uv run pytest -q`: passed, 30 tests.
-- `python -m compileall -q src tests`: passed.
+- `uv run pytest -q`: passed, 41 tests.
+- `uv run python -m compileall -q src tests option_data_manager`: passed.
 - `uv run python scripts/smoke-local-app.py --database data/tmp-smoke/script-smoke.sqlite3`: passed for API/WebUI factory endpoints.
 - `odm-api` server smoke on `127.0.0.1:18770`: `/api/health`, `/api/status`, and `/docs` returned 200.
 - `odm-webui` server smoke on `127.0.0.1:18765`: `/`, `/api/webui/overview`, `/api/webui/runs`, `/api/settings`, and `/assets/webui.js` returned 200.
@@ -31,6 +31,7 @@
 - Standalone `odm-test-tqsdk` command added for credential/network checks outside the WebUI.
 - TQSDK startup now retries transient login/TLS failures and reports non-zero collection exits to the WebUI status.
 - Quote collection now prefers TQSDK `get_quote_list` batch subscription, and interrupted `running` batches are reset to `pending` on the next plan materialization.
+- Short-window collection now passes absolute `time.time() + 1` deadlines to `api.wait_update()`, matching TQSDK's subscription update contract.
 - API factory smoke test: `/api/health`, `/api/status`, and `/api/settings` returned 200.
 - WebUI factory smoke test: `/`, `/api/settings`, and `/api/webui/overview` returned 200.
 - WebUI/API status now expose collection batch progress, including success, pending, failed, remaining, and recent failed batches.
@@ -40,7 +41,29 @@
 - Live bounded collection smoke: `uv run odm-collect --max-underlyings 1 --max-batches 1 --option-batch-size 5 --wait-cycles 1` completed and wrote a partial-failure report without secrets.
 - Live full-market planning smoke: `uv run odm-collect --max-underlyings 1000000 --max-batches 3 --option-batch-size 20 --wait-cycles 1` materialized 380 underlyings, 27,386 options, and 1,544 active batches; the selected 3 batches completed successfully without secrets in the report.
 - WSL WebUI background full-market refresh is running with 380 underlyings, 27,386 options, and 1,544 active batches discovered; progress has started without failed batches.
+- Local real TQSDK login check passed on Windows with encrypted SQLite credentials: `uv run odm-test-tqsdk --database data\option-data-current.sqlite3 --attempts 2 --retry-delay 2`.
+- Tuned local performance evidence captured under ignored `docs/qa/live-evidence/perf-tuning/` paths:
+  - `option_batch_size=40`, `wait_cycles=1` was the best single-process bounded-window candidate in the small sample.
+  - 2 independent TQSDK worker processes improved throughput to about 6.078 options/second; 4 workers improved to about 7.827 options/second with sublinear scaling.
+  - Quote-only probes showed much higher subscription/write throughput than full Quote/K-line/metrics windows, supporting a split realtime Quote worker plus lower-frequency K-line/metrics refresh.
+- Tuned process-level full-market catch-up command implemented: `odm-collect-parallel` uses disjoint underlying ranges, independent TQSDK API processes, `option_batch_size=40`, and `wait_cycles=1` defaults.
+- Quote-only long-lived subscription command implemented: `odm-quote-stream` uses bounded Quote symbol shards and keeps TQSDK quote references alive through `api.wait_update()`.
+- Local command smoke passed without writing secrets:
+  - `uv run odm-quote-stream --database data\option-data-current.sqlite3 --report docs\qa\live-evidence\2026-05-09-quote-stream-smoke.json --no-discover --max-symbols 10 --cycles 1 --quote-shard-size 10` wrote 10 Quote rows with status `success`.
+  - `uv run odm-collect-parallel --database data\option-data-current.sqlite3 --report-dir docs\qa\live-evidence\parallel-smoke --summary docs\qa\live-evidence\parallel-smoke\summary.json --workers 2 --max-batches-per-worker 1 --option-batch-size 40 --wait-cycles 1 --no-discover` ran 2 worker processes, selected 2 batches, and wrote 66 Quote rows plus 1,320 K-line rows.
+- WebUI read model now prefers the latest parallel collection progress for operator display while API background refresh can still monitor the routine collection scope.
+- Stale interrupted acquisition runs older than 30 minutes are marked failed before collection, preventing false long-running diagnostics; current runtime cleanup marked 3 old interrupted runs failed.
+- Real runtime API/WebUI smoke returned 200 for `/api/health`, `/api/status`, `/api/webui/overview`, `/api/webui/tquote`, `/api/webui/runs`, and `/api/settings`.
+- Final real runtime API/WebUI smoke returned 200 for API `/api/health`, `/api/status`, `/api/settings`, `/api/logs`, `/api/quote-stream`, `/docs` and WebUI `/`, `/api/settings`, `/api/webui/overview`, `/api/webui/tquote`, `/api/webui/runs`, `/api/quote-stream`, `/assets/webui.js`, `/assets/webui.css`; the overview reported 864/864 successful batches and 0 failed.
+- Final tuned full-market local acceptance run completed without writing secrets: `uv run odm-collect-parallel --database data\option-data-current.sqlite3 --report-dir docs\qa\live-evidence\final-parallel-catchup\workers --summary docs\qa\live-evidence\final-parallel-catchup\summary.json --workers 4 --max-batches-per-worker 60 --option-batch-size 40 --wait-cycles 1 --until-complete --max-waves 10`.
+  - Result: 864/864 collection batches succeeded, 0 failed, 380 active underlyings, 27,386 active options, 565,000 K-line rows, 27,386 metrics rows, and 27,386 Quote rows present in `quote_current`.
+  - Summary: 4 worker shards, 6 waves, 4,325.332 seconds, 6.332 options/second, 28,250 Quote writes, 27,386 metrics writes, 573 metric-source errors recorded as retryable `EmptyMetricsError` quality gaps.
+  - WebUI/read-model acceptance view after completion: `completion_ratio=1.0`, `success_batches=864`, `failed_batches=0`, `stale_batches=0`, K-line coverage `1.0`, IV coverage `0.9013`, Greeks coverage `0.8959`, price-field quote coverage `0.8553`.
+  - Data-quality interpretation: every active option has a Quote row, K-line row set, and metrics row; remaining IV/Greeks and price-field gaps are source availability/market-state gaps surfaced in diagnostics, not collection failures.
+- WebUI/API quote stream controls are implemented: `/api/quote-stream` status, `/api/quote-stream/start`, `/api/quote-stream/stop`, settings-page worker count/shard-size/max-symbol controls, cooperative stop-file worker shutdown, and safe service-log events.
+- Targeted verification for quote stream controls passed; final full suite now passes 41 tests and compileall passed.
+- Live quote stream control smoke passed with local TQSDK credentials: API started 1 worker with 10 symbols, stopped it through `/api/quote-stream/stop`, left no running worker process, and wrote a secret-safe runtime report under ignored `docs\qa\live-evidence\quote-stream-runtime`.
 
 ## Remaining Acceptance Work
 
-- Let the background refresh worker continue bounded windows until all full-market batches are complete, then record coverage/performance evidence under ignored QA evidence paths.
+- None for current local production release.

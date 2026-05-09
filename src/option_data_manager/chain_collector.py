@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import sqlite3
+import time
 from typing import Any
 
 from .acquisition import AcquisitionRepository, AcquisitionRunRecord
@@ -322,7 +323,7 @@ def _get_quote_list(api: Any, symbols: Sequence[str]) -> Any | None:
 
 def _wait_updates(api: Any, *, wait_cycles: int) -> None:
     for _ in range(max(wait_cycles, 0)):
-        api.wait_update(deadline=1)
+        api.wait_update(deadline=time.time() + 1)
 
 
 def _query_greeks(api: Any, symbol: str) -> Any:

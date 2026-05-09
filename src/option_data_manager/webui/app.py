@@ -102,7 +102,7 @@ def _overview_payload(
 ) -> dict:
     return {
         "database_path": database_path,
-        **read_model.overview(limit=limit),
+        **read_model.overview(limit=limit, prefer_parallel_collection=True),
         "refresh": {
             "running": (
                 service_state.get_value("collection.refresh_running") or "false"
@@ -118,12 +118,26 @@ def _overview_payload(
             "started_at": service_state.get_value("collection.refresh_started_at"),
             "finished_at": service_state.get_value("collection.refresh_finished_at"),
         },
+        "quote_stream": _quote_stream_payload(service_state),
     }
 
 
 def _int_or_none(value: str | None) -> int | None:
     if value is None:
         return None
+
+
+def _quote_stream_payload(service_state: ServiceStateRepository) -> dict:
+    return {
+        "running": (service_state.get_value("quote_stream.running") or "false")
+        == "true",
+        "message": service_state.get_value("quote_stream.message"),
+        "worker_count": _int_or_none(service_state.get_value("quote_stream.worker_count"))
+        or 0,
+        "report_dir": service_state.get_value("quote_stream.report_dir"),
+        "started_at": service_state.get_value("quote_stream.started_at"),
+        "finished_at": service_state.get_value("quote_stream.finished_at"),
+    }
     try:
         return int(value)
     except ValueError:
@@ -313,6 +327,17 @@ INDEX_HTML = """<!doctype html>
               <button class="btn btn-sm btn-primary" type="button" id="save-runtime-settings">保存运行设置</button>
               <button class="btn btn-sm btn-warning" type="button" id="trigger-refresh">手动刷新</button>
             </div>
+          </section>
+          <section class="panel card">
+            <div class="panel-header"><span class="panel-title">实时 Quote Worker</span><span class="panel-note">quote-only 常驻订阅分片，负责让 T 型报价跟随实时行情更新。</span></div>
+            <div class="settings-grid">
+              <label>Worker 数<select class="form-select form-select-sm" id="setting-quote-workers"><option value="1">1 个 worker</option><option value="2">2 个 worker</option><option value="3">3 个 worker</option><option value="4">4 个 worker</option></select></label>
+              <label>订阅分片大小<input class="form-control form-control-sm" id="setting-quote-shard-size" type="number" min="1" /></label>
+              <label>最大 symbols<input class="form-control form-control-sm" id="setting-quote-max-symbols" type="number" min="1" placeholder="留空为全量" /></label>
+              <button class="btn btn-sm btn-primary" type="button" id="start-quote-stream">启动实时订阅</button>
+              <button class="btn btn-sm btn-light" type="button" id="stop-quote-stream">停止实时订阅</button>
+            </div>
+            <div class="notice mt-3" id="quote-stream-message">实时订阅状态加载中。</div>
           </section>
           <section class="panel card">
             <div class="panel-header"><span class="panel-title">API Key</span><span class="panel-note">完整 Key 只在创建时显示。</span></div>
@@ -852,6 +877,8 @@ function bindControls() {
   $("#test-credentials").addEventListener("click", testCredentials);
   $("#save-runtime-settings").addEventListener("click", saveRuntimeSettings);
   $("#trigger-refresh").addEventListener("click", triggerRefresh);
+  $("#start-quote-stream").addEventListener("click", startQuoteStream);
+  $("#stop-quote-stream").addEventListener("click", stopQuoteStream);
   $("#create-api-key").addEventListener("click", createApiKey);
 }
 
@@ -866,6 +893,10 @@ async function loadSettings() {
     $("#setting-batch-size").value = settings.collection.option_batch_size ?? 20;
     $("#setting-wait-cycles").value = settings.collection.wait_cycles ?? 1;
     $("#setting-max-batches").value = settings.collection.max_batches ?? 100;
+    $("#setting-quote-workers").value = settings.quote_stream?.workers ?? 1;
+    $("#setting-quote-shard-size").value = settings.quote_stream?.quote_shard_size ?? 1000;
+    $("#setting-quote-max-symbols").value = settings.quote_stream?.max_symbols ?? "";
+    renderQuoteStreamStatus(settings.quote_stream?.status);
     $("#settings-message").textContent = settings.tqsdk.password_configured ? "TQSDK 密码已配置。" : "TQSDK 密码尚未配置。";
     await loadApiKeys();
   } catch (error) {
@@ -900,6 +931,9 @@ async function saveRuntimeSettings() {
     ["collection.option_batch_size", $("#setting-batch-size").value || "20"],
     ["collection.wait_cycles", $("#setting-wait-cycles").value || "1"],
     ["collection.max_batches", $("#setting-max-batches").value || "100"],
+    ["quote_stream.workers", $("#setting-quote-workers").value || "1"],
+    ["quote_stream.quote_shard_size", $("#setting-quote-shard-size").value || "1000"],
+    ["quote_stream.max_symbols", $("#setting-quote-max-symbols").value || ""],
   ];
   for (const [key, value] of updates) {
     await fetchJsonWithBody(`/api/settings/${encodeURIComponent(key)}`, "PUT", { value });
@@ -913,6 +947,43 @@ async function triggerRefresh() {
   const result = await fetchJsonWithBody("/api/refresh", "POST", {});
   $("#settings-message").textContent = `${result.message} 报告：${result.report_path}`;
   await refreshOverview();
+}
+
+async function startQuoteStream() {
+  $("#quote-stream-message").textContent = "正在启动实时订阅 worker。";
+  await saveRuntimeSettings();
+  const payload = {
+    workers: Number($("#setting-quote-workers").value || 1),
+    quote_shard_size: Number($("#setting-quote-shard-size").value || 1000),
+    discover: false,
+  };
+  const maxSymbols = $("#setting-quote-max-symbols").value;
+  if (maxSymbols) payload.max_symbols = Number(maxSymbols);
+  const result = await fetchJsonWithBody("/api/quote-stream/start", "POST", payload);
+  renderQuoteStreamStatus(result);
+  await refreshOverview();
+}
+
+async function stopQuoteStream() {
+  $("#quote-stream-message").textContent = "正在停止实时订阅 worker。";
+  const result = await fetchJsonWithBody("/api/quote-stream/stop", "POST", {});
+  renderQuoteStreamStatus(result);
+  await refreshOverview();
+}
+
+function renderQuoteStreamStatus(status) {
+  if (!status) {
+    $("#quote-stream-message").textContent = "实时订阅状态暂不可用。";
+    return;
+  }
+  const configuredWorkers = Number($("#setting-quote-workers")?.value || status.worker_count || 1);
+  const stateText = status.running ? "实时订阅运行中" : "实时订阅未运行";
+  const workerText = status.running
+    ? `正在运行 ${fmtNum(status.worker_count || configuredWorkers)} 个独立 worker 进程`
+    : `配置为启动 ${fmtNum(configuredWorkers)} 个独立 worker 进程`;
+  const message = status.message ? `上次状态：${status.message}` : "等待启动。";
+  const reports = status.report_dir ? `报告目录：${status.report_dir}` : "";
+  $("#quote-stream-message").textContent = [stateText, workerText, message, reports].filter(Boolean).join(" · ");
 }
 
 async function loadApiKeys() {
@@ -985,6 +1056,7 @@ function fmtCollectionProgress(progress) {
 function renderCollectionProgress() {
   const progress = state.overview.collection ?? {};
   const refresh = state.overview.refresh ?? {};
+  const quoteStream = state.overview.quote_stream ?? {};
   const active = Number(progress.active_batches ?? 0);
   const cards = [
     ["总分片", fmtNum(active), `${fmtNum(progress.planned_underlyings ?? 0)} 标的`],
@@ -995,6 +1067,11 @@ function renderCollectionProgress() {
       "后台任务",
       refresh.running ? "运行中" : "空闲",
       refresh.message ?? (refresh.finished_at ? fmtDateTime(refresh.finished_at) : "等待触发"),
+    ],
+    [
+      "实时 Quote",
+      quoteStream.running ? "运行中" : "空闲",
+      quoteStream.message ?? (quoteStream.finished_at ? fmtDateTime(quoteStream.finished_at) : "等待启动"),
     ],
     ["最近分片更新", fmtDateTime(progress.latest_batch_update), progress.scope ?? "--"],
   ];
@@ -1016,7 +1093,7 @@ function renderUnderlyingRows() {
   const rows = state.overview.underlyings.filter((row) => !state.showIssuesOnly || row.status !== "正常");
   $("#overview-empty").classList.toggle("d-none", rows.length !== 0);
   $("#underlying-rows").innerHTML = rows.map((row) => {
-    const statusClass = row.status === "正常" ? "good" : row.status === "采集中" ? "warn" : "bad";
+    const statusClass = row.status === "正常" ? "good" : row.status === "数据缺口" ? "warn" : "bad";
     return `<tr class="clickable" data-underlying="${escapeHtml(row.underlying_symbol)}">
       <td>${escapeHtml(row.exchange_id)}</td>
       <td>${escapeHtml(productNames[row.product_id] ?? row.product_id)}</td>

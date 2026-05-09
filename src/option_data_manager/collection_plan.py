@@ -46,6 +46,7 @@ def build_market_collection_plan(
     option_batch_size: int = 20,
     max_underlyings: int | None = None,
     start_after_underlying: str | None = None,
+    end_before_underlying: str | None = None,
 ) -> MarketCollectionPlan:
     """Build a deterministic plan over active futures with active options."""
 
@@ -59,6 +60,7 @@ def build_market_collection_plan(
     underlyings = _active_option_underlyings(
         connection,
         start_after_underlying=start_after_underlying,
+        end_before_underlying=end_before_underlying,
         max_underlyings=max_underlyings,
     )
     plans: list[UnderlyingCollectionPlan] = []
@@ -100,6 +102,7 @@ def _active_option_underlyings(
     connection: sqlite3.Connection,
     *,
     start_after_underlying: str | None,
+    end_before_underlying: str | None,
     max_underlyings: int | None,
 ) -> list[sqlite3.Row]:
     cursor = connection.execute(
@@ -118,10 +121,16 @@ def _active_option_underlyings(
         WHERE future.active = 1
           AND future.ins_class = 'FUTURE'
           AND (? IS NULL OR future.symbol > ?)
+          AND (? IS NULL OR future.symbol < ?)
         GROUP BY future.symbol, future.exchange_id, future.product_id
         ORDER BY future.symbol
         """,
-        (start_after_underlying, start_after_underlying),
+        (
+            start_after_underlying,
+            start_after_underlying,
+            end_before_underlying,
+            end_before_underlying,
+        ),
     )
     rows = cursor.fetchall()
     if max_underlyings is not None:

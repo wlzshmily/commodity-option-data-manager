@@ -13,4 +13,4 @@
 
 ## Current Active Plan
 
-Bring the half-finished source to a local production release covering five commodity option exchanges, with working package metadata, API, WebUI, collection, tests, and acceptance evidence.
+Release-readiness pass is complete for the local production release covering five commodity option exchanges, including WebUI/API controls for quote-only realtime stream workers.

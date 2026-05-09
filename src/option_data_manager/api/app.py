@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -41,6 +44,11 @@ REFRESH_INTERVAL_KEY = "collection.refresh_interval_seconds"
 OPTION_BATCH_SIZE_KEY = "collection.option_batch_size"
 WAIT_CYCLES_KEY = "collection.wait_cycles"
 DEFAULT_BACKGROUND_MAX_BATCHES = "100"
+QUOTE_STREAM_WORKERS_KEY = "quote_stream.workers"
+QUOTE_STREAM_SHARD_SIZE_KEY = "quote_stream.quote_shard_size"
+QUOTE_STREAM_MAX_SYMBOLS_KEY = "quote_stream.max_symbols"
+DEFAULT_QUOTE_STREAM_WORKERS = "1"
+DEFAULT_QUOTE_STREAM_SHARD_SIZE = "1000"
 
 
 class TqsdkCredentialUpdate(BaseModel):
@@ -104,6 +112,28 @@ class RefreshResponse(BaseModel):
     message: str
 
 
+class QuoteStreamStartRequest(BaseModel):
+    """Optional runtime overrides for quote stream workers."""
+
+    workers: int | None = None
+    quote_shard_size: int | None = None
+    max_symbols: int | None = None
+    discover: bool = False
+
+
+class QuoteStreamResponse(BaseModel):
+    """Current quote stream worker status."""
+
+    status: str
+    running: bool
+    message: str | None
+    worker_count: int
+    pids: list[int]
+    report_dir: str | None
+    started_at: str | None
+    finished_at: str | None
+
+
 def create_app(
     connection: sqlite3.Connection,
     *,
@@ -121,11 +151,19 @@ def create_app(
     read_model = WebuiReadModel(connection)
     refresh_lock = threading.Lock()
     refresh_worker: dict[str, threading.Thread | None] = {"thread": None}
+    quote_stream_lock = threading.Lock()
+    quote_stream_processes: dict[str, list[Any]] = {"processes": []}
     if (service_state.get_value("collection.refresh_running") or "false") == "true":
         service_state.set_value("collection.refresh_running", "false")
         service_state.set_value(
             "collection.refresh_message",
             "Refresh stopped because the local service restarted.",
+        )
+    if (service_state.get_value("quote_stream.running") or "false") == "true":
+        service_state.set_value("quote_stream.running", "false")
+        service_state.set_value(
+            "quote_stream.message",
+            "本地服务重启后，实时订阅 worker 未自动接管。",
         )
 
     app = FastAPI(title="Option Data Manager API")
@@ -224,6 +262,10 @@ def create_app(
             "summary": overview["summary"],
             "collection": overview["collection"],
             "refresh": _refresh_status(service_state),
+            "quote_stream": _quote_stream_status(
+                service_state,
+                quote_stream_processes,
+            ),
             "latest_run": latest_run[0].__dict__ if latest_run else None,
             "api": {
                 "bind": settings.get_value(API_BIND_KEY) or "127.0.0.1",
@@ -286,6 +328,145 @@ def create_app(
             report_path=str(report_path),
             message="Refresh started in the background. The WebUI will update as batches finish.",
         )
+
+    @app.get("/api/quote-stream", response_model=QuoteStreamResponse)
+    def quote_stream_status(
+        _: ApiKeyRecord | None = Depends(require_auth),
+    ) -> QuoteStreamResponse:
+        return QuoteStreamResponse(
+            **_quote_stream_status(service_state, quote_stream_processes)
+        )
+
+    @app.post("/api/quote-stream/start", response_model=QuoteStreamResponse)
+    def start_quote_stream(
+        payload: QuoteStreamStartRequest | None = None,
+        _: ApiKeyRecord | None = Depends(require_auth),
+    ) -> QuoteStreamResponse:
+        request = payload or QuoteStreamStartRequest()
+        with quote_stream_lock:
+            status = _quote_stream_status(service_state, quote_stream_processes)
+            if status["running"]:
+                return QuoteStreamResponse(**status)
+            account = settings.get_value(TQSDK_ACCOUNT_KEY)
+            password = settings.get_secret(TQSDK_PASSWORD_KEY)
+            if not account or not password:
+                service_logs.append(
+                    level="warning",
+                    category="quote_stream",
+                    message="实时订阅启动被阻止：TQSDK 凭据缺失。",
+                )
+                return QuoteStreamResponse(
+                    status="blocked",
+                    running=False,
+                    message="TQSDK 凭据尚未配置。",
+                    worker_count=0,
+                    pids=[],
+                    report_dir=None,
+                    started_at=None,
+                    finished_at=None,
+                )
+            worker_count = request.workers or _positive_int_setting(
+                settings.get_value(QUOTE_STREAM_WORKERS_KEY),
+                int(DEFAULT_QUOTE_STREAM_WORKERS),
+            )
+            quote_shard_size = request.quote_shard_size or _positive_int_setting(
+                settings.get_value(QUOTE_STREAM_SHARD_SIZE_KEY),
+                int(DEFAULT_QUOTE_STREAM_SHARD_SIZE),
+            )
+            max_symbols = request.max_symbols
+            if max_symbols is None:
+                max_symbols = _optional_positive_int(
+                    settings.get_value(QUOTE_STREAM_MAX_SYMBOLS_KEY)
+                )
+            if worker_count < 1:
+                raise HTTPException(status_code=400, detail="workers must be positive.")
+            if quote_shard_size < 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="quote_shard_size must be positive.",
+                )
+            if max_symbols is not None and max_symbols < 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="max_symbols must be positive when provided.",
+                )
+            report_dir = Path("docs/qa/live-evidence/quote-stream-runtime")
+            report_dir.mkdir(parents=True, exist_ok=True)
+            processes = _start_quote_stream_processes(
+                database_path=database_path or DEFAULT_DATABASE_PATH,
+                report_dir=report_dir,
+                worker_count=worker_count,
+                quote_shard_size=quote_shard_size,
+                max_symbols=max_symbols,
+                discover=request.discover,
+            )
+            started_at = datetime.now(UTC).isoformat()
+            quote_stream_processes["processes"] = processes
+            service_state.set_value("quote_stream.running", "true")
+            service_state.set_value("quote_stream.started_at", started_at)
+            service_state.set_value("quote_stream.finished_at", None)
+            service_state.set_value("quote_stream.worker_count", str(worker_count))
+            service_state.set_value(
+                "quote_stream.pids",
+                json.dumps([int(process.pid) for process in processes]),
+            )
+            service_state.set_value("quote_stream.report_dir", str(report_dir))
+            service_state.set_value("quote_stream.message", "实时订阅 worker 已启动。")
+            service_logs.append(
+                level="info",
+                category="quote_stream",
+                message="实时订阅 worker 已启动。",
+                context={
+                    "worker_count": worker_count,
+                    "quote_shard_size": quote_shard_size,
+                    "max_symbols_configured": max_symbols is not None,
+                    "discover": request.discover,
+                    "report_dir": str(report_dir),
+                },
+            )
+            return QuoteStreamResponse(
+                **_quote_stream_status(service_state, quote_stream_processes)
+            )
+
+    @app.post("/api/quote-stream/stop", response_model=QuoteStreamResponse)
+    def stop_quote_stream(
+        _: ApiKeyRecord | None = Depends(require_auth),
+    ) -> QuoteStreamResponse:
+        with quote_stream_lock:
+            processes = quote_stream_processes.get("processes", [])
+            stopped = 0
+            for process in processes:
+                if process.poll() is None:
+                    _request_quote_stream_stop_files(service_state)
+                    stopped += 1
+            for process in processes:
+                if process.poll() is None:
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.terminate()
+                if process.poll() is None:
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+            finished_at = datetime.now(UTC).isoformat()
+            quote_stream_processes["processes"] = []
+            service_state.set_value("quote_stream.running", "false")
+            service_state.set_value("quote_stream.finished_at", finished_at)
+            service_state.set_value(
+                "quote_stream.message",
+                f"已请求停止 {stopped} 个实时订阅 worker。",
+            )
+            service_logs.append(
+                level="info",
+                category="quote_stream",
+                message="实时订阅 worker 已停止。",
+                context={"stopped_workers": stopped},
+            )
+            return QuoteStreamResponse(
+                **_quote_stream_status(service_state, quote_stream_processes)
+            )
 
     @app.get("/api/exchanges")
     def exchanges(_: ApiKeyRecord | None = Depends(require_auth)) -> list[dict[str, Any]]:
@@ -430,6 +611,23 @@ def create_app(
                 "kline_backfill": (settings.get_value("collection.kline_backfill") or "true") == "true",
                 "inactive_handling": settings.get_value("collection.inactive_handling") or "mark_inactive",
                 "sqlite_path": database_path or DEFAULT_DATABASE_PATH,
+            },
+            "quote_stream": {
+                "workers": _positive_int_setting(
+                    settings.get_value(QUOTE_STREAM_WORKERS_KEY),
+                    int(DEFAULT_QUOTE_STREAM_WORKERS),
+                ),
+                "quote_shard_size": _positive_int_setting(
+                    settings.get_value(QUOTE_STREAM_SHARD_SIZE_KEY),
+                    int(DEFAULT_QUOTE_STREAM_SHARD_SIZE),
+                ),
+                "max_symbols": _optional_positive_int(
+                    settings.get_value(QUOTE_STREAM_MAX_SYMBOLS_KEY)
+                ),
+                "status": _quote_stream_status(
+                    service_state,
+                    quote_stream_processes,
+                ),
             },
             "safe_metadata": [item.__dict__ for item in settings.list_metadata()],
         }
@@ -649,6 +847,146 @@ def _collection_args(
         "--max-batches",
         settings.get_value("collection.max_batches") or DEFAULT_BACKGROUND_MAX_BATCHES,
     ]
+
+
+def _start_quote_stream_processes(
+    *,
+    database_path: str,
+    report_dir: Path,
+    worker_count: int,
+    quote_shard_size: int,
+    max_symbols: int | None,
+    discover: bool,
+) -> list[subprocess.Popen[Any]]:
+    processes: list[subprocess.Popen[Any]] = []
+    startupinfo = _hidden_startupinfo()
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    for stale_stop_file in report_dir.glob("worker-*.stop"):
+        stale_stop_file.unlink(missing_ok=True)
+    for worker_index in range(worker_count):
+        report_path = report_dir / f"worker-{worker_index:02d}-of-{worker_count:02d}.json"
+        stop_path = report_dir / f"worker-{worker_index:02d}-of-{worker_count:02d}.stop"
+        stop_path.unlink(missing_ok=True)
+        command = [
+            sys.executable,
+            "-m",
+            "option_data_manager.cli.quote_stream",
+            "--database",
+            database_path,
+            "--report",
+            str(report_path),
+            "--worker-index",
+            str(worker_index),
+            "--worker-count",
+            str(worker_count),
+            "--quote-shard-size",
+            str(quote_shard_size),
+            "--stop-file",
+            str(stop_path),
+        ]
+        if max_symbols is not None:
+            command.extend(["--max-symbols", str(max_symbols)])
+        if not discover:
+            command.append("--no-discover")
+        processes.append(
+            subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+            )
+        )
+    return processes
+
+
+def _hidden_startupinfo() -> subprocess.STARTUPINFO | None:
+    if os.name != "nt":
+        return None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    return startupinfo
+
+
+def _request_quote_stream_stop_files(service_state: ServiceStateRepository) -> None:
+    report_dir = service_state.get_value("quote_stream.report_dir")
+    if not report_dir:
+        return
+    directory = Path(report_dir)
+    worker_count = _int_or_none(service_state.get_value("quote_stream.worker_count")) or 0
+    if worker_count:
+        for worker_index in range(worker_count):
+            path = directory / f"worker-{worker_index:02d}-of-{worker_count:02d}.stop"
+            path.write_text("stop requested\n", encoding="utf-8")
+    for path in directory.glob("worker-*.stop"):
+        path.write_text("stop requested\n", encoding="utf-8")
+
+
+def _quote_stream_status(
+    service_state: ServiceStateRepository,
+    process_table: dict[str, list[Any]],
+) -> dict[str, Any]:
+    processes = process_table.get("processes", [])
+    attached_pids = [int(process.pid) for process in processes if process.poll() is None]
+    running = bool(attached_pids)
+    if processes and not running:
+        process_table["processes"] = []
+        service_state.set_value("quote_stream.running", "false")
+        service_state.set_value("quote_stream.finished_at", datetime.now(UTC).isoformat())
+        service_state.set_value("quote_stream.message", "实时订阅 worker 已退出。")
+    persisted_pids = _json_int_list(service_state.get_value("quote_stream.pids"))
+    worker_count = _int_or_none(service_state.get_value("quote_stream.worker_count")) or (
+        len(attached_pids) if attached_pids else len(persisted_pids)
+    )
+    running = running or (
+        (service_state.get_value("quote_stream.running") or "false") == "true"
+        and bool(attached_pids)
+    )
+    status = "running" if running else "stopped"
+    return {
+        "status": status,
+        "running": running,
+        "message": service_state.get_value("quote_stream.message"),
+        "worker_count": worker_count,
+        "pids": attached_pids or ([] if not running else persisted_pids),
+        "report_dir": service_state.get_value("quote_stream.report_dir"),
+        "started_at": service_state.get_value("quote_stream.started_at"),
+        "finished_at": service_state.get_value("quote_stream.finished_at"),
+    }
+
+
+def _json_int_list(value: str | None) -> list[int]:
+    if not value:
+        return []
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    integers: list[int] = []
+    for item in payload:
+        try:
+            integers.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return integers
+
+
+def _positive_int_setting(value: str | None, default: int) -> int:
+    parsed = _optional_positive_int(value)
+    return default if parsed is None else parsed
+
+
+def _optional_positive_int(value: str | None) -> int | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _run_refresh_until_complete(

@@ -1,4 +1,5 @@
-from option_data_manager.chain_collector import _quote_refs
+import option_data_manager.chain_collector as chain_collector
+from option_data_manager.chain_collector import _quote_refs, _wait_updates
 from option_data_manager.instruments import InstrumentRecord
 
 
@@ -46,6 +47,21 @@ def test_quote_refs_falls_back_to_single_quote_subscription() -> None:
         "CZCE.AP610C8000": "single:CZCE.AP610C8000",
     }
     assert calls == ["CZCE.AP610", "CZCE.AP610C8000"]
+
+
+def test_wait_updates_uses_absolute_deadline(monkeypatch) -> None:
+    deadlines: list[float] = []
+
+    class FakeApi:
+        def wait_update(self, *, deadline: float) -> bool:
+            deadlines.append(deadline)
+            return True
+
+    monkeypatch.setattr(chain_collector.time, "time", lambda: 1000.0)
+
+    _wait_updates(FakeApi(), wait_cycles=2)
+
+    assert deadlines == [1001.0, 1001.0]
 
 
 def _instrument(symbol: str) -> InstrumentRecord:

@@ -92,13 +92,23 @@ class OptionMetricsRepository:
                 :raw_payload_json
             )
             ON CONFLICT(symbol) DO UPDATE SET
-                received_at = excluded.received_at,
-                delta = excluded.delta,
-                gamma = excluded.gamma,
-                theta = excluded.theta,
-                vega = excluded.vega,
-                rho = excluded.rho,
-                iv = excluded.iv,
+                received_at = CASE
+                    WHEN
+                        excluded.delta IS NOT NULL
+                        OR excluded.gamma IS NOT NULL
+                        OR excluded.theta IS NOT NULL
+                        OR excluded.vega IS NOT NULL
+                        OR excluded.rho IS NOT NULL
+                        OR excluded.iv IS NOT NULL
+                    THEN excluded.received_at
+                    ELSE option_source_metrics_current.received_at
+                END,
+                delta = COALESCE(excluded.delta, option_source_metrics_current.delta),
+                gamma = COALESCE(excluded.gamma, option_source_metrics_current.gamma),
+                theta = COALESCE(excluded.theta, option_source_metrics_current.theta),
+                vega = COALESCE(excluded.vega, option_source_metrics_current.vega),
+                rho = COALESCE(excluded.rho, option_source_metrics_current.rho),
+                iv = COALESCE(excluded.iv, option_source_metrics_current.iv),
                 source_method = excluded.source_method,
                 raw_payload_json = excluded.raw_payload_json
             """,

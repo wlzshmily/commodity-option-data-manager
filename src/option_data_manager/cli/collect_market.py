@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -14,6 +14,7 @@ import sqlite3
 import traceback
 from typing import Any
 
+from option_data_manager.acquisition import AcquisitionRepository
 from option_data_manager.market_collector import collect_market_batches
 from option_data_manager.market_discovery import (
     COMMODITY_OPTION_EXCHANGES,
@@ -84,8 +85,10 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
             max_underlyings=args.max_underlyings,
             max_batches=args.max_batches,
             start_after_underlying=args.start_after_underlying,
+            end_before_underlying=args.end_before_underlying,
             wait_cycles=max(args.wait_cycles, 0),
             scope=args.scope,
+            discover_market=not args.skip_discovery,
         )
         result["credential_source"] = credentials.source
         report = build_completed_report(result=result, database_path=database_path)
@@ -114,7 +117,9 @@ def run_collection_command(
     max_batches: int | None,
     start_after_underlying: str | None,
     wait_cycles: int,
+    end_before_underlying: str | None = None,
     scope: str = DEFAULT_SCOPE,
+    discover_market: bool = True,
     api_factory: Callable[[str, str], Any] | None = None,
     iv_calculator_factory: Callable[[], Callable[[Any, Any], Any] | None] | None = None,
 ) -> dict[str, Any]:
@@ -132,9 +137,14 @@ def run_collection_command(
     create_iv_calculator = iv_calculator_factory or _create_option_impv_calculator
     api = create_api(account, password)
     try:
-        connection = sqlite3.connect(database_path)
+        connection = _connect_database(database_path)
         try:
-            discovery = _discover_and_persist_market(api, connection)
+            _finish_stale_running_runs(connection)
+            discovery = (
+                _discover_and_persist_market(api, connection)
+                if discover_market
+                else None
+            )
             result = collect_market_batches(
                 api,
                 connection,
@@ -142,6 +152,7 @@ def run_collection_command(
                 max_underlyings=max_underlyings,
                 max_batches=max_batches,
                 start_after_underlying=start_after_underlying,
+                end_before_underlying=end_before_underlying,
                 wait_cycles=wait_cycles,
                 iv_calculator=create_iv_calculator(),
                 scope=scope,
@@ -289,13 +300,28 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--max-underlyings", type=int, default=1_000_000)
     parser.add_argument("--max-batches", type=int, default=None)
     parser.add_argument("--start-after-underlying", default=None)
+    parser.add_argument("--end-before-underlying", default=None)
     parser.add_argument("--wait-cycles", type=int, default=2)
     parser.add_argument("--scope", default=DEFAULT_SCOPE)
+    parser.add_argument("--skip-discovery", action="store_true")
     return parser.parse_args(argv)
 
 
 def _create_tqsdk_api(account: str, password: str) -> Any:
     return create_tqsdk_api_with_retries(account, password)
+
+
+def _finish_stale_running_runs(connection: sqlite3.Connection) -> int:
+    cutoff = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+    return AcquisitionRepository(connection).finish_stale_running_runs(
+        started_before=cutoff,
+    )
+
+
+def _connect_database(database_path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(database_path, timeout=30)
+    connection.execute("PRAGMA busy_timeout = 30000")
+    return connection
 
 
 def _create_option_impv_calculator() -> Callable[[Any, Any], Any]:
@@ -444,6 +470,7 @@ def _command_result_to_dict(
             "max_underlyings": result.max_underlyings,
             "max_batches": result.max_batches,
             "start_after_underlying": result.start_after_underlying,
+            "end_before_underlying": result.end_before_underlying,
             "option_batch_size": result.option_batch_size,
             "planned_underlyings": result.planned_underlyings,
             "planned_options": result.planned_options,

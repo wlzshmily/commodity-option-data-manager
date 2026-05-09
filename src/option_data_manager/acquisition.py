@@ -244,6 +244,33 @@ class AcquisitionRepository:
         ).fetchall()
         return [AcquisitionRunRecord(**dict(row)) for row in rows]
 
+    def finish_stale_running_runs(
+        self,
+        *,
+        started_before: str,
+        finished_at: str | None = None,
+        message: str = "Run marked failed because the worker stopped before finishing.",
+    ) -> int:
+        """Mark old running records as failed after interrupted workers."""
+
+        cutoff = _required_text(started_before, "Stale running cutoff")
+        actual_finished_at = finished_at or datetime.now(UTC).isoformat()
+        cursor = self._connection.execute(
+            """
+            UPDATE acquisition_runs
+            SET
+                finished_at = ?,
+                status = 'failed',
+                error_count = CASE WHEN error_count > 0 THEN error_count ELSE 1 END,
+                message = ?
+            WHERE status = 'running'
+              AND started_at < ?
+            """,
+            (actual_finished_at, message, cutoff),
+        )
+        self._connection.commit()
+        return int(cursor.rowcount)
+
     def record_error(
         self,
         *,

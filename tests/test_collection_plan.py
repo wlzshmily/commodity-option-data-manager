@@ -24,3 +24,25 @@ def test_market_plan_batches_active_options_by_underlying() -> None:
     assert plan.batch_count == 2
     assert plan.underlyings[0].underlying_symbol == "SHFE.cu2606"
 
+
+def test_market_plan_honors_end_before_underlying() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = InstrumentRepository(connection)
+    for underlying in ("DCE.a2601", "DCE.b2601", "DCE.c2601"):
+        repository.upsert_instruments(
+            normalize_option_chain_discovery(
+                underlying_symbol=underlying,
+                call_symbols=(f"{underlying}C100",),
+                put_symbols=(f"{underlying}P100",),
+                last_seen_at="2026-05-08T00:00:00+00:00",
+            )
+        )
+
+    plan = build_market_collection_plan(
+        connection,
+        option_batch_size=10,
+        start_after_underlying="DCE.a2601",
+        end_before_underlying="DCE.c2601",
+    )
+
+    assert [item.underlying_symbol for item in plan.underlyings] == ["DCE.b2601"]

@@ -50,6 +50,30 @@ export TQSDK_PASSWORD="your-password"
 uv run odm-collect --max-batches 100 --wait-cycles 1
 ```
 
+Tuned full-market catch-up can use independent process shards. Each worker
+opens its own TQSDK API instance and owns a disjoint underlying range:
+
+```bash
+uv run odm-collect-parallel \
+  --workers 2 \
+  --option-batch-size 40 \
+  --wait-cycles 1 \
+  --max-batches-per-worker 50 \
+  --until-complete \
+  --max-waves 20
+```
+
+Realtime UI freshness should use quote-only shards and keep subscriptions
+alive. Keep `quote-shard-size` bounded; very large symbol lists can trigger
+TQSDK server-side limits.
+
+```bash
+uv run odm-quote-stream \
+  --worker-index 0 \
+  --worker-count 2 \
+  --quote-shard-size 1000
+```
+
 Validate credentials and network connectivity without starting collection:
 
 ```bash

@@ -27,11 +27,21 @@ class WebuiReadModel:
         self.connection.row_factory = sqlite3.Row
         _ensure_tables(self.connection)
 
-    def overview(self, *, limit: int = 80) -> dict[str, Any]:
+    def overview(
+        self,
+        *,
+        limit: int = 80,
+        prefer_parallel_collection: bool = False,
+    ) -> dict[str, Any]:
         """Return acquisition health summarized by underlying contract."""
 
         rows = _underlying_rows(self.connection, limit=limit)
         totals = _overview_totals(self.connection)
+        collection = (
+            _preferred_collection_progress(self.connection)
+            if prefer_parallel_collection
+            else _collection_progress(self.connection)
+        )
         return {
             "summary": {
                 **totals,
@@ -50,7 +60,8 @@ class WebuiReadModel:
                     totals["active_options"],
                 ),
             },
-            "collection": _collection_progress(self.connection),
+            "collection": collection,
+            "collection_groups": _collection_groups(self.connection),
             "exchanges": _exchange_rows(self.connection),
             "underlyings": rows,
         }
@@ -251,6 +262,90 @@ def _collection_progress(
     }
 
 
+def _preferred_collection_progress(connection: sqlite3.Connection) -> dict[str, Any]:
+    routine = _collection_progress(connection)
+    parallel = _parallel_collection_progress(connection)
+    if parallel["active_batches"] <= 0:
+        return routine
+    routine_update = routine.get("latest_batch_update") or ""
+    parallel_update = parallel.get("latest_batch_update") or ""
+    if parallel_update >= routine_update:
+        return parallel
+    return routine
+
+
+def _collection_groups(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    groups = [_collection_progress(connection)]
+    parallel = _parallel_collection_progress(connection)
+    if parallel["active_batches"] > 0:
+        groups.append(parallel)
+    return groups
+
+
+def _parallel_collection_progress(connection: sqlite3.Connection) -> dict[str, Any]:
+    return _collection_progress_for_predicate(
+        connection,
+        scope_label="parallel-market-current-slice",
+        where_sql="plan_scope LIKE ?",
+        where_params=("parallel-market-current-slice-worker-%",),
+    )
+
+
+def _collection_progress_for_predicate(
+    connection: sqlite3.Connection,
+    *,
+    scope_label: str,
+    where_sql: str,
+    where_params: tuple[Any, ...],
+) -> dict[str, Any]:
+    row = connection.execute(
+        f"""
+        SELECT
+            COUNT(*) AS total_batches,
+            SUM(CASE WHEN stale = 0 THEN 1 ELSE 0 END) AS active_batches,
+            SUM(CASE WHEN stale = 0 AND status = 'pending' THEN 1 ELSE 0 END) AS pending_batches,
+            SUM(CASE WHEN stale = 0 AND status = 'running' THEN 1 ELSE 0 END) AS running_batches,
+            SUM(CASE WHEN stale = 0 AND status = 'success' THEN 1 ELSE 0 END) AS success_batches,
+            SUM(CASE WHEN stale = 0 AND status = 'failed' THEN 1 ELSE 0 END) AS failed_batches,
+            SUM(CASE WHEN stale = 1 THEN 1 ELSE 0 END) AS stale_batches,
+            SUM(CASE WHEN stale = 0 THEN option_count ELSE 0 END) AS planned_options,
+            COUNT(DISTINCT CASE WHEN stale = 0 THEN underlying_symbol END) AS planned_underlyings,
+            MAX(updated_at) AS latest_batch_update,
+            MAX(completed_at) AS latest_batch_completion
+        FROM collection_plan_batches
+        WHERE {where_sql}
+        """,
+        where_params,
+    ).fetchone()
+    data = _row_dict(row) if row is not None else {}
+    active_batches = int(data.get("active_batches") or 0)
+    success_batches = int(data.get("success_batches") or 0)
+    pending_batches = int(data.get("pending_batches") or 0)
+    failed_batches = int(data.get("failed_batches") or 0)
+    running_batches = int(data.get("running_batches") or 0)
+    return {
+        "scope": scope_label,
+        "total_batches": int(data.get("total_batches") or 0),
+        "active_batches": active_batches,
+        "pending_batches": pending_batches,
+        "running_batches": running_batches,
+        "success_batches": success_batches,
+        "failed_batches": failed_batches,
+        "stale_batches": int(data.get("stale_batches") or 0),
+        "planned_options": int(data.get("planned_options") or 0),
+        "planned_underlyings": int(data.get("planned_underlyings") or 0),
+        "remaining_batches": pending_batches + failed_batches + running_batches,
+        "completion_ratio": _ratio(success_batches, active_batches),
+        "latest_batch_update": data.get("latest_batch_update"),
+        "latest_batch_completion": data.get("latest_batch_completion"),
+        "recent_failures": _collection_failures_for_predicate(
+            connection,
+            where_sql=where_sql,
+            where_params=where_params,
+        ),
+    }
+
+
 def _collection_failures(
     connection: sqlite3.Connection,
     *,
@@ -277,6 +372,37 @@ def _collection_failures(
         LIMIT ?
         """,
         (scope, limit),
+    ).fetchall()
+    return [_row_dict(row) for row in rows]
+
+
+def _collection_failures_for_predicate(
+    connection: sqlite3.Connection,
+    *,
+    where_sql: str,
+    where_params: tuple[Any, ...],
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        f"""
+        SELECT
+            underlying_symbol,
+            batch_index,
+            exchange_id,
+            product_id,
+            option_count,
+            status,
+            attempt_count,
+            last_error,
+            updated_at
+        FROM collection_plan_batches
+        WHERE {where_sql}
+          AND stale = 0
+          AND status = 'failed'
+        ORDER BY updated_at DESC, underlying_symbol, batch_index
+        LIMIT ?
+        """,
+        (*where_params, limit),
     ).fetchall()
     return [_row_dict(row) for row in rows]
 
@@ -710,7 +836,7 @@ def _status_from_counts(data: dict[str, Any], option_count: int) -> str:
     if int(data["quote_count"]) == option_count and int(data["metrics_count"]) == option_count:
         return "正常"
     if int(data["quote_count"]) or int(data["metrics_count"]) or int(data["kline_count"]):
-        return "采集中"
+        return "数据缺口"
     return "未采集"
 
 

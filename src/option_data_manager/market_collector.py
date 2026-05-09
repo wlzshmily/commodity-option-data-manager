@@ -45,6 +45,7 @@ class StatefulMarketCollectionResult:
     max_underlyings: int
     max_batches: int | None
     start_after_underlying: str | None
+    end_before_underlying: str | None
     option_batch_size: int
     planned_underlyings: int
     planned_options: int
@@ -65,6 +66,7 @@ def collect_market_batches(
     start_after_underlying: str | None,
     wait_cycles: int,
     iv_calculator: Callable[[Any, Any], Any] | None,
+    end_before_underlying: str | None = None,
     scope: str = "windowed-market-current-slice",
 ) -> StatefulMarketCollectionResult:
     """Collect current slices by consuming durable non-stale collection batches."""
@@ -78,6 +80,7 @@ def collect_market_batches(
         option_batch_size=option_batch_size,
         max_underlyings=max_underlyings,
         start_after_underlying=start_after_underlying,
+        end_before_underlying=end_before_underlying,
     )
     state_repo = CollectionStateRepository(connection)
     materialized = state_repo.materialize_plan(
@@ -109,6 +112,7 @@ def collect_market_batches(
         max_underlyings=max_underlyings,
         max_batches=max_batches,
         start_after_underlying=start_after_underlying,
+        end_before_underlying=end_before_underlying,
         option_batch_size=option_batch_size,
         planned_underlyings=plan.underlying_count,
         planned_options=plan.option_count,

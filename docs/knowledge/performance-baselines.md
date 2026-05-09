@@ -3,4 +3,38 @@
 - Bounded smoke baseline: `max_underlyings=1`, `max_batches=1`, `option_batch_size=5`, `wait_cycles=1` completed in about 21 seconds on the local machine and produced a partial-failure report for one option batch.
 - Full-market planning smoke: `max_underlyings=1000000`, `max_batches=3`, `option_batch_size=20`, `wait_cycles=1` completed in about 45 seconds and selected 3 of 1,544 active full-market batches.
 - Runtime tuning: background refresh window default increased from 10 to 100 batches to reduce repeated TQSDK connect/discovery/subscription startup cost; API-triggered collection defaults to `wait_cycles=1` to avoid an extra per-batch wait round.
-- Pending: complete full-market collection batch size, latency, coverage, and source-unavailable evidence.
+- 2026-05-09 local Windows TQSDK validation fixed `wait_update` deadline handling in the short-window collector. TQSDK documents `deadline` as an absolute `time.time()` value; the collector now uses `time.time() + 1` instead of `1`.
+- 2026-05-09 full-market window evidence after the deadline fix: `option_batch_size=20`, `max_batches=100`, `wait_cycles=1` completed windows in 636.74 to 738.55 seconds, about 6.4 to 7.4 seconds per batch.
+- 2026-05-09 batch-size tuning from the same local database snapshot, 8 selected batches per case:
+  - `option_batch_size=20`, `wait_cycles=1`: 134 options in 48.64 seconds, 2.755 options/second.
+  - `option_batch_size=40`, `wait_cycles=1`: 248 options in 76.08 seconds, 3.260 options/second.
+  - `option_batch_size=60`, `wait_cycles=1`: 312 options in 102.47 seconds, 3.045 options/second.
+  - `option_batch_size=80`, `wait_cycles=1`: 492 options in 164.28 seconds, 2.995 options/second.
+- Current recommended short-window threshold: use `option_batch_size=40`, `wait_cycles=1` for full-market current-slice catch-up unless a longer live run shows source instability.
+- 2026-05-09 wait-cycle tuning at `option_batch_size=40`, 6 selected batches per case:
+  - `wait_cycles=0`: 188 options in 80.97 seconds, 2.322 options/second.
+  - `wait_cycles=1`: 188 options in 65.67 seconds, 2.863 options/second.
+  - `wait_cycles=2`: 188 options in 93.27 seconds, 2.016 options/second.
+  - Conclusion: `wait_cycles=1` is faster and more faithful to the subscription model than `0`; extra cycles slow the bounded window.
+- 2026-05-09 quote-only probes:
+  - 1,000 Quote symbols, 3 `wait_update` cycles: 7.563 internal seconds, 132.220 symbols/second, no write errors.
+  - 3,000 Quote symbols, 3 `wait_update` cycles: 16.009 internal seconds, 187.396 symbols/second, no write errors, but TQSDK warned that subscription field length above 50,000 may hit server limits.
+  - Conclusion: full-market realtime Quote should use bounded quote shards and a long-lived subscription loop; the dominant full-slice cost is daily K-line reference setup plus IV/Greeks processing.
+- 2026-05-09 independent-process concurrency:
+  - 2 workers, `option_batch_size=40`, `wait_cycles=1`: 506 options in 83.25 seconds, 6.078 options/second.
+  - 4 workers, `option_batch_size=40`, `wait_cycles=1`: 738 options in 94.29 seconds, 7.827 options/second.
+  - Conclusion: process-level sharding improves throughput, but scaling is sublinear after 2 workers; each worker should own an independent TQSDK API instance and disjoint market shard.
+- 2026-05-09 continuous subscription probes on `SHFE.cu2606`:
+  - Full Quote/K-line/metrics mode, 54 options, 3 cycles: 43.515 internal seconds, status `partial_source_unavailable`.
+  - Quote-only mode, 54 options, 10 cycles: 43.723 internal seconds, status `success`.
+  - Conclusion: long-lived quote subscriptions are suitable for realtime UI freshness; K-line and metrics refresh should be decoupled and lower frequency.
+- Implemented commands from the tuning results:
+  - `odm-collect-parallel` for process-level full-market catch-up using disjoint underlying ranges and independent TQSDK API instances.
+  - `odm-quote-stream` for long-lived Quote-only subscription shards.
+- 2026-05-09 final local full-market catch-up acceptance:
+  - Command: `odm-collect-parallel --workers 4 --max-batches-per-worker 60 --option-batch-size 40 --wait-cycles 1 --until-complete --max-waves 10`.
+  - Evidence: ignored `docs/qa/live-evidence/final-parallel-catchup/summary.json`.
+  - Result: 864 selected batches, 864 succeeded, 0 failed; 27,386 options, 565,000 K-line rows, 27,386 metrics writes, 28,250 Quote writes.
+  - Runtime: 6 waves, 4,325.332 seconds total, 6.332 options/second.
+  - Long-tail observation: the fourth shard carried the slowest tail because its underlying range had denser late batches; process-level sharding still completed the full market without failed batches.
+  - Data-quality observation: 573 retryable metric-source gaps were recorded as `EmptyMetricsError`; these are source IV/Greeks availability gaps, not collection/write failures.
