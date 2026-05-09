@@ -25,3 +25,4 @@
 - Background collection wait cycles are configurable and default to one wait round.
 - WSL2 Ubuntu setup, documentation, and Linux secret protection.
 - Persistent service logs and WebUI diagnostics for API/settings/background refresh events.
+- Repeatable local API/WebUI smoke command and passing 28-test suite after dependency recovery.

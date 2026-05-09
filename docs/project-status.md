@@ -12,13 +12,16 @@
 ## Current Blockers
 
 - Full-market performance thresholds must be confirmed with real collection evidence.
-- Latest `uv run pytest -q` retry could not recreate the local `.venv` because the PyPI tunnel failed while downloading `scipy` for the TQSDK dependency chain.
+- Live full-market completion still needs valid local TQSDK credentials and a completed background refresh evidence window.
 
 ## Verification
 
-- `uv run pytest -q`: previously passed, 25 tests; latest retry was blocked by PyPI tunnel failure while downloading scipy after the local `.venv` was recreated.
-- `python -m compileall -q src tests`: passed after service-log changes.
-- Service log repository smoke: passed.
+- `uv run pytest -q`: passed, 28 tests.
+- `python -m compileall -q src tests`: passed.
+- `uv run python scripts/smoke-local-app.py --database data/tmp-smoke/script-smoke.sqlite3`: passed for API/WebUI factory endpoints.
+- `odm-api` server smoke on `127.0.0.1:18770`: `/api/health`, `/api/status`, and `/docs` returned 200.
+- `odm-webui` server smoke on `127.0.0.1:18765`: `/`, `/api/webui/overview`, `/api/webui/runs`, `/api/settings`, and `/assets/webui.js` returned 200.
+- `ODM_DATABASE_PATH=data/tmp-smoke/tqsdk-check.sqlite3 ODM_SECRET_PROTECTOR=plaintext uv run odm-test-tqsdk`: blocked as expected because TQSDK credentials are not configured in this environment.
 - `scripts/agentic-sdlc/check-agentic-sdlc.ps1 -Root .`: passed.
 - WSL2 Ubuntu setup path documented in `docs/operations/wsl2-ubuntu.md`; Linux SDLC checker added at `scripts/agentic-sdlc/check-agentic-sdlc.sh`.
 - WSL setup guard verified: setup refuses `/mnt/c` Windows-mounted paths and requires a WSL-native clone.

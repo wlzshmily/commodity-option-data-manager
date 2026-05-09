@@ -8,6 +8,10 @@
 - A sample SQLite fixture demonstrates UI/API behavior.
 - Live TQSDK collection evidence is captured without secrets.
 
+## Local Smoke Command
+
+- `uv run python scripts/smoke-local-app.py --database data/tmp-smoke/script-smoke.sqlite3` verifies core API/WebUI endpoints without contacting TQSDK.
+
 ## Rollback
 
 - Stop local services.
