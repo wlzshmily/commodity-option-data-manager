@@ -419,7 +419,8 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
                 MIN(last_exercise_datetime) AS option_last_exercise_datetime,
                 SUM(CASE WHEN option_class = 'CALL' THEN 1 ELSE 0 END) AS call_count,
                 SUM(CASE WHEN option_class = 'PUT' THEN 1 ELSE 0 END) AS put_count,
-                COUNT(*) AS option_count
+                COUNT(*) AS option_count,
+                MIN(NULLIF(expire_datetime, '')) AS expire_datetime
             FROM instruments
             WHERE active = 1 AND option_class IN ('CALL', 'PUT')
             GROUP BY underlying_symbol, exchange_id, product_id
@@ -462,6 +463,7 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
             oc.call_count,
             oc.put_count,
             oc.option_count,
+            oc.expire_datetime,
             COALESCE(c.quote_count, 0) AS quote_count,
             COALESCE(c.metrics_count, 0) AS metrics_count,
             COALESCE(c.iv_count, 0) AS iv_count,
@@ -501,6 +503,7 @@ def _format_underlying_row(row: sqlite3.Row) -> dict[str, Any]:
     data["days_to_option_last_exercise_datetime"] = _days_to_expiry(
         data.get("option_last_exercise_datetime")
     )
+    data["days_to_expiry"] = _days_to_expiry(data.get("expire_datetime"))
     data["quote_coverage"] = _ratio(int(data["quote_count"]), option_count)
     data["metrics_coverage"] = _ratio(int(data["metrics_count"]), option_count)
     data["iv_coverage"] = _ratio(int(data["iv_count"]), option_count)
@@ -577,8 +580,8 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
         LEFT JOIN (
             SELECT
                 underlying_symbol,
-                MIN(expire_datetime) AS option_expire_datetime,
-                MIN(last_exercise_datetime) AS option_last_exercise_datetime
+                MIN(NULLIF(expire_datetime, '')) AS option_expire_datetime,
+                MIN(NULLIF(last_exercise_datetime, '')) AS option_last_exercise_datetime
             FROM instruments
             WHERE active = 1
               AND option_class IN ('CALL', 'PUT')
@@ -611,6 +614,11 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
     data["days_to_option_last_exercise_datetime"] = _days_to_expiry(
         data.get("option_last_exercise_datetime")
     )
+    expiry_datetime = data.get("option_expire_datetime") or data.get(
+        "future_expire_datetime"
+    )
+    data["expire_datetime"] = expiry_datetime
+    data["days_to_expiry"] = _days_to_expiry(expiry_datetime)
     data["last_kline_display_datetime"] = _daily_kline_close_datetime(
         data.get("last_kline_bar_datetime"),
         reference_datetime=data.get("source_datetime") or data.get("received_at"),
@@ -714,6 +722,8 @@ def _selector_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
             "exchange_id": row["exchange_id"],
             "product_id": row["product_id"],
             "expiry_month": row["expiry_month"],
+            "expire_datetime": row.get("expire_datetime"),
+            "days_to_expiry": row.get("days_to_expiry"),
             "status": row["status"],
         }
         for row in rows

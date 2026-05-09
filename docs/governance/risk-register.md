@@ -7,3 +7,4 @@
 | Secrets leak through UI/API/test evidence | Security failure | DPAPI storage, masked responses, safe service-log contexts, ignored runtime DBs, tests | Open |
 | Existing WebUI baseline may lack approved prototype details | UX mismatch | Preserve current layout and only fill production behavior | Accepted |
 | Cloud/runtime outbound proxy blocks TQSDK auth | Live validation cannot complete in cloud runtime | Use WSL2/local runtime with direct TQSDK access for acceptance evidence; keep cloud attempts secret-safe and marked blocked | Open |
+| WebUI selector state can drift from refreshed overview rows | Wrong T型报价 chain displayed after user changes exchange/product/month | Prefer quote selector rows when available and reload the chain after resolving the changed selector level | Mitigated |

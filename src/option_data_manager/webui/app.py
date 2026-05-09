@@ -240,8 +240,8 @@ INDEX_HTML = """<!doctype html>
             </div>
             <div class="table-responsive table-shell">
               <table class="table table-sm align-middle summary-table underlying-table">
-                <colgroup><col class="underlying-exchange"><col class="underlying-product"><col class="underlying-symbol"><col class="underlying-expiry"><col class="underlying-count"><col class="underlying-count"><col class="underlying-ratio"><col class="underlying-ratio"><col class="underlying-kline"><col class="underlying-time"><col class="underlying-status"><col class="underlying-action"></colgroup>
-                <thead><tr><th>交易所</th><th>品种</th><th>标的合约</th><th>到期月</th><th>CALL</th><th>PUT</th><th>Quote</th><th>Greeks/IV</th><th>20D K线</th><th>行情时间</th><th>状态</th><th>操作</th></tr></thead>
+                <colgroup><col class="underlying-exchange"><col class="underlying-product"><col class="underlying-symbol"><col class="underlying-expiry"><col class="underlying-count"><col class="underlying-count"><col class="underlying-count"><col class="underlying-ratio"><col class="underlying-ratio"><col class="underlying-kline"><col class="underlying-time"><col class="underlying-status"><col class="underlying-action"></colgroup>
+                <thead><tr><th>交易所</th><th>品种</th><th>标的合约</th><th>到期月</th><th>剩余天数</th><th>CALL</th><th>PUT</th><th>Quote</th><th>Greeks/IV</th><th>20D K线</th><th>行情时间</th><th>状态</th><th>操作</th></tr></thead>
                 <tbody id="underlying-rows"></tbody>
               </table>
               <div class="empty-state d-none" id="overview-empty">
@@ -273,6 +273,7 @@ INDEX_HTML = """<!doctype html>
               <select class="form-select form-select-sm" id="product-select"></select>
               <label class="form-label mb-0">到期月</label>
               <select class="form-select form-select-sm" id="expiry-select"></select>
+              <span class="expiry-days">剩余到期天数 <strong id="toolbar-expiry-days">--</strong></span>
               <span class="ms-auto">K线时间 <strong id="toolbar-book-time">--</strong></span>
             </div>
             <div class="quote-table-wrap">
@@ -844,6 +845,14 @@ const state = {
   previousLatest: new Map(),
 };
 
+const exchangeNames = {
+  DCE: "大商所",
+  CZCE: "郑商所",
+  SHFE: "上期所",
+  INE: "能源中心",
+  GFEX: "广期所",
+};
+
 const productNames = {
   a: "黄大豆1号",
   ad: "氧化铝",
@@ -960,6 +969,11 @@ function fmtPct(value) {
   return `${(Number(value) * 100).toFixed(1)}%`;
 }
 
+function fmtDaysToExpiry(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
+  return `${Number(value)}天`;
+}
+
 function fmtDateTime(value) {
   if (!value) return "--";
   const text = String(value);
@@ -1058,7 +1072,7 @@ function bindControls() {
     renderUnderlyingRows();
   });
   ["exchange-select", "product-select", "expiry-select"].forEach((id) => {
-    $(`#${id}`).addEventListener("change", onSelectorChange);
+    $(`#${id}`).addEventListener("change", () => onSelectorChange(id));
   });
   $("#close-drawer").addEventListener("click", closeDrawer);
   $("#drawer-backdrop").addEventListener("click", closeDrawer);
@@ -1309,7 +1323,7 @@ function renderExchangeCards() {
     const ivCoverage = group.iv_coverage ?? 0;
     const cls = quoteCoverage < 0.95 ? "bad" : ivCoverage < 0.98 ? "warn" : "";
     return `<div class="exchange-card ${cls}">
-      <strong>${escapeHtml(group.exchange_id)}</strong><span>${fmtNum(group.product_count)}品种 / ${fmtNum(group.underlying_count)}标的</span>
+      <strong>${escapeHtml(exchangeNames[group.exchange_id] ?? group.exchange_id)}</strong><span>${fmtNum(group.product_count)}品种 / ${fmtNum(group.underlying_count)}标的</span>
       <div>Quote ${fmtPct(quoteCoverage)} · IV ${fmtPct(ivCoverage)}</div>
     </div>`;
   }).join("");
@@ -1368,10 +1382,11 @@ function renderUnderlyingRows() {
   $("#underlying-rows").innerHTML = rows.map((row) => {
     const statusClass = row.status === "正常" ? "good" : row.status === "数据缺口" ? "warn" : "bad";
     return `<tr class="clickable" data-underlying="${escapeHtml(row.underlying_symbol)}">
-      <td>${escapeHtml(row.exchange_id)}</td>
-      <td>${escapeHtml(productLabel(row.product_id))}</td>
+      <td>${escapeHtml(exchangeNames[row.exchange_id] ?? row.exchange_id)}</td>
+      <td>${escapeHtml(productNames[row.product_id] ?? row.product_id)}</td>
       <td class="mono">${escapeHtml(row.underlying_symbol)}</td>
       <td class="mono">${escapeHtml(row.expiry_month ?? "--")}</td>
+      <td class="mono">${fmtDaysToExpiry(row.days_to_expiry)}</td>
       <td class="mono">${fmtNum(row.call_count)}</td>
       <td class="mono">${fmtNum(row.put_count)}</td>
       <td class="good">${fmtPct(row.quote_coverage)}</td>
@@ -1391,7 +1406,11 @@ function renderUnderlyingRows() {
 }
 
 function selectorRows() {
-  return state.overview?.underlyings ?? [];
+  const quoteSelectors = state.quote?.selectors?.map((row) => ({
+    ...row,
+    underlying_symbol: row.underlying_symbol ?? row.symbol,
+  })) ?? [];
+  return quoteSelectors.length ? quoteSelectors : (state.overview?.underlyings ?? []);
 }
 
 function renderSelectors() {
@@ -1400,13 +1419,13 @@ function renderSelectors() {
   if (!current) return;
   const exchangeRows = rows.filter((row) => row.exchange_id === current.exchange_id);
   const productRows = exchangeRows.filter((row) => row.product_id === current.product_id);
-  fillSelect($("#exchange-select"), unique(rows.map((row) => row.exchange_id)), current.exchange_id);
-  fillSelect($("#product-select"), unique(exchangeRows.map((row) => row.product_id)), current.product_id, productLabel);
+  fillSelect($("#exchange-select"), unique(rows.map((row) => row.exchange_id)), current.exchange_id, (value) => exchangeNames[value] ?? value);
+  fillSelect($("#product-select"), unique(exchangeRows.map((row) => row.product_id)), current.product_id, (value) => productNames[value] ?? value);
   fillSelectOptions(
     $("#expiry-select"),
     productRows.map((row) => ({
       value: row.underlying_symbol,
-      label: row.expiry_month ?? row.underlying_symbol,
+      label: `${row.expiry_month ?? row.underlying_symbol}${row.days_to_expiry === null || row.days_to_expiry === undefined ? "" : `（${fmtDaysToExpiry(row.days_to_expiry)}）`}`,
     })),
     current.underlying_symbol,
   );
@@ -1436,24 +1455,33 @@ function fillSelectOptions(select, options, selected) {
   select.value = selected;
 }
 
-async function onSelectorChange() {
+async function onSelectorChange(changedId) {
   const rows = selectorRows();
   const exchange = $("#exchange-select").value;
   const product = $("#product-select").value;
   const selectedUnderlying = $("#expiry-select").value;
-  const current =
+  let current;
+  if (changedId === "expiry-select") {
+    current = rows.find((row) => row.underlying_symbol === selectedUnderlying);
+  } else if (changedId === "product-select") {
+    current = rows.find((row) => row.exchange_id === exchange && row.product_id === product);
+  } else if (changedId === "exchange-select") {
+    current = rows.find((row) => row.exchange_id === exchange);
+  }
+  current = current ??
     rows.find((row) => row.exchange_id === exchange && row.product_id === product && row.underlying_symbol === selectedUnderlying) ??
     rows.find((row) => row.exchange_id === exchange && row.product_id === product) ??
     rows.find((row) => row.exchange_id === exchange) ??
     rows[0];
   if (current) {
     state.selectedUnderlying = current.underlying_symbol;
-    renderSelectors();
     await loadQuote(current.underlying_symbol, { animate: false });
+    renderSelectors();
   }
 }
 
 async function loadQuote(underlying, options = {}) {
+  state.selectedUnderlying = underlying;
   state.quote = await fetchJson(`/api/webui/tquote?underlying=${encodeURIComponent(underlying)}`);
   renderQuote(options);
 }
@@ -1498,6 +1526,7 @@ function renderQuote(options = {}) {
   const displayTime = underlying.last_kline_display_datetime ?? underlying.source_datetime ?? underlying.received_at;
   $("#quote-book-time").textContent = fmtDateTime(displayTime);
   $("#toolbar-book-time").textContent = fmtDateTime(displayTime);
+  $("#toolbar-expiry-days").textContent = fmtDaysToExpiry(underlying.days_to_expiry);
   $("#quote-active-options").textContent = fmtNum(activeOptions);
   $("#quote-iv-coverage").textContent = activeOptions ? fmtPct(withIv / activeOptions) : "--";
   $("#quote-kline-status").textContent = activeOptions && withKline >= activeOptions ? "正常" : "补齐中";

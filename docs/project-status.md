@@ -16,7 +16,8 @@
 
 ## Verification
 
-- `uv run pytest -q`: passed, 41 tests.
+- WebUI T型报价 selector switching fixed; overview exchange labels are localized to Chinese; remaining expiry days appear in overview and T型报价.
+- `uv run pytest -q`: passed, 46 tests.
 - `uv run python -m compileall -q src tests option_data_manager`: passed.
 - `uv run python scripts/smoke-local-app.py --database data/tmp-smoke/script-smoke.sqlite3`: passed for API/WebUI factory endpoints.
 - `odm-api` server smoke on `127.0.0.1:18770`: `/api/health`, `/api/status`, and `/docs` returned 200.

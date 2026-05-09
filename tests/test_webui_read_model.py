@@ -225,7 +225,7 @@ def test_empty_quote_source_time_is_not_displayed_as_market_time() -> None:
     assert row["display_market_time"] is None
 
 
-def test_underlying_rows_expose_future_last_trade_and_option_expiry_days() -> None:
+def test_expiry_days_are_exposed_for_overview_and_tquote() -> None:
     connection = sqlite3.connect(":memory:")
     read_model = WebuiReadModel(connection)
     connection.executemany(
@@ -296,6 +296,12 @@ def test_underlying_rows_expose_future_last_trade_and_option_expiry_days() -> No
     assert quote["strikes"][0]["CALL"]["days_to_expire_datetime"] == (
         date(2026, 6, 10) - date.today()
     ).days
+
+    assert row["expire_datetime"] == "2026-06-10"
+    assert row["days_to_expiry"] == row["days_to_option_expire_datetime"]
+    assert quote["underlying"]["expire_datetime"] == "2026-06-10"
+    assert quote["underlying"]["days_to_expiry"] == row["days_to_expiry"]
+    assert quote["selectors"][0]["days_to_expiry"] == row["days_to_expiry"]
 
 
 def test_runs_include_service_logs() -> None:

@@ -10,6 +10,8 @@
 
 ## Done
 
+- Fixed T型报价 exchange/product/month selector switching and displayed remaining expiry days in overview/T型报价.
+
 - Requirements reviewed and implementation plan approved.
 - Package structure and `pyproject.toml`.
 - Governance baseline.

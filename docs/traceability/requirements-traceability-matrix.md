@@ -13,3 +13,4 @@
 | Realtime Quote operator controls | api app, webui app, service state/logs | `/api/quote-stream` API tests, WebUI settings controls, compileall |
 | Option/future expiry metadata for API callers | instruments repository, quote_streamer TQSDK field backfill, webui read model, API app | `tests/test_webui_read_model.py`, `tests/test_api_app.py`, `tests/test_quote_streamer.py` |
 | Local diagnostics/logging | service_state, api app, webui read model/app | service log repository smoke, compileall, API/WebUI tests once dependencies are available |
+| WEBUI-001 selector/localization/expiry-days change | webui read model/app | `tests/test_webui_read_model.py`; `uv run pytest -q` passed 46 tests; `uv run python -m compileall -q src tests`; agentic-SDLC check |
