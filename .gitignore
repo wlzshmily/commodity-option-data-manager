@@ -17,5 +17,6 @@ docs/qa/sdk-contract-reports/*.sqlite3-*
 *.log
 .env
 .env.*
+!.env.example
 *.key
 secret.key
