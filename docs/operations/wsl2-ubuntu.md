@@ -50,6 +50,12 @@ export TQSDK_PASSWORD="your-password"
 uv run odm-collect --max-batches 100 --wait-cycles 1
 ```
 
+Validate credentials and network connectivity without starting collection:
+
+```bash
+uv run odm-test-tqsdk
+```
+
 For local WebUI use, credentials may also be saved through Settings. On WSL/Linux, saved secrets are encrypted with a per-user Fernet key at:
 
 ```text

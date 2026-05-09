@@ -16,12 +16,13 @@
 
 ## Verification
 
-- `uv run pytest -q`: passed, 16 tests.
+- `uv run pytest -q`: passed, 19 tests.
 - `uv run python -m compileall -q src tests option_data_manager`: passed.
 - `scripts/agentic-sdlc/check-agentic-sdlc.ps1 -Root .`: passed.
 - WSL2 Ubuntu setup path documented in `docs/operations/wsl2-ubuntu.md`; Linux SDLC checker added at `scripts/agentic-sdlc/check-agentic-sdlc.sh`.
 - WSL setup guard verified: setup refuses `/mnt/c` Windows-mounted paths and requires a WSL-native clone.
 - WSL live TQSDK connection test passed under Python 3.11.
+- Standalone `odm-test-tqsdk` command added for credential/network checks outside the WebUI.
 - API factory smoke test: `/api/health`, `/api/status`, and `/api/settings` returned 200.
 - WebUI factory smoke test: `/`, `/api/settings`, and `/api/webui/overview` returned 200.
 - WebUI/API status now expose collection batch progress, including success, pending, failed, remaining, and recent failed batches.

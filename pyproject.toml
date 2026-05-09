@@ -14,6 +14,7 @@ dependencies = [
 [project.scripts]
 odm-api = "option_data_manager.api.app:main"
 odm-collect = "option_data_manager.cli.collect_market:main"
+odm-test-tqsdk = "option_data_manager.cli.check_tqsdk:main"
 odm-webui = "option_data_manager.webui.app:main"
 
 [dependency-groups]
