@@ -68,3 +68,10 @@
   - `uv run pytest -s tests/test_api_app.py tests/test_quote_streamer.py tests/test_realtime_health.py -q`: 28 passed.
   - `uv run python -m compileall -q src tests`: passed.
   - `uv run pytest -s -q`: 76 passed.
+- 2026-05-11 WSL dynamic contract manager baseline:
+  - Realtime startup now always refreshes the TQSDK contract universe before workers start, even when active contracts already exist.
+  - Long-lived quote-stream workers now run a contract-management loop. Worker 0 periodically calls TQSDK discovery; every worker periodically compares its shard's active Quote/Kline targets with in-memory references and reconciles incrementally.
+  - Functional test adds a new strike contract and marks the old option inactive while a stream is running; the worker subscribes only the new Quote/Kline symbol, removes the inactive symbol from local maps, and preserves unchanged references.
+  - `uv run pytest -s tests/test_quote_streamer.py tests/test_api_app.py tests/test_realtime_health.py -q`: 29 passed.
+  - `uv run python -m compileall -q src tests`: passed.
+  - `uv run pytest -s -q`: 77 passed.

@@ -31,3 +31,4 @@
 | WEBUI-009 | Done | Codex | Add trading-session-aware realtime network health detection without holiday/post-close false alerts | WSL full suite passed 73 tests after correcting normal Friday-night handling |
 | WEBUI-010 | Done | Codex | Add TQSDK official connection notification capture to realtime health reporting | WSL targeted realtime health/API/quote-stream tests passed 27 tests; full suite passed 75 tests |
 | WEBUI-011 | Done | Codex | Bootstrap the active contract universe before realtime subscription startup on empty databases | WSL targeted API/quote-stream/health tests passed 28 tests; full suite passed 76 tests |
+| CM-001 | Done | Codex | Implement mandatory dynamic contract management for realtime Quote/Kline workers | Startup discovery always runs; worker 0 periodic discovery; all workers incremental Quote/Kline reconciliation; WSL targeted API/quote-stream/health tests passed 29 tests; full suite passed 77 tests |

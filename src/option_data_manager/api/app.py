@@ -1067,9 +1067,14 @@ def _ensure_quote_stream_universe(
 ) -> tuple[bool, str, bool]:
     """Ensure realtime subscriptions have an active contract universe."""
 
-    if not force_discovery and _active_option_count(connection) > 0:
-        return (True, "已有可订阅合约。", False)
-    reason = "手动刷新合约列表" if force_discovery else "首次启动前初始化合约列表"
+    existing_active_options = _active_option_count(connection)
+    reason = (
+        "手动刷新合约列表"
+        if force_discovery
+        else "启动前刷新合约列表"
+        if existing_active_options > 0
+        else "首次启动前初始化合约列表"
+    )
     service_state.set_value("quote_stream.message", f"实时订阅启动前正在{reason}。")
     service_logs.append(
         level="info",
@@ -1403,6 +1408,16 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str
         for row in progress_rows
         if row.get("last_tqsdk_restore_at") is not None
     ]
+    contract_refresh_values = [
+        str(row.get("last_contract_refresh_at"))
+        for row in progress_rows
+        if row.get("last_contract_refresh_at") is not None
+    ]
+    contract_reconcile_values = [
+        str(row.get("last_contract_reconcile_at"))
+        for row in progress_rows
+        if row.get("last_contract_reconcile_at") is not None
+    ]
     started_values = [
         str(row.get("started_at"))
         for row in progress_rows
@@ -1455,6 +1470,31 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str
         else None,
         "tqsdk_notify_count": sum(
             _int_value(row.get("tqsdk_notify_count")) for row in progress_rows
+        ),
+        "contract_refresh_count": sum(
+            _int_value(row.get("contract_refresh_count")) for row in progress_rows
+        ),
+        "last_contract_refresh_at": max(contract_refresh_values)
+        if contract_refresh_values
+        else None,
+        "last_contract_reconcile_at": max(contract_reconcile_values)
+        if contract_reconcile_values
+        else None,
+        "contract_reconcile_added_quote_count": sum(
+            _int_value(row.get("contract_reconcile_added_quote_count"))
+            for row in progress_rows
+        ),
+        "contract_reconcile_removed_quote_count": sum(
+            _int_value(row.get("contract_reconcile_removed_quote_count"))
+            for row in progress_rows
+        ),
+        "contract_reconcile_added_kline_count": sum(
+            _int_value(row.get("contract_reconcile_added_kline_count"))
+            for row in progress_rows
+        ),
+        "contract_reconcile_removed_kline_count": sum(
+            _int_value(row.get("contract_reconcile_removed_kline_count"))
+            for row in progress_rows
         ),
         "cycle_count": sum(_int_value(row.get("cycle_count")) for row in progress_rows),
         "wait_update_count": sum(
@@ -1523,6 +1563,21 @@ def _progress_from_report(payload: dict[str, Any]) -> dict[str, Any] | None:
         "last_tqsdk_disconnect_at": result.get("last_tqsdk_disconnect_at"),
         "last_tqsdk_restore_at": result.get("last_tqsdk_restore_at"),
         "tqsdk_notify_count": _int_value(result.get("tqsdk_notify_count")),
+        "contract_refresh_count": _int_value(result.get("contract_refresh_count")),
+        "last_contract_refresh_at": result.get("last_contract_refresh_at"),
+        "last_contract_reconcile_at": result.get("last_contract_reconcile_at"),
+        "contract_reconcile_added_quote_count": _int_value(
+            result.get("contract_reconcile_added_quote_count")
+        ),
+        "contract_reconcile_removed_quote_count": _int_value(
+            result.get("contract_reconcile_removed_quote_count")
+        ),
+        "contract_reconcile_added_kline_count": _int_value(
+            result.get("contract_reconcile_added_kline_count")
+        ),
+        "contract_reconcile_removed_kline_count": _int_value(
+            result.get("contract_reconcile_removed_kline_count")
+        ),
         "cycle_count": _int_value(result.get("cycles")),
         "wait_update_count": _int_value(result.get("wait_update_count")),
         "quotes_written": _int_value(result.get("quotes_written")),
@@ -1609,6 +1664,13 @@ def _empty_quote_stream_progress(*, running: bool) -> dict[str, Any]:
         "last_tqsdk_disconnect_at": None,
         "last_tqsdk_restore_at": None,
         "tqsdk_notify_count": 0,
+        "contract_refresh_count": 0,
+        "last_contract_refresh_at": None,
+        "last_contract_reconcile_at": None,
+        "contract_reconcile_added_quote_count": 0,
+        "contract_reconcile_removed_quote_count": 0,
+        "contract_reconcile_added_kline_count": 0,
+        "contract_reconcile_removed_kline_count": 0,
         "cycle_count": 0,
         "wait_update_count": 0,
         "quotes_written": 0,

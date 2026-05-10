@@ -2,9 +2,9 @@
 
 | Task | Status | Files | Verification |
 | --- | --- | --- | --- |
-| CM-T001 | Draft | `docs/specs/SPEC-001-dynamic-contract-manager/*` | Requirements open questions resolved |
-| CM-T002 | Draft | `src/option_data_manager/*`, `tests/*` | Contract refresh diff unit tests |
-| CM-T003 | Draft | `src/option_data_manager/collection_state.py`, `tests/*` | Collection batches reset/stale behavior tests |
-| CM-T004 | Draft | `src/option_data_manager/quote_streamer.py`, `tests/*` | Incremental Quote/Kline subscription reconciliation tests |
-| CM-T005 | Draft | `src/option_data_manager/api/*`, `src/option_data_manager/webui/*`, `tests/*` | API/WebUI status tests |
-| CM-T006 | Draft | `docs/tasks/*`, `docs/traceability/*`, `docs/governance/*` | SDLC check |
+| CM-T001 | Done | `docs/specs/SPEC-001-dynamic-contract-manager/*` | Requirements scope confirmed for v0.1 realtime path |
+| CM-T002 | Done | `src/option_data_manager/api/app.py`, `tests/test_api_app.py` | Startup discovery bootstrap test |
+| CM-T003 | Deferred | `src/option_data_manager/collection_state.py`, `tests/*` | Collection batch rematerialization is already handled by collection plan materialization; more precise stale-batch reset remains future work |
+| CM-T004 | Done | `src/option_data_manager/quote_streamer.py`, `tests/test_quote_streamer.py` | Incremental Quote/Kline subscription reconciliation test |
+| CM-T005 | Done | `src/option_data_manager/api/*`, `src/option_data_manager/webui/*`, `tests/*` | API/WebUI progress fields and health hint tests via API/quote-stream suite |
+| CM-T006 | Done | `docs/tasks/*`, `docs/traceability/*`, `docs/governance/*` | Project memory updated |

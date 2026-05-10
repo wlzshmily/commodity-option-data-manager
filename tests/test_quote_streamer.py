@@ -1,4 +1,5 @@
 import sqlite3
+import time
 
 from option_data_manager.instruments import (
     InstrumentRepository,
@@ -466,3 +467,91 @@ def test_stream_quotes_records_tqsdk_connection_notifications() -> None:
     assert result.last_tqsdk_restore_at is not None
     assert progress_events[-1]["tqsdk_notify_count"] == 2
     assert progress_events[-1]["tqsdk_connection_status"] == "connected"
+
+
+def test_stream_quotes_reconciles_contract_universe_incrementally() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = InstrumentRepository(connection)
+    repository.upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C100",),
+            put_symbols=("DCE.a2601P100",),
+            last_seen_at="2026-05-11T00:00:00+08:00",
+        )
+    )
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.quote_batches: list[list[str]] = []
+            self.kline_symbols: list[object] = []
+
+        def get_quote_list(self, symbols: list[str]) -> list[dict[str, object]]:
+            self.quote_batches.append(list(symbols))
+            return [
+                {
+                    "datetime": "2026-05-11T00:00:00+08:00",
+                    "last_price": float(index + 1),
+                }
+                for index, _ in enumerate(symbols)
+            ]
+
+        def wait_update(self, *, deadline: float) -> bool:
+            time.sleep(0.002)
+            return True
+
+        def is_changing(self, quote: object, fields: object) -> bool:
+            return False
+
+        def get_kline_serial(
+            self,
+            symbol: object,
+            *,
+            duration_seconds: int,
+            data_length: int,
+        ) -> list[dict[str, object]]:
+            self.kline_symbols.append(symbol)
+            return []
+
+    refreshed = False
+
+    def refresh_contracts() -> None:
+        nonlocal refreshed
+        if refreshed:
+            return
+        refreshed = True
+        repository.upsert_instruments(
+            normalize_option_chain_discovery(
+                underlying_symbol="DCE.a2601",
+                call_symbols=("DCE.a2601C200",),
+                put_symbols=("DCE.a2601P100",),
+                last_seen_at="2026-05-11T08:55:00+08:00",
+            )
+        )
+        repository.mark_missing_inactive(
+            underlying_symbol="DCE.a2601",
+            seen_symbols={"DCE.a2601", "DCE.a2601C200", "DCE.a2601P100"},
+            last_seen_at="2026-05-11T08:55:00+08:00",
+        )
+
+    api = FakeApi()
+    result = stream_quotes(
+        api,
+        connection,
+        cycles=3,
+        wait_deadline_seconds=1,
+        contract_refresh_callback=refresh_contracts,
+        contract_refresh_interval_seconds=0.001,
+    )
+
+    assert api.quote_batches[0] == ["DCE.a2601", "DCE.a2601C100", "DCE.a2601P100"]
+    assert api.quote_batches[1] == ["DCE.a2601C200"]
+    assert result.subscribed_quote_count == 3
+    assert result.subscribed_kline_count == 3
+    assert result.contract_refresh_count >= 1
+    assert result.contract_reconcile_added_quote_count == 1
+    assert result.contract_reconcile_removed_quote_count == 1
+    assert result.contract_reconcile_added_kline_count == 1
+    assert result.contract_reconcile_removed_kline_count == 1
+    assert repository.get_instrument("DCE.a2601C100").active is False
+    assert repository.get_instrument("DCE.a2601C200").active is True

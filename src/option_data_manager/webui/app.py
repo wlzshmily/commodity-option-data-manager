@@ -266,6 +266,16 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict:
         for row in rows
         if row.get("last_tqsdk_restore_at") is not None
     ]
+    contract_refresh_values = [
+        str(row.get("last_contract_refresh_at"))
+        for row in rows
+        if row.get("last_contract_refresh_at") is not None
+    ]
+    contract_reconcile_values = [
+        str(row.get("last_contract_reconcile_at"))
+        for row in rows
+        if row.get("last_contract_reconcile_at") is not None
+    ]
     started_values = [
         str(row.get("started_at")) for row in rows if row.get("started_at") is not None
     ]
@@ -315,6 +325,31 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict:
         if tqsdk_restore_values
         else None,
         "tqsdk_notify_count": sum(_int_value(row.get("tqsdk_notify_count")) for row in rows),
+        "contract_refresh_count": sum(
+            _int_value(row.get("contract_refresh_count")) for row in rows
+        ),
+        "last_contract_refresh_at": max(contract_refresh_values)
+        if contract_refresh_values
+        else None,
+        "last_contract_reconcile_at": max(contract_reconcile_values)
+        if contract_reconcile_values
+        else None,
+        "contract_reconcile_added_quote_count": sum(
+            _int_value(row.get("contract_reconcile_added_quote_count"))
+            for row in rows
+        ),
+        "contract_reconcile_removed_quote_count": sum(
+            _int_value(row.get("contract_reconcile_removed_quote_count"))
+            for row in rows
+        ),
+        "contract_reconcile_added_kline_count": sum(
+            _int_value(row.get("contract_reconcile_added_kline_count"))
+            for row in rows
+        ),
+        "contract_reconcile_removed_kline_count": sum(
+            _int_value(row.get("contract_reconcile_removed_kline_count"))
+            for row in rows
+        ),
         "cycle_count": sum(_int_value(row.get("cycle_count")) for row in rows),
         "wait_update_count": sum(_int_value(row.get("wait_update_count")) for row in rows),
         "quotes_written": sum(_int_value(row.get("quotes_written")) for row in rows),
@@ -380,6 +415,21 @@ def _progress_from_report(payload: dict) -> dict | None:
         "last_tqsdk_disconnect_at": result.get("last_tqsdk_disconnect_at"),
         "last_tqsdk_restore_at": result.get("last_tqsdk_restore_at"),
         "tqsdk_notify_count": _int_value(result.get("tqsdk_notify_count")),
+        "contract_refresh_count": _int_value(result.get("contract_refresh_count")),
+        "last_contract_refresh_at": result.get("last_contract_refresh_at"),
+        "last_contract_reconcile_at": result.get("last_contract_reconcile_at"),
+        "contract_reconcile_added_quote_count": _int_value(
+            result.get("contract_reconcile_added_quote_count")
+        ),
+        "contract_reconcile_removed_quote_count": _int_value(
+            result.get("contract_reconcile_removed_quote_count")
+        ),
+        "contract_reconcile_added_kline_count": _int_value(
+            result.get("contract_reconcile_added_kline_count")
+        ),
+        "contract_reconcile_removed_kline_count": _int_value(
+            result.get("contract_reconcile_removed_kline_count")
+        ),
         "cycle_count": _int_value(result.get("cycles")),
         "wait_update_count": _int_value(result.get("wait_update_count")),
         "quotes_written": _int_value(result.get("quotes_written")),
@@ -460,6 +510,13 @@ def _empty_quote_stream_progress(*, running: bool) -> dict:
         "last_tqsdk_disconnect_at": None,
         "last_tqsdk_restore_at": None,
         "tqsdk_notify_count": 0,
+        "contract_refresh_count": 0,
+        "last_contract_refresh_at": None,
+        "last_contract_reconcile_at": None,
+        "contract_reconcile_added_quote_count": 0,
+        "contract_reconcile_removed_quote_count": 0,
+        "contract_reconcile_added_kline_count": 0,
+        "contract_reconcile_removed_kline_count": 0,
         "cycle_count": 0,
         "wait_update_count": 0,
         "quotes_written": 0,
@@ -2017,7 +2074,8 @@ function fmtRealtimeHealthHint(quoteStream) {
   const health = quoteStream?.health;
   if (!health) return "等待健康检测。";
   const notify = fmtTqsdkNotifyHint(quoteStream);
-  return [health.message ?? "等待健康检测。", notify].filter(Boolean).join(" · ");
+  const contractManager = fmtContractManagerHint(quoteStream);
+  return [health.message ?? "等待健康检测。", contractManager, notify].filter(Boolean).join(" · ");
 }
 
 function realtimeHealthTone(quoteStream) {
@@ -2038,6 +2096,18 @@ function fmtTqsdkNotifyHint(quoteStream) {
   };
   const label = statusLabels[status] ? `TQSDK ${statusLabels[status]}` : "TQSDK 通知";
   return `${label}：${content}`;
+}
+
+function fmtContractManagerHint(quoteStream) {
+  const progress = quoteStream?.progress ?? {};
+  const refreshCount = Number(progress.contract_refresh_count ?? 0);
+  const added = Number(progress.contract_reconcile_added_quote_count ?? 0)
+    + Number(progress.contract_reconcile_added_kline_count ?? 0);
+  const removed = Number(progress.contract_reconcile_removed_quote_count ?? 0)
+    + Number(progress.contract_reconcile_removed_kline_count ?? 0);
+  if (!refreshCount && !added && !removed) return "";
+  const timeText = progress.last_contract_refresh_at ? fmtDateTime(progress.last_contract_refresh_at) : "--";
+  return `合约管理 ${fmtNum(refreshCount)}次 · 增${fmtNum(added)} / 减${fmtNum(removed)} · ${timeText}`;
 }
 
 function fmtBatchRefreshHint(refresh) {

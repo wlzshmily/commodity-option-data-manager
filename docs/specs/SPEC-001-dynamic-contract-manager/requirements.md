@@ -44,7 +44,9 @@ As the operator of the local option data manager, I need the system to keep the 
 - Historical warehousing of every old contract's time series.
 - Trading, order placement, strategy scoring, alerting, or backtesting.
 
-## Open Questions
+## Confirmed Scope
 
-- [需要澄清] For the first implementation, should the pre-session refresh be manual/API-triggered only, or should it include a built-in scheduler?
-- [需要澄清] Should the system use one global refresh schedule for all exchanges, or exchange/product-specific schedules that account for night-session differences?
+- First implementation includes a built-in realtime contract-management loop, not only manual/API-triggered refresh.
+- Realtime startup always performs one authoritative TQSDK contract discovery pass before spawning workers, even when the database already has active contracts.
+- During long-running realtime operation, worker 0 periodically refreshes the persisted contract universe from TQSDK; all workers periodically compare their shard's current active symbols with in-memory Quote/Kline references and reconcile incrementally.
+- The first implementation uses a conservative global refresh interval instead of exchange/product-specific calendars. It avoids full worker restart and keeps unchanged references alive. More precise pre-session scheduling remains a future refinement, but the mandatory contract-management path is active.

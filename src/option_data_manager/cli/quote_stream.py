@@ -20,6 +20,7 @@ from option_data_manager.cli.collect_market import (
     _resolve_credentials,
 )
 from option_data_manager.quote_streamer import (
+    DEFAULT_CONTRACT_REFRESH_INTERVAL_SECONDS,
     DEFAULT_KLINE_BATCH_SIZE,
     DEFAULT_KLINE_DATA_LENGTH,
     DEFAULT_QUOTE_SHARD_SIZE,
@@ -93,6 +94,16 @@ def main(argv: list[str] | None = None) -> int:
                 stop_requested=_stop_file_requested(Path(args.stop_file))
                 if args.stop_file
                 else None,
+                contract_refresh_callback=(
+                    lambda: _discover_and_persist_market(api, connection)
+                )
+                if args.contract_refresh and args.worker_index == 0
+                else None,
+                contract_refresh_interval_seconds=(
+                    args.contract_refresh_interval_seconds
+                    if args.contract_refresh
+                    else None
+                ),
             )
         finally:
             connection.close()
@@ -159,6 +170,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--cycles", type=int, default=None)
     parser.add_argument("--duration-seconds", type=float, default=None)
     parser.add_argument("--wait-deadline-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--contract-refresh-interval-seconds",
+        type=float,
+        default=DEFAULT_CONTRACT_REFRESH_INTERVAL_SECONDS,
+    )
+    parser.add_argument(
+        "--no-contract-refresh",
+        dest="contract_refresh",
+        action="store_false",
+    )
     parser.add_argument("--stop-file", default=None)
     parser.add_argument("--no-discover", dest="discover", action="store_false")
     parser.add_argument("--no-klines", dest="include_klines", action="store_false")
@@ -174,6 +195,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         discover=True,
         include_klines=True,
         prioritize_near_expiry=True,
+        contract_refresh=True,
     )
     args = parser.parse_args(argv)
     if args.futures_only and args.options_only:

@@ -1,6 +1,6 @@
 # Design
 
-Draft only. Design cannot be finalized until requirements open questions are resolved and approved.
+Implemented baseline for the v0.1 realtime path.
 
 ## Proposed Shape
 
@@ -15,6 +15,10 @@ Draft only. Design cannot be finalized until requirements open questions are res
   - newly active symbols receive new Quote/Kline subscriptions without rebuilding the full subscription set.
 - Add an API/WebUI status surface for the latest contract refresh and realtime reconciliation status.
 - Keep runtime credential handling unchanged: credentials remain in environment variables or encrypted SQLite settings and are never written to tracked evidence.
+- `/api/quote-stream/start` performs one parent-process TQSDK discovery pass before spawning workers. This handles both empty databases and non-empty databases that may be stale.
+- `odm-quote-stream` keeps `--no-discover` worker startup for speed and boundary clarity, but each long-lived worker has a contract reconciliation loop. Worker 0 performs periodic TQSDK discovery; every worker periodically reselects its own shard's Quote/Kline targets from SQLite and applies an incremental diff.
+- Quote reconciliation removes inactive symbols from the in-memory reference map and subscribes only newly added symbols with `get_quote_list` batches.
+- Kline reconciliation removes inactive symbols from the in-memory reference map and subscribes only newly added Kline symbols. The default single-symbol Kline batch size remains the stable path.
 
 ## Session Boundary Model
 
@@ -28,3 +32,8 @@ The first design assumption is that contract-universe changes are authoritative 
 - Holiday schedule without a night session.
 - Refresh succeeds but realtime workers have not yet reconciled their in-memory subscription sets.
 - TQSDK release behavior for Quote/Kline references differs between quote-list and kline-serial objects.
+
+## Current Limitations
+
+- Physical server-side unsubscribe semantics are limited by TQSDK's public object/reference model. The implementation releases inactive symbols from local reference maps and stops writing/updating them; unchanged references remain alive and newly active symbols are added without full rebuild.
+- The first scheduler uses a global interval inside realtime workers. A future refinement can align refresh timing exactly to exchange/product-specific pre-session windows.

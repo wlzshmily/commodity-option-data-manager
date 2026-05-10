@@ -109,7 +109,17 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
             self.terminated = True
 
     created = []
+    discovery_calls = []
+    fake_api = object()
     monkeypatch.setattr("option_data_manager.api.app.subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(
+        "option_data_manager.api.app.create_tqsdk_api_with_retries",
+        lambda account, password: fake_api,
+    )
+    monkeypatch.setattr(
+        "option_data_manager.api.app._discover_and_persist_market",
+        lambda api, connection: discovery_calls.append(api),
+    )
 
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
@@ -142,6 +152,7 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
     assert payload["running"] is True
     assert payload["worker_count"] == 2
     assert len(payload["pids"]) == 2
+    assert discovery_calls == [fake_api]
     assert len(created) == 3
     assert "--worker-index" in created[0].command
     assert "--no-klines" not in created[0].command

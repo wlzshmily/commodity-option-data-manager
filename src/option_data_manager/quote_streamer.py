@@ -23,6 +23,7 @@ DEFAULT_KLINE_DATA_LENGTH = 20
 DEFAULT_METRICS_DIRTY_MIN_INTERVAL_SECONDS = 30
 DEFAULT_UNDERLYING_CHAIN_DIRTY_INTERVAL_SECONDS = 30
 DEFAULT_NEAR_EXPIRY_MONTHS = 2
+DEFAULT_CONTRACT_REFRESH_INTERVAL_SECONDS = 30 * 60
 _FAR_EXPIRY_KEY = (9999, 99)
 _MONTH_PATTERN = re.compile(r"(\d{3,4})")
 
@@ -58,6 +59,13 @@ class QuoteStreamResult:
     last_tqsdk_disconnect_at: str | None
     last_tqsdk_restore_at: str | None
     tqsdk_notify_count: int
+    contract_refresh_count: int
+    last_contract_refresh_at: str | None
+    last_contract_reconcile_at: str | None
+    contract_reconcile_added_quote_count: int
+    contract_reconcile_removed_quote_count: int
+    contract_reconcile_added_kline_count: int
+    contract_reconcile_removed_kline_count: int
     error_count: int
 
 
@@ -84,6 +92,8 @@ def stream_quotes(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     stop_requested: Callable[[], bool] | None = None,
     tq_notify_factory: Callable[[Any], Any] | None = None,
+    contract_refresh_callback: Callable[[], Any] | None = None,
+    contract_refresh_interval_seconds: float | None = None,
 ) -> QuoteStreamResult:
     """Keep quote references alive and write changed current quotes.
 
@@ -113,6 +123,11 @@ def stream_quotes(
         raise ValueError("wait_deadline_seconds must be positive.")
     if near_expiry_months < 1:
         raise ValueError("near_expiry_months must be positive.")
+    if (
+        contract_refresh_interval_seconds is not None
+        and contract_refresh_interval_seconds <= 0
+    ):
+        raise ValueError("contract_refresh_interval_seconds must be positive.")
     if not include_futures and not include_options:
         raise ValueError("At least one symbol class must be included.")
 
@@ -193,8 +208,7 @@ def stream_quotes(
     symbol_metadata = _quote_symbol_metadata(connection, symbols)
     error_count = 0
     quote_refs: dict[str, Any] = {}
-    kline_refs: list[Any] = []
-    subscribed_kline_count = 0
+    kline_refs: dict[str, Any] = {}
     quote_started_at = datetime.now(UTC).isoformat()
     _emit_progress(
         progress_callback,
@@ -248,13 +262,12 @@ def stream_quotes(
     attempted_kline_count = 0
     for batch in _batches(kline_symbols, kline_batch_size):
         attempted_kline_count += len(batch)
-        refs, subscribed_count, batch_error_count = _subscribe_kline_batch(
+        refs, batch_error_count = _subscribe_kline_ref_batch(
             api,
             batch,
             data_length=kline_data_length,
         )
-        kline_refs.extend(refs)
-        subscribed_kline_count += subscribed_count
+        kline_refs.update(refs)
         error_count += batch_error_count
         if (
             attempted_kline_count == len(kline_symbols)
@@ -273,12 +286,12 @@ def stream_quotes(
                 worker_count=worker_count,
                 quote_subscribed=len(quote_refs),
                 quote_total=len(symbols),
-                kline_subscribed=subscribed_kline_count,
+                kline_subscribed=len(kline_refs),
                 kline_total=len(kline_symbols),
                 near_expiry_months=near_expiry_months,
                 near_expiry_quote_subscribed=near_quote_total,
                 near_expiry_quote_total=near_quote_total,
-                near_expiry_kline_subscribed=min(subscribed_kline_count, near_kline_total),
+                near_expiry_kline_subscribed=min(len(kline_refs), near_kline_total),
                 near_expiry_kline_total=near_kline_total,
                 tq_notify_state=tqsdk_notify_state,
             )
@@ -293,12 +306,12 @@ def stream_quotes(
         worker_count=worker_count,
         quote_subscribed=len(quote_refs),
         quote_total=len(symbols),
-        kline_subscribed=subscribed_kline_count,
+        kline_subscribed=len(kline_refs),
         kline_total=len(kline_symbols),
         near_expiry_months=near_expiry_months,
         near_expiry_quote_subscribed=near_quote_total,
         near_expiry_quote_total=near_quote_total,
-        near_expiry_kline_subscribed=min(subscribed_kline_count, near_kline_total),
+        near_expiry_kline_subscribed=min(len(kline_refs), near_kline_total),
         near_expiry_kline_total=near_kline_total,
         tq_notify_state=tqsdk_notify_state,
     )
@@ -310,6 +323,18 @@ def stream_quotes(
     last_wait_update_at: str | None = None
     last_quote_write_at: str | None = None
     next_progress_heartbeat_at = time.monotonic()
+    next_contract_refresh_at = (
+        time.monotonic() + contract_refresh_interval_seconds
+        if contract_refresh_interval_seconds is not None
+        else None
+    )
+    contract_refresh_count = 0
+    last_contract_refresh_at: str | None = None
+    last_contract_reconcile_at: str | None = None
+    reconcile_added_quote_count = 0
+    reconcile_removed_quote_count = 0
+    reconcile_added_kline_count = 0
+    reconcile_removed_kline_count = 0
 
     while True:
         if stop_requested is not None and stop_requested():
@@ -324,6 +349,54 @@ def stream_quotes(
             wait_update_count += 1
             last_wait_update_at = datetime.now(UTC).isoformat()
         tqsdk_notify_state.consume(tq_notify)
+        now_monotonic = time.monotonic()
+        if (
+            next_contract_refresh_at is not None
+            and now_monotonic >= next_contract_refresh_at
+        ):
+            next_contract_refresh_at = now_monotonic + float(
+                contract_refresh_interval_seconds or 0
+            )
+            if contract_refresh_callback is not None:
+                try:
+                    contract_refresh_callback()
+                    contract_refresh_count += 1
+                    last_contract_refresh_at = datetime.now(UTC).isoformat()
+                except Exception:
+                    error_count += 1
+            reconcile = _reconcile_subscriptions(
+                api,
+                connection,
+                quote_refs=quote_refs,
+                kline_refs=kline_refs,
+                worker_index=worker_index,
+                worker_count=worker_count,
+                max_symbols=max_symbols,
+                include_futures=include_futures,
+                include_options=include_options,
+                include_klines=include_klines,
+                prioritize_near_expiry=prioritize_near_expiry,
+                near_expiry_months=near_expiry_months,
+                quote_shard_size=quote_shard_size,
+                kline_batch_size=kline_batch_size,
+                kline_data_length=kline_data_length,
+            )
+            symbols = reconcile["symbols"]
+            kline_symbols = reconcile["kline_symbols"]
+            near_quote_total = reconcile["near_quote_total"]
+            near_kline_total = reconcile["near_kline_total"]
+            symbol_metadata = _quote_symbol_metadata(connection, symbols)
+            reconcile_added_quote_count += reconcile["added_quote_count"]
+            reconcile_removed_quote_count += reconcile["removed_quote_count"]
+            reconcile_added_kline_count += reconcile["added_kline_count"]
+            reconcile_removed_kline_count += reconcile["removed_kline_count"]
+            if (
+                reconcile["added_quote_count"]
+                or reconcile["removed_quote_count"]
+                or reconcile["added_kline_count"]
+                or reconcile["removed_kline_count"]
+            ):
+                last_contract_reconcile_at = datetime.now(UTC).isoformat()
         received_at = datetime.now(UTC).isoformat()
         wrote_quote_this_cycle = False
         for symbol, quote_ref in quote_refs.items():
@@ -377,13 +450,13 @@ def stream_quotes(
                 worker_count=worker_count,
                 quote_subscribed=len(quote_refs),
                 quote_total=len(symbols),
-                kline_subscribed=subscribed_kline_count,
+                kline_subscribed=len(kline_refs),
                 kline_total=len(kline_symbols),
                 near_expiry_months=near_expiry_months,
                 near_expiry_quote_subscribed=near_quote_total,
                 near_expiry_quote_total=near_quote_total,
                 near_expiry_kline_subscribed=min(
-                    subscribed_kline_count,
+                    len(kline_refs),
                     near_kline_total,
                 ),
                 near_expiry_kline_total=near_kline_total,
@@ -394,6 +467,13 @@ def stream_quotes(
                 last_wait_update_at=last_wait_update_at,
                 last_quote_write_at=last_quote_write_at,
                 tq_notify_state=tqsdk_notify_state,
+                contract_refresh_count=contract_refresh_count,
+                last_contract_refresh_at=last_contract_refresh_at,
+                last_contract_reconcile_at=last_contract_reconcile_at,
+                contract_reconcile_added_quote_count=reconcile_added_quote_count,
+                contract_reconcile_removed_quote_count=reconcile_removed_quote_count,
+                contract_reconcile_added_kline_count=reconcile_added_kline_count,
+                contract_reconcile_removed_kline_count=reconcile_removed_kline_count,
             )
 
     return QuoteStreamResult(
@@ -404,7 +484,7 @@ def stream_quotes(
         symbol_count=len(symbols),
         kline_symbol_count=len(kline_symbols),
         subscribed_quote_count=len(quote_refs),
-        subscribed_kline_count=subscribed_kline_count,
+        subscribed_kline_count=len(kline_refs),
         quote_shard_size=quote_shard_size,
         kline_data_length=kline_data_length,
         near_expiry_months=near_expiry_months,
@@ -424,6 +504,13 @@ def stream_quotes(
         last_tqsdk_disconnect_at=tqsdk_notify_state.last_disconnect_at,
         last_tqsdk_restore_at=tqsdk_notify_state.last_restore_at,
         tqsdk_notify_count=tqsdk_notify_state.notify_count,
+        contract_refresh_count=contract_refresh_count,
+        last_contract_refresh_at=last_contract_refresh_at,
+        last_contract_reconcile_at=last_contract_reconcile_at,
+        contract_reconcile_added_quote_count=reconcile_added_quote_count,
+        contract_reconcile_removed_quote_count=reconcile_removed_quote_count,
+        contract_reconcile_added_kline_count=reconcile_added_kline_count,
+        contract_reconcile_removed_kline_count=reconcile_removed_kline_count,
         error_count=error_count,
     )
 
@@ -592,6 +679,142 @@ def _subscribe_kline_batch(
             except Exception:
                 error_count += 1
         return (refs, len(refs), error_count)
+
+
+def _subscribe_kline_ref_batch(
+    api: Any,
+    symbols: list[str],
+    *,
+    data_length: int,
+) -> tuple[dict[str, Any], int]:
+    """Subscribe Kline symbols and retain a symbol-to-reference map."""
+
+    if not symbols:
+        return ({}, 0)
+    try:
+        symbol_arg: str | list[str] = symbols[0] if len(symbols) == 1 else list(symbols)
+        ref = api.get_kline_serial(
+            symbol_arg,
+            duration_seconds=SECONDS_PER_DAY,
+            data_length=data_length,
+        )
+        return ({symbol: ref for symbol in symbols}, 0)
+    except Exception:
+        refs: dict[str, Any] = {}
+        error_count = 0
+        for symbol in symbols:
+            try:
+                refs[symbol] = api.get_kline_serial(
+                    symbol,
+                    duration_seconds=SECONDS_PER_DAY,
+                    data_length=data_length,
+                )
+            except Exception:
+                error_count += 1
+        return (refs, error_count)
+
+
+def _reconcile_subscriptions(
+    api: Any,
+    connection: sqlite3.Connection,
+    *,
+    quote_refs: dict[str, Any],
+    kline_refs: dict[str, Any],
+    worker_index: int,
+    worker_count: int,
+    max_symbols: int | None,
+    include_futures: bool,
+    include_options: bool,
+    include_klines: bool,
+    prioritize_near_expiry: bool,
+    near_expiry_months: int,
+    quote_shard_size: int,
+    kline_batch_size: int,
+    kline_data_length: int,
+) -> dict[str, Any]:
+    symbols = select_quote_symbols(
+        connection,
+        worker_index=worker_index,
+        worker_count=worker_count,
+        max_symbols=max_symbols,
+        include_futures=include_futures,
+        include_options=include_options,
+        prioritize_near_expiry=prioritize_near_expiry,
+    )
+    kline_symbols = (
+        select_kline_symbols(
+            connection,
+            worker_index=worker_index,
+            worker_count=worker_count,
+            max_symbols=max_symbols,
+            prioritize_near_expiry=prioritize_near_expiry,
+        )
+        if include_options and include_klines
+        else []
+    )
+    target_quotes = set(symbols)
+    target_klines = set(kline_symbols)
+    removed_quote_count = 0
+    for symbol in list(quote_refs):
+        if symbol not in target_quotes:
+            quote_refs.pop(symbol, None)
+            removed_quote_count += 1
+    removed_kline_count = 0
+    for symbol in list(kline_refs):
+        if symbol not in target_klines:
+            kline_refs.pop(symbol, None)
+            removed_kline_count += 1
+    added_quote_symbols = [symbol for symbol in symbols if symbol not in quote_refs]
+    for batch in _batches(added_quote_symbols, quote_shard_size):
+        quote_refs.update(zip(batch, _quote_list(api, batch), strict=True))
+    added_kline_count = 0
+    for batch in _batches(
+        [symbol for symbol in kline_symbols if symbol not in kline_refs],
+        kline_batch_size,
+    ):
+        refs, _error_count = _subscribe_kline_ref_batch(
+            api,
+            batch,
+            data_length=kline_data_length,
+        )
+        kline_refs.update(refs)
+        added_kline_count += len(refs)
+    near_quote_total = (
+        count_near_expiry_quote_symbols(
+            connection,
+            worker_index=worker_index,
+            worker_count=worker_count,
+            max_symbols=max_symbols,
+            include_futures=include_futures,
+            include_options=include_options,
+            prioritize_near_expiry=prioritize_near_expiry,
+            near_expiry_months=near_expiry_months,
+        )
+        if prioritize_near_expiry
+        else 0
+    )
+    near_kline_total = (
+        count_near_expiry_kline_symbols(
+            connection,
+            worker_index=worker_index,
+            worker_count=worker_count,
+            max_symbols=max_symbols,
+            prioritize_near_expiry=prioritize_near_expiry,
+            near_expiry_months=near_expiry_months,
+        )
+        if include_options and include_klines and prioritize_near_expiry
+        else 0
+    )
+    return {
+        "symbols": symbols,
+        "kline_symbols": kline_symbols,
+        "near_quote_total": near_quote_total,
+        "near_kline_total": near_kline_total,
+        "added_quote_count": len(added_quote_symbols),
+        "removed_quote_count": removed_quote_count,
+        "added_kline_count": added_kline_count,
+        "removed_kline_count": removed_kline_count,
+    }
 
 
 def _quote_subscription_rows(
@@ -991,6 +1214,13 @@ def _emit_progress(
     last_wait_update_at: str | None = None,
     last_quote_write_at: str | None = None,
     tq_notify_state: _TqsdkNotifyState | None = None,
+    contract_refresh_count: int = 0,
+    last_contract_refresh_at: str | None = None,
+    last_contract_reconcile_at: str | None = None,
+    contract_reconcile_added_quote_count: int = 0,
+    contract_reconcile_removed_quote_count: int = 0,
+    contract_reconcile_added_kline_count: int = 0,
+    contract_reconcile_removed_kline_count: int = 0,
 ) -> None:
     if progress_callback is None:
         return
@@ -1028,6 +1258,21 @@ def _emit_progress(
             "changed_quotes_written": changed_quotes_written,
             "last_wait_update_at": last_wait_update_at,
             "last_quote_write_at": last_quote_write_at,
+            "contract_refresh_count": contract_refresh_count,
+            "last_contract_refresh_at": last_contract_refresh_at,
+            "last_contract_reconcile_at": last_contract_reconcile_at,
+            "contract_reconcile_added_quote_count": (
+                contract_reconcile_added_quote_count
+            ),
+            "contract_reconcile_removed_quote_count": (
+                contract_reconcile_removed_quote_count
+            ),
+            "contract_reconcile_added_kline_count": (
+                contract_reconcile_added_kline_count
+            ),
+            "contract_reconcile_removed_kline_count": (
+                contract_reconcile_removed_kline_count
+            ),
             "completion_ratio": subscribed_objects / total_objects
             if total_objects
             else 0.0,
