@@ -10,6 +10,8 @@
 
 ## Done
 
+- Hardened realtime status and stop endpoints so transient SQLite service-state write locks do not surface as 500 responses; remote start/stop smoke now stops quote and metrics workers cleanly.
+- Documented Linux server deployment with GitHub commit releases, shared runtime data, systemd service, verification, public test exposure, upgrade, and rollback steps.
 - Fixed T型报价 exchange/product/month selector switching and displayed remaining expiry days in overview/T型报价.
 - Reduced T型报价 contract switching latency and filled remaining expiry days from stored TQSDK quote payload fields when instrument expiry columns are still empty.
 - Clarified overview realtime Quote status separately from batch collection progress, including worker count/PIDs and latest data write time.

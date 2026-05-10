@@ -181,6 +181,70 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
     assert all(process.terminated for process in created)
 
 
+def test_quote_stream_stop_is_best_effort_when_state_db_is_locked(monkeypatch) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.pid = 32200
+            self.terminated = False
+
+        def poll(self):
+            return 0 if self.terminated else None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.terminated = True
+            return 0
+
+        def kill(self) -> None:
+            self.terminated = True
+
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    process = FakeProcess()
+    app.state.quote_stream_processes["processes"] = [process]
+    app.state.service_state.set_value("quote_stream.running", "true")
+    app.state.service_state.set_value("quote_stream.worker_count", "1")
+    app.state.service_state.set_value("quote_stream.pids", "[32200]")
+
+    def locked_set_value(key, value):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(app.state.service_state, "set_value", locked_set_value)
+    client = TestClient(app)
+
+    response = client.post("/api/quote-stream/stop")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["running"] is False
+    assert payload["message"] == "已请求停止 1 个实时订阅 worker 和 0 个指标 worker。"
+    assert process.terminated is True
+
+
+def test_quote_stream_status_ignores_stale_state_write_lock(monkeypatch) -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    app.state.quote_stream_processes["processes"] = []
+    app.state.service_state.set_value("quote_stream.running", "true")
+    app.state.service_state.set_value("quote_stream.worker_count", "1")
+    app.state.service_state.set_value("quote_stream.message", "实时订阅 worker 已启动。")
+
+    def locked_set_value(key, value):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(app.state.service_state, "set_value", locked_set_value)
+    client = TestClient(app)
+
+    response = client.get("/api/quote-stream")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["running"] is False
+    assert payload["status"] == "stopped"
+
+
 def test_quote_stream_start_initializes_empty_contract_universe(monkeypatch) -> None:
     class FakeProcess:
         _next_pid = 32100

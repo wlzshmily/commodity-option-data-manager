@@ -204,13 +204,15 @@ def create_app(
             response = await call_next(request)
         except Exception as exc:
             if request.url.path.startswith("/api/"):
-                service_state.record_request(
+                _safe_record_request(
+                    service_state,
                     path=request.url.path,
                     method=request.method,
                     status_code=500,
                     latency_ms=(time.perf_counter() - started) * 1000,
                 )
-                service_logs.append(
+                _safe_append_service_log(
+                    service_logs,
                     level="error",
                     category="api",
                     message="Unhandled API request error.",
@@ -222,14 +224,16 @@ def create_app(
                 )
             raise
         if request.url.path.startswith("/api/"):
-            service_state.record_request(
+            _safe_record_request(
+                service_state,
                 path=request.url.path,
                 method=request.method,
                 status_code=response.status_code,
                 latency_ms=(time.perf_counter() - started) * 1000,
             )
             if response.status_code >= 500:
-                service_logs.append(
+                _safe_append_service_log(
+                    service_logs,
                     level="error",
                     category="api",
                     message="API request returned a server error.",
@@ -559,9 +563,11 @@ def create_app(
         with quote_stream_lock:
             _request_quote_stream_stop_files(service_state)
             processes = quote_stream_processes.get("processes", [])
-            persisted_pids = _json_int_list(service_state.get_value("quote_stream.pids"))
+            persisted_pids = _json_int_list(
+                _safe_get_service_value(service_state, "quote_stream.pids")
+            )
             persisted_metrics_pids = _json_int_list(
-                service_state.get_value("metrics_worker.pids")
+                _safe_get_service_value(service_state, "metrics_worker.pids")
             )
             attached_pids = {int(process.pid) for process in processes}
             attached_metrics_pids = {
@@ -603,33 +609,40 @@ def create_app(
             finished_at = datetime.now(UTC).isoformat()
             quote_stream_processes["processes"] = []
             metrics_worker_processes["processes"] = []
-            service_state.set_value("quote_stream.running", "false")
-            service_state.set_value("quote_stream.finished_at", finished_at)
-            service_state.set_value("quote_stream.pids", "[]")
-            service_state.set_value("metrics_worker.running", "false")
-            service_state.set_value("metrics_worker.finished_at", finished_at)
-            service_state.set_value("metrics_worker.pids", "[]")
-            service_state.set_value(
-                "quote_stream.message",
-                f"已请求停止 {stopped} 个实时订阅 worker 和 {metrics_stopped} 个指标 worker。",
+            _safe_set_service_value(service_state, "quote_stream.running", "false")
+            _safe_set_service_value(service_state, "quote_stream.finished_at", finished_at)
+            _safe_set_service_value(service_state, "quote_stream.pids", "[]")
+            _safe_set_service_value(service_state, "metrics_worker.running", "false")
+            _safe_set_service_value(service_state, "metrics_worker.finished_at", finished_at)
+            _safe_set_service_value(service_state, "metrics_worker.pids", "[]")
+            stop_message = (
+                f"已请求停止 {stopped} 个实时订阅 worker 和 {metrics_stopped} 个指标 worker。"
             )
-            service_state.set_value(
+            _safe_set_service_value(
+                service_state,
+                "quote_stream.message",
+                stop_message,
+            )
+            _safe_set_service_value(
+                service_state,
                 "metrics_worker.message",
                 f"已请求停止 {metrics_stopped} 个指标刷新 worker。",
             )
-            service_logs.append(
+            _safe_append_service_log(
+                service_logs,
                 level="info",
                 category="quote_stream",
                 message="实时订阅 worker 已停止。",
                 context={"stopped_workers": stopped},
             )
-            return QuoteStreamResponse(
-                **_quote_stream_status(
-                    service_state,
-                    quote_stream_processes,
-                    connection=connection,
-                )
+            payload = _quote_stream_status(
+                service_state,
+                quote_stream_processes,
+                connection=connection,
             )
+            payload["message"] = stop_message
+            payload["finished_at"] = payload["finished_at"] or finished_at
+            return QuoteStreamResponse(**payload)
 
     @app.get("/api/exchanges")
     def exchanges(_: ApiKeyRecord | None = Depends(require_auth)) -> list[dict[str, Any]]:
@@ -1267,11 +1280,13 @@ def _hidden_startupinfo() -> subprocess.STARTUPINFO | None:
 
 
 def _request_quote_stream_stop_files(service_state: ServiceStateRepository) -> None:
-    report_dir = service_state.get_value("quote_stream.report_dir")
+    report_dir = _safe_get_service_value(service_state, "quote_stream.report_dir")
     if not report_dir:
         return
     directory = Path(report_dir)
-    worker_count = _int_or_none(service_state.get_value("quote_stream.worker_count")) or 0
+    worker_count = _int_or_none(
+        _safe_get_service_value(service_state, "quote_stream.worker_count")
+    ) or 0
     if worker_count:
         for worker_index in range(worker_count):
             path = directory / f"worker-{worker_index:02d}-of-{worker_count:02d}.stop"
@@ -1288,30 +1303,45 @@ def _quote_stream_status(
 ) -> dict[str, Any]:
     processes = process_table.get("processes", [])
     attached_pids = [int(process.pid) for process in processes if process.poll() is None]
-    persisted_pids = _json_int_list(service_state.get_value("quote_stream.pids"))
+    persisted_pids = _json_int_list(
+        _safe_get_service_value(service_state, "quote_stream.pids")
+    )
     live_persisted_pids = [
         pid for pid in persisted_pids if pid not in attached_pids and _pid_is_quote_stream(pid)
     ]
     live_pids = attached_pids or live_persisted_pids
     running = bool(live_pids)
+    persisted_running = _safe_get_service_value(service_state, "quote_stream.running")
     if running:
-        if (service_state.get_value("quote_stream.running") or "false") != "true":
-            service_state.set_value("quote_stream.running", "true")
-            service_state.set_value(
+        if (persisted_running or "false") != "true":
+            _safe_set_service_value(service_state, "quote_stream.running", "true")
+            _safe_set_service_value(
+                service_state,
                 "quote_stream.message",
                 "实时订阅 worker 仍在运行。",
             )
-    elif processes or (service_state.get_value("quote_stream.running") or "false") == "true":
+    elif processes or (persisted_running or "false") == "true":
         process_table["processes"] = []
-        service_state.set_value("quote_stream.running", "false")
-        service_state.set_value("quote_stream.finished_at", datetime.now(UTC).isoformat())
-        service_state.set_value("quote_stream.message", "实时订阅 worker 已退出。")
-    worker_count = _int_or_none(service_state.get_value("quote_stream.worker_count")) or (
+        _safe_set_service_value(service_state, "quote_stream.running", "false")
+        _safe_set_service_value(
+            service_state,
+            "quote_stream.finished_at",
+            datetime.now(UTC).isoformat(),
+        )
+        _safe_set_service_value(
+            service_state,
+            "quote_stream.message",
+            "实时订阅 worker 已退出。",
+        )
+    worker_count = _int_or_none(
+        _safe_get_service_value(service_state, "quote_stream.worker_count")
+    ) or (
         len(live_pids) if live_pids else len(persisted_pids)
     )
     status = "running" if running else "stopped"
+    report_dir = _safe_get_service_value(service_state, "quote_stream.report_dir")
     progress = _quote_stream_progress(
-        service_state.get_value("quote_stream.report_dir"),
+        report_dir,
         running=running,
     )
     health = build_realtime_health(
@@ -1322,15 +1352,92 @@ def _quote_stream_status(
     return {
         "status": status,
         "running": running,
-        "message": service_state.get_value("quote_stream.message"),
+        "message": _safe_get_service_value(service_state, "quote_stream.message")
+        or ("实时订阅 worker 仍在运行。" if running else "实时订阅未运行。"),
         "worker_count": worker_count,
         "pids": live_pids,
-        "report_dir": service_state.get_value("quote_stream.report_dir"),
-        "started_at": service_state.get_value("quote_stream.started_at"),
-        "finished_at": service_state.get_value("quote_stream.finished_at"),
+        "report_dir": report_dir,
+        "started_at": _safe_get_service_value(service_state, "quote_stream.started_at"),
+        "finished_at": _safe_get_service_value(service_state, "quote_stream.finished_at"),
         "progress": progress,
         "health": health,
     }
+
+
+def _safe_get_service_value(
+    service_state: ServiceStateRepository,
+    key: str,
+    default: str | None = None,
+) -> str | None:
+    try:
+        return service_state.get_value(key)
+    except sqlite3.OperationalError as exc:
+        if _is_sqlite_busy(exc):
+            return default
+        raise
+
+
+def _safe_set_service_value(
+    service_state: ServiceStateRepository,
+    key: str,
+    value: str | None,
+) -> bool:
+    try:
+        service_state.set_value(key, value)
+    except sqlite3.OperationalError as exc:
+        if _is_sqlite_busy(exc):
+            return False
+        raise
+    return True
+
+
+def _safe_append_service_log(
+    service_logs: ServiceLogRepository,
+    *,
+    level: str,
+    category: str,
+    message: str,
+    context: dict[str, Any] | None = None,
+) -> bool:
+    try:
+        service_logs.append(
+            level=level,
+            category=category,
+            message=message,
+            context=context,
+        )
+    except sqlite3.OperationalError as exc:
+        if _is_sqlite_busy(exc):
+            return False
+        raise
+    return True
+
+
+def _safe_record_request(
+    service_state: ServiceStateRepository,
+    *,
+    path: str,
+    method: str,
+    status_code: int,
+    latency_ms: float,
+) -> bool:
+    try:
+        service_state.record_request(
+            path=path,
+            method=method,
+            status_code=status_code,
+            latency_ms=latency_ms,
+        )
+    except sqlite3.OperationalError as exc:
+        if _is_sqlite_busy(exc):
+            return False
+        raise
+    return True
+
+
+def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database is busy" in message
 
 
 def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str, Any]:

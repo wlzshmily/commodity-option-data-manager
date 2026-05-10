@@ -97,17 +97,21 @@ class ServiceStateRepository:
 
     def set_value(self, key: str, value: str | None) -> None:
         now = datetime.now(UTC).isoformat()
-        self._connection.execute(
-            """
-            INSERT INTO service_state (key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = excluded.updated_at
-            """,
-            (key, value, now),
-        )
-        self._connection.commit()
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO service_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, now),
+            )
+            self._connection.commit()
+        except sqlite3.OperationalError:
+            self._connection.rollback()
+            raise
 
     def get_value(self, key: str) -> str | None:
         row = self._connection.execute(
@@ -124,22 +128,26 @@ class ServiceStateRepository:
         status_code: int,
         latency_ms: float,
     ) -> None:
-        self._connection.execute(
-            """
-            INSERT INTO api_request_metrics (
-                path, method, status_code, latency_ms, created_at
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO api_request_metrics (
+                    path, method, status_code, latency_ms, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    path,
+                    method,
+                    status_code,
+                    latency_ms,
+                    datetime.now(UTC).isoformat(),
+                ),
             )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                path,
-                method,
-                status_code,
-                latency_ms,
-                datetime.now(UTC).isoformat(),
-            ),
-        )
-        self._connection.commit()
+            self._connection.commit()
+        except sqlite3.OperationalError:
+            self._connection.rollback()
+            raise
 
     def api_summary(self) -> ApiMetricSummary:
         row = self._connection.execute(
@@ -182,22 +190,26 @@ class ServiceLogRepository:
         cleaned_category = _required_text(category, "Service log category")
         cleaned_message = _required_text(message, "Service log message")
         created_at = datetime.now(UTC).isoformat()
-        cursor = self._connection.execute(
-            """
-            INSERT INTO service_logs (
-                created_at, level, category, message, context_json
+        try:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO service_logs (
+                    created_at, level, category, message, context_json
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    created_at,
+                    normalized_level,
+                    cleaned_category,
+                    cleaned_message,
+                    _context_json(context),
+                ),
             )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                created_at,
-                normalized_level,
-                cleaned_category,
-                cleaned_message,
-                _context_json(context),
-            ),
-        )
-        self._connection.commit()
+            self._connection.commit()
+        except sqlite3.OperationalError:
+            self._connection.rollback()
+            raise
         return ServiceLogRecord(
             log_id=int(cursor.lastrowid),
             created_at=created_at,

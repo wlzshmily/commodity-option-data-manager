@@ -10,6 +10,7 @@
 - Risk register: `docs/governance/risk-register.md`
 - Release plan: `docs/release/release-plan.md`
 - WSL2 Ubuntu operations: `docs/operations/wsl2-ubuntu.md`
+- Linux server deployment: `docs/operations/linux-server-deployment.md`
 
 ## Current Active Plan
 

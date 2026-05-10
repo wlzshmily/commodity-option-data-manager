@@ -17,6 +17,14 @@
 - `uv run odm-collect-parallel --database data/option-data-current.sqlite3 --workers 2 --max-batches-per-worker 1 --option-batch-size 40 --wait-cycles 1 --no-discover` verifies process-level TQSDK shard wiring without exposing secrets.
 - WebUI/API quote stream controls can be smoke-tested without live TQSDK by monkeypatched API tests; live operation uses the same `odm-quote-stream` CLI path and writes runtime reports under ignored `docs/qa/live-evidence/quote-stream-runtime/`.
 
+## Server Deployment
+
+- Linux server deployment is documented in `docs/operations/linux-server-deployment.md`.
+- Deploy explicit GitHub commit SHAs into `/opt/option-data-manager/releases/<short-sha>`, switch `/opt/option-data-manager/current`, and keep runtime SQLite/report state under `/opt/option-data-manager/shared/`.
+- Run deployment verification before switching traffic: `pytest -q`, compileall, `scripts/smoke-local-app.py`, and `scripts/agentic-sdlc/check-agentic-sdlc.sh`.
+- After a service restart, restart background refresh and realtime subscriptions if operators expect collection to continue immediately.
+- Public `8765/tcp` binding is for temporary test servers only; production access should use SSH tunneling, VPN, Cloudflare Access, or an authenticated HTTPS reverse proxy.
+
 ## Acceptance Evidence
 
 - Final tuned full-market catch-up: `docs/qa/live-evidence/final-parallel-catchup/summary.json` with 4 worker shards, 6 waves, 27,386 active options, 864/864 successful batches, 0 failed batches, 4,325.332 seconds, and 6.332 options/second.
@@ -29,4 +37,5 @@
 - Stop local services.
 - Restore the previous ignored runtime SQLite database backup if needed.
 - Keep source changes separate from runtime data.
+- Server rollback points `/opt/option-data-manager/current` back to a previous release directory and restarts `odm-webui`; shared SQLite data is preserved unless a separate database restore is explicitly required.
 
