@@ -66,14 +66,19 @@ class WebuiReadModel:
             "underlyings": rows,
         }
 
-    def tquote(self, *, underlying_symbol: str | None = None) -> dict[str, Any]:
+    def tquote(
+        self,
+        *,
+        underlying_symbol: str | None = None,
+        include_selectors: bool = True,
+    ) -> dict[str, Any]:
         """Return one underlying option chain aligned by strike price."""
 
         selected = underlying_symbol or _default_underlying(self.connection)
         if selected is None:
             return {
                 "underlying": None,
-                "selectors": _selector_rows(self.connection),
+                "selectors": _selector_rows(self.connection) if include_selectors else [],
                 "strikes": [],
                 "atm_strike": None,
                 "maxima": _empty_maxima(),
@@ -84,7 +89,7 @@ class WebuiReadModel:
         atm_strike = _atm_strike(strike_rows, underlying.get("last_price"))
         return {
             "underlying": underlying,
-            "selectors": _selector_rows(self.connection),
+            "selectors": _selector_rows(self.connection) if include_selectors else [],
             "strikes": strike_rows,
             "atm_strike": atm_strike,
             "maxima": _maxima(strike_rows),
@@ -152,6 +157,36 @@ def _overview_totals(connection: sqlite3.Connection) -> dict[str, int]:
           AND {_quote_has_market_data_sql("q")}
         """,
     )
+    active_quote_symbols = _scalar(
+        connection,
+        """
+        SELECT COUNT(*)
+        FROM instruments
+        WHERE active = 1
+          AND (ins_class = 'FUTURE' OR option_class IN ('CALL', 'PUT'))
+        """,
+    )
+    quote_symbol_rows = _scalar(
+        connection,
+        """
+        SELECT COUNT(*)
+        FROM instruments i
+        JOIN quote_current q ON q.symbol = i.symbol
+        WHERE i.active = 1
+          AND (i.ins_class = 'FUTURE' OR i.option_class IN ('CALL', 'PUT'))
+        """,
+    )
+    quote_symbol_market_rows = _scalar(
+        connection,
+        f"""
+        SELECT COUNT(*)
+        FROM instruments i
+        JOIN quote_current q ON q.symbol = i.symbol
+        WHERE i.active = 1
+          AND (i.ins_class = 'FUTURE' OR i.option_class IN ('CALL', 'PUT'))
+          AND {_quote_has_market_data_sql("q")}
+        """,
+    )
     option_kline_symbols = _scalar(
         connection,
         """
@@ -185,7 +220,10 @@ def _overview_totals(connection: sqlite3.Connection) -> dict[str, int]:
             """,
         ),
         "active_options": active_options,
+        "active_quote_symbols": active_quote_symbols,
         "option_quote_rows": option_quote_rows,
+        "quote_symbol_rows": quote_symbol_rows,
+        "quote_symbol_market_rows": quote_symbol_market_rows,
         "option_kline_symbols": option_kline_symbols,
         "metrics_rows": _scalar(
             connection,
@@ -210,6 +248,7 @@ def _overview_totals(connection: sqlite3.Connection) -> dict[str, int]:
         ),
         "acquisition_errors": _scalar(connection, "SELECT COUNT(*) FROM acquisition_errors"),
         "acquisition_runs": _scalar(connection, "SELECT COUNT(*) FROM acquisition_runs"),
+        "latest_quote_update": _latest_quote_update(connection),
     }
 
 
@@ -412,18 +451,20 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
         f"""
         WITH option_counts AS (
             SELECT
-                underlying_symbol,
-                exchange_id,
-                product_id,
-                MIN(expire_datetime) AS option_expire_datetime,
-                MIN(last_exercise_datetime) AS option_last_exercise_datetime,
-                SUM(CASE WHEN option_class = 'CALL' THEN 1 ELSE 0 END) AS call_count,
-                SUM(CASE WHEN option_class = 'PUT' THEN 1 ELSE 0 END) AS put_count,
+                o.underlying_symbol,
+                o.exchange_id,
+                o.product_id,
+                MIN(COALESCE(NULLIF(o.expire_datetime, ''), json_extract(oq.raw_payload_json, '$.expire_datetime'))) AS option_expire_datetime,
+                MIN(COALESCE(NULLIF(o.last_exercise_datetime, ''), json_extract(oq.raw_payload_json, '$.last_exercise_datetime'))) AS option_last_exercise_datetime,
+                MIN(CAST(json_extract(oq.raw_payload_json, '$.expire_rest_days') AS INTEGER)) AS option_expire_rest_days,
+                SUM(CASE WHEN o.option_class = 'CALL' THEN 1 ELSE 0 END) AS call_count,
+                SUM(CASE WHEN o.option_class = 'PUT' THEN 1 ELSE 0 END) AS put_count,
                 COUNT(*) AS option_count,
-                MIN(NULLIF(expire_datetime, '')) AS expire_datetime
-            FROM instruments
-            WHERE active = 1 AND option_class IN ('CALL', 'PUT')
-            GROUP BY underlying_symbol, exchange_id, product_id
+                MIN(COALESCE(NULLIF(o.expire_datetime, ''), json_extract(oq.raw_payload_json, '$.expire_datetime'))) AS expire_datetime
+            FROM instruments o
+            LEFT JOIN quote_current oq ON oq.symbol = o.symbol
+            WHERE o.active = 1 AND o.option_class IN ('CALL', 'PUT')
+            GROUP BY o.underlying_symbol, o.exchange_id, o.product_id
         ),
         coverage AS (
             SELECT
@@ -460,6 +501,7 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
             oc.product_id,
             oc.option_expire_datetime,
             oc.option_last_exercise_datetime,
+            oc.option_expire_rest_days,
             oc.call_count,
             oc.put_count,
             oc.option_count,
@@ -497,13 +539,21 @@ def _format_underlying_row(row: sqlite3.Row) -> dict[str, Any]:
     data = _row_dict(row)
     option_count = int(data["option_count"])
     data["expiry_month"] = _expiry_month(str(data["underlying_symbol"]))
-    data["days_to_option_expire_datetime"] = _days_to_expiry(
+    data["option_expire_datetime"] = _expiry_date_text(
         data.get("option_expire_datetime")
+    )
+    data["option_last_exercise_datetime"] = _expiry_date_text(
+        data.get("option_last_exercise_datetime")
+    )
+    data["expire_datetime"] = data["option_expire_datetime"]
+    data["days_to_option_expire_datetime"] = _expiry_days(
+        data.get("option_expire_datetime"),
+        fallback_days=data.get("option_expire_rest_days"),
     )
     data["days_to_option_last_exercise_datetime"] = _days_to_expiry(
         data.get("option_last_exercise_datetime")
     )
-    data["days_to_expiry"] = _days_to_expiry(data.get("expire_datetime"))
+    data["days_to_expiry"] = data["days_to_option_expire_datetime"]
     data["quote_coverage"] = _ratio(int(data["quote_count"]), option_count)
     data["metrics_coverage"] = _ratio(int(data["metrics_count"]), option_count)
     data["iv_coverage"] = _ratio(int(data["iv_count"]), option_count)
@@ -558,11 +608,12 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
             i.exchange_id,
             i.product_id,
             i.instrument_id,
-            i.expire_datetime AS future_expire_datetime,
-            i.delivery_year,
-            i.delivery_month,
+            COALESCE(NULLIF(i.expire_datetime, ''), json_extract(q.raw_payload_json, '$.expire_datetime')) AS future_expire_datetime,
+            COALESCE(i.delivery_year, json_extract(q.raw_payload_json, '$.delivery_year')) AS delivery_year,
+            COALESCE(i.delivery_month, json_extract(q.raw_payload_json, '$.delivery_month')) AS delivery_month,
             expiry.option_expire_datetime,
             expiry.option_last_exercise_datetime,
+            expiry.option_expire_rest_days,
             CASE WHEN {_quote_has_market_data_sql("q")} THEN q.source_datetime END AS source_datetime,
             q.received_at,
             COALESCE(q.last_price, k.last_kline_close_price) AS last_price,
@@ -579,14 +630,16 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
         LEFT JOIN quote_current q ON q.symbol = i.symbol
         LEFT JOIN (
             SELECT
-                underlying_symbol,
-                MIN(NULLIF(expire_datetime, '')) AS option_expire_datetime,
-                MIN(NULLIF(last_exercise_datetime, '')) AS option_last_exercise_datetime
-            FROM instruments
-            WHERE active = 1
-              AND option_class IN ('CALL', 'PUT')
-              AND (expire_datetime IS NOT NULL OR last_exercise_datetime IS NOT NULL)
-            GROUP BY underlying_symbol
+                o.underlying_symbol,
+                MIN(COALESCE(NULLIF(o.expire_datetime, ''), json_extract(oq.raw_payload_json, '$.expire_datetime'))) AS option_expire_datetime,
+                MIN(COALESCE(NULLIF(o.last_exercise_datetime, ''), json_extract(oq.raw_payload_json, '$.last_exercise_datetime'))) AS option_last_exercise_datetime,
+                MIN(CAST(json_extract(oq.raw_payload_json, '$.expire_rest_days') AS INTEGER)) AS option_expire_rest_days
+            FROM instruments o
+            LEFT JOIN quote_current oq ON oq.symbol = o.symbol
+            WHERE o.active = 1
+              AND o.underlying_symbol = ?
+              AND o.option_class IN ('CALL', 'PUT')
+            GROUP BY o.underlying_symbol
         ) expiry ON expiry.underlying_symbol = i.symbol
         LEFT JOIN (
             SELECT k1.symbol,
@@ -594,22 +647,28 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
                    k1.close_price AS last_kline_close_price,
                    k1.volume AS last_kline_volume
             FROM kline_20d_current k1
-            JOIN (
-                SELECT symbol, MAX(bar_datetime) AS last_bar_datetime
-                FROM kline_20d_current
-                GROUP BY symbol
-            ) k2 ON k2.symbol = k1.symbol AND k2.last_bar_datetime = k1.bar_datetime
+            WHERE k1.symbol = ?
+            ORDER BY k1.bar_datetime DESC
+            LIMIT 1
         ) k ON k.symbol = i.symbol
         WHERE i.symbol = ?
         """,
-        (symbol,),
+        (symbol, symbol, symbol),
     ).fetchone()
     if row is None:
         return {"symbol": symbol, "missing": True}
     data = _row_dict(row)
     data["expiry_month"] = _expiry_month(symbol)
-    data["days_to_option_expire_datetime"] = _days_to_expiry(
+    data["future_expire_datetime"] = _expiry_date_text(data.get("future_expire_datetime"))
+    data["option_expire_datetime"] = _expiry_date_text(
         data.get("option_expire_datetime")
+    )
+    data["option_last_exercise_datetime"] = _expiry_date_text(
+        data.get("option_last_exercise_datetime")
+    )
+    data["days_to_option_expire_datetime"] = _expiry_days(
+        data.get("option_expire_datetime"),
+        fallback_days=data.get("option_expire_rest_days"),
     )
     data["days_to_option_last_exercise_datetime"] = _days_to_expiry(
         data.get("option_last_exercise_datetime")
@@ -618,7 +677,10 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
         "future_expire_datetime"
     )
     data["expire_datetime"] = expiry_datetime
-    data["days_to_expiry"] = _days_to_expiry(expiry_datetime)
+    data["days_to_expiry"] = _expiry_days(
+        expiry_datetime,
+        fallback_days=data.get("option_expire_rest_days"),
+    )
     data["last_kline_display_datetime"] = _daily_kline_close_datetime(
         data.get("last_kline_bar_datetime"),
         reference_datetime=data.get("source_datetime") or data.get("received_at"),
@@ -633,10 +695,11 @@ def _option_rows(connection: sqlite3.Connection, underlying_symbol: str) -> list
             i.symbol,
             i.option_class,
             i.strike_price,
-            i.expire_datetime,
-            i.last_exercise_datetime,
-            i.exercise_year,
-            i.exercise_month,
+            COALESCE(NULLIF(i.expire_datetime, ''), json_extract(q.raw_payload_json, '$.expire_datetime')) AS expire_datetime,
+            COALESCE(NULLIF(i.last_exercise_datetime, ''), json_extract(q.raw_payload_json, '$.last_exercise_datetime')) AS last_exercise_datetime,
+            json_extract(q.raw_payload_json, '$.expire_rest_days') AS expire_rest_days,
+            COALESCE(i.exercise_year, json_extract(q.raw_payload_json, '$.exercise_year')) AS exercise_year,
+            COALESCE(i.exercise_month, json_extract(q.raw_payload_json, '$.exercise_month')) AS exercise_month,
             q.bid_price1,
             q.ask_price1,
             COALESCE(q.last_price, k.close_price) AS last_price,
@@ -661,15 +724,12 @@ def _option_rows(connection: sqlite3.Connection, underlying_symbol: str) -> list
         FROM instruments i
         LEFT JOIN quote_current q ON q.symbol = i.symbol
         LEFT JOIN option_source_metrics_current m ON m.symbol = i.symbol
-        LEFT JOIN (
-            SELECT k1.symbol, k1.bar_datetime, k1.close_price, k1.volume
-            FROM kline_20d_current k1
-            JOIN (
-                SELECT symbol, MAX(bar_datetime) AS last_bar_datetime
-                FROM kline_20d_current
-                GROUP BY symbol
-            ) k2 ON k2.symbol = k1.symbol AND k2.last_bar_datetime = k1.bar_datetime
-        ) k ON k.symbol = i.symbol
+        LEFT JOIN kline_20d_current k ON k.symbol = i.symbol
+            AND k.bar_datetime = (
+                SELECT MAX(k2.bar_datetime)
+                FROM kline_20d_current k2
+                WHERE k2.symbol = i.symbol
+            )
         WHERE i.active = 1
           AND i.underlying_symbol = ?
           AND i.option_class IN ('CALL', 'PUT')
@@ -682,7 +742,14 @@ def _option_rows(connection: sqlite3.Connection, underlying_symbol: str) -> list
 
 def _format_option_row(row: sqlite3.Row) -> dict[str, Any]:
     data = _row_dict(row)
-    data["days_to_expire_datetime"] = _days_to_expiry(data.get("expire_datetime"))
+    data["expire_datetime"] = _expiry_date_text(data.get("expire_datetime"))
+    data["last_exercise_datetime"] = _expiry_date_text(
+        data.get("last_exercise_datetime")
+    )
+    data["days_to_expire_datetime"] = _expiry_days(
+        data.get("expire_datetime"),
+        fallback_days=data.get("expire_rest_days"),
+    )
     data["days_to_last_exercise_datetime"] = _days_to_expiry(
         data.get("last_exercise_datetime")
     )
@@ -782,6 +849,11 @@ def _latest_update(connection: sqlite3.Connection) -> str | None:
     return row["latest_update"] if row and row["latest_update"] else None
 
 
+def _latest_quote_update(connection: sqlite3.Connection) -> str | None:
+    row = connection.execute("SELECT MAX(received_at) AS latest_update FROM quote_current").fetchone()
+    return row["latest_update"] if row and row["latest_update"] else None
+
+
 def _daily_kline_close_datetime(
     value: Any,
     *,
@@ -878,6 +950,16 @@ def _days_to_expiry(value: Any) -> int | None:
     if parsed is None:
         return None
     return (parsed - date.today()).days
+
+
+def _expiry_days(value: Any, *, fallback_days: Any = None) -> int | None:
+    days = _days_to_expiry(value)
+    if days is not None:
+        return days
+    try:
+        return int(fallback_days)
+    except (TypeError, ValueError):
+        return None
 
 
 def _atm_strike(strike_rows: list[dict[str, Any]], last_price: Any) -> float | None:

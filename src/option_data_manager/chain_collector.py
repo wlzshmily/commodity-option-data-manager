@@ -11,12 +11,20 @@ from typing import Any
 
 from .acquisition import AcquisitionRepository, AcquisitionRunRecord
 from .instruments import InstrumentRepository, InstrumentRecord
-from .klines import KlineRepository, normalize_multi_symbol_kline_rows
+from .klines import (
+    KlineRecord,
+    KlineRepository,
+    merge_kline_records,
+    normalize_kline_rows,
+    records_to_multi_symbol_kline_frame,
+)
 from .option_metrics import OptionMetricsRepository, normalize_option_metrics
 from .quotes import QuoteRepository, normalize_quote
 
 
 SECONDS_PER_DAY = 24 * 60 * 60
+FULL_KLINE_DATA_LENGTH = 20
+INCREMENTAL_KLINE_DATA_LENGTH = 3
 
 
 @dataclass(frozen=True)
@@ -96,15 +104,18 @@ def collect_persisted_option_chain(
                     context={"underlying_symbol": cleaned_underlying},
                 )
 
-        underlying_kline_written = False
+        underlying_kline_records: list[KlineRecord] | None = None
         for batch_index, batch in enumerate(batches, start=1):
             kline_refs: dict[str, Any] = {}
+            kline_symbols = [option.symbol for option in batch]
+            if underlying_kline_records is None:
+                kline_symbols.append(cleaned_underlying)
             for option in batch:
                 try:
                     kline_refs[option.symbol] = api.get_kline_serial(
-                        [option.symbol, cleaned_underlying],
+                        option.symbol,
                         duration_seconds=SECONDS_PER_DAY,
-                        data_length=20,
+                        data_length=_kline_data_length(kline_repo, option.symbol),
                     )
                 except Exception as exc:
                     error_count += 1
@@ -116,48 +127,90 @@ def collect_persisted_option_chain(
                         exc=exc,
                         context={
                             "batch_index": batch_index,
-                            "symbols": [option.symbol, cleaned_underlying],
+                            "symbols": [option.symbol],
+                        },
+                    )
+            if underlying_kline_records is None:
+                try:
+                    kline_refs[cleaned_underlying] = api.get_kline_serial(
+                        cleaned_underlying,
+                        duration_seconds=SECONDS_PER_DAY,
+                        data_length=_kline_data_length(kline_repo, cleaned_underlying),
+                    )
+                except Exception as exc:
+                    error_count += 1
+                    _record_error(
+                        acquisition_repo,
+                        run_id=run.run_id,
+                        symbol=cleaned_underlying,
+                        stage="kline",
+                        exc=exc,
+                        context={
+                            "batch_index": batch_index,
+                            "symbols": [cleaned_underlying],
                         },
                     )
             _wait_updates(api, wait_cycles=wait_cycles)
 
-            for option in batch:
-                klines = kline_refs.get(option.symbol)
-                if klines is not None:
-                    try:
-                        normalized = normalize_multi_symbol_kline_rows(
-                            [option.symbol, cleaned_underlying],
+            normalized_by_symbol: dict[str, list[KlineRecord]] = {}
+            for symbol in kline_symbols:
+                klines = kline_refs.get(symbol)
+                if klines is None:
+                    continue
+                try:
+                    merged = merge_kline_records(
+                        kline_repo.get_klines(symbol),
+                        normalize_kline_rows(
+                            symbol,
                             klines,
                             received_at=actual_received_at,
-                        )
-                        for symbol, records in normalized.items():
-                            if symbol == cleaned_underlying and underlying_kline_written:
-                                continue
-                            kline_repo.replace_symbol_klines(symbol, records)
-                            kline_rows_written += len(records)
-                            if symbol == cleaned_underlying:
-                                underlying_kline_written = True
-                    except Exception as exc:
-                        error_count += 1
-                        _record_error(
-                            acquisition_repo,
-                            run_id=run.run_id,
-                            symbol=option.symbol,
-                            stage="kline",
-                            exc=exc,
-                            context={
-                                "batch_index": batch_index,
-                                "symbols": [option.symbol, cleaned_underlying],
-                            },
-                        )
-                        klines = None
+                        ),
+                        limit=FULL_KLINE_DATA_LENGTH,
+                    )
+                    kline_repo.replace_symbol_klines(symbol, merged)
+                    kline_rows_written += len(merged)
+                    normalized_by_symbol[symbol] = merged
+                    if symbol == cleaned_underlying:
+                        underlying_kline_records = merged
+                except Exception as exc:
+                    error_count += 1
+                    _record_error(
+                        acquisition_repo,
+                        run_id=run.run_id,
+                        symbol=symbol,
+                        stage="kline",
+                        exc=exc,
+                        context={
+                            "batch_index": batch_index,
+                            "symbols": [symbol],
+                        },
+                    )
+
+            for option in batch:
+                option_records = normalized_by_symbol.get(option.symbol)
+                current_underlying_records = (
+                    underlying_kline_records or kline_repo.get_klines(cleaned_underlying)
+                )
+                iv_klines = None
+                if option_records and current_underlying_records:
+                    iv_klines = records_to_multi_symbol_kline_frame(
+                        [option.symbol, cleaned_underlying],
+                        {
+                            option.symbol: option_records,
+                            cleaned_underlying: current_underlying_records,
+                        },
+                    )
 
                 option_quote = quote_refs.get(option.symbol)
                 greeks = _query_greeks(api, option.symbol)
                 iv_payload = None
-                if iv_calculator is not None and klines is not None and option_quote is not None:
+                if (
+                    iv_calculator is not None
+                    and iv_klines is not None
+                    and option_quote is not None
+                ):
                     try:
-                        iv_payload = iv_calculator(klines, option_quote)
+                        iv_payload = iv_calculator(iv_klines, option_quote)
                     except Exception as exc:
                         error_count += 1
                         _record_error(
@@ -331,6 +384,23 @@ def _query_greeks(api: Any, symbol: str) -> Any:
         return api.query_option_greeks(symbol)
     except Exception:
         return None
+
+
+def _has_kline_cache(
+    repository: KlineRepository,
+    symbols: tuple[str, ...],
+    *,
+    min_records: int,
+) -> bool:
+    return all(len(repository.get_klines(symbol)) >= min_records for symbol in symbols)
+
+
+def _kline_data_length(repository: KlineRepository, symbol: str) -> int:
+    return (
+        INCREMENTAL_KLINE_DATA_LENGTH
+        if _has_kline_cache(repository, (symbol,), min_records=FULL_KLINE_DATA_LENGTH)
+        else FULL_KLINE_DATA_LENGTH
+    )
 
 
 def _metrics_are_empty(metrics: Any) -> bool:

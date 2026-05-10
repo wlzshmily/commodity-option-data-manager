@@ -1,4 +1,5 @@
 import sqlite3
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -18,6 +19,10 @@ def test_api_status_and_settings_do_not_require_key_by_default() -> None:
     assert settings["api"]["auth_required"] is False
     assert settings["tqsdk"]["password_configured"] is False
     assert settings["collection"]["wait_cycles"] == 1
+    assert settings["quote_stream"]["kline_batch_size"] == 1
+    assert settings["quote_stream"]["kline_data_length"] == 3
+    assert settings["quote_stream"]["prioritize_near_expiry"] is True
+    assert settings["quote_stream"]["near_expiry_months"] == 2
 
 
 def test_api_key_required_when_setting_enabled() -> None:
@@ -112,7 +117,12 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
 
     started = client.post(
         "/api/quote-stream/start",
-        json={"workers": 2, "quote_shard_size": 50, "max_symbols": 100},
+        json={
+            "workers": 2,
+            "quote_shard_size": 50,
+            "kline_batch_size": 2,
+            "max_symbols": 100,
+        },
     )
 
     assert started.status_code == 200
@@ -120,15 +130,161 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
     assert payload["running"] is True
     assert payload["worker_count"] == 2
     assert len(payload["pids"]) == 2
-    assert len(created) == 2
+    assert len(created) == 3
     assert "--worker-index" in created[0].command
+    assert "--no-klines" not in created[0].command
+    assert "--kline-data-length" in created[0].command
+    assert created[0].command[
+        created[0].command.index("--kline-data-length") + 1
+    ] == "3"
+    assert "--kline-batch-size" in created[0].command
+    assert created[0].command[
+        created[0].command.index("--kline-batch-size") + 1
+    ] == "2"
+    assert "--near-expiry-months" in created[0].command
+    assert created[0].command[
+        created[0].command.index("--near-expiry-months") + 1
+    ] == "2"
+    assert "--no-prioritize-near-expiry" not in created[0].command
+    assert "option_data_manager.cli.metrics_worker" in created[2].command
+    assert "--min-interval-seconds" in created[2].command
     assert "super-secret" not in str(created[0].command)
+    assert "super-secret" not in str(created[2].command)
 
     stopped = client.post("/api/quote-stream/stop")
 
     assert stopped.status_code == 200
     assert stopped.json()["running"] is False
     assert all(process.terminated for process in created)
+
+
+def test_quote_stream_status_aggregates_runtime_subscription_progress(
+    tmp_path: Path,
+) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.pid = 33000
+
+        def poll(self):
+            return None
+
+    report_dir = tmp_path / "quote-stream-runtime"
+    report_dir.mkdir()
+    (report_dir / "worker-00-of-01.json").write_text(
+        """
+        {
+          "status": "subscribing",
+          "progress": {
+            "status": "subscribing",
+            "started_at": "2026-05-10T00:00:00+00:00",
+            "updated_at": "2026-05-10T00:00:08+00:00",
+            "quote_started_at": "2026-05-10T00:00:00+00:00",
+            "quote_finished_at": "2026-05-10T00:00:04+00:00",
+            "kline_started_at": "2026-05-10T00:00:04+00:00",
+            "quote_subscribed": 4,
+            "quote_total": 4,
+            "kline_subscribed": 2,
+            "kline_total": 4,
+            "cycle_count": 3,
+            "wait_update_count": 2,
+            "quotes_written": 8,
+            "last_wait_update_at": "2026-05-10T00:00:07+00:00",
+            "last_quote_write_at": "2026-05-10T00:00:07+00:00",
+            "last_tqsdk_notify_at": "2026-05-10T00:00:06+00:00",
+            "last_tqsdk_notify_code": 2019112902,
+            "last_tqsdk_notify_level": "WARNING",
+            "last_tqsdk_notify_content": "与行情服务器的网络连接已恢复",
+            "tqsdk_connection_status": "connected",
+            "last_tqsdk_disconnect_at": "2026-05-10T00:00:02+00:00",
+            "last_tqsdk_restore_at": "2026-05-10T00:00:06+00:00",
+            "tqsdk_notify_count": 2,
+            "near_expiry_months": 2,
+            "near_expiry_quote_subscribed": 4,
+            "near_expiry_quote_total": 4,
+            "near_expiry_kline_subscribed": 1,
+            "near_expiry_kline_total": 2,
+            "near_expiry_subscribed": 5,
+            "near_expiry_total": 6,
+            "subscribed_objects": 6,
+            "total_objects": 8,
+            "completion_ratio": 0.75
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    app.state.quote_stream_processes["processes"] = [FakeProcess()]
+    app.state.service_state.set_value("quote_stream.running", "true")
+    app.state.service_state.set_value("quote_stream.worker_count", "1")
+    app.state.service_state.set_value("quote_stream.report_dir", str(report_dir))
+    app.state.service_state.set_value("quote_stream.pids", "[33000]")
+    client = TestClient(app)
+
+    payload = client.get("/api/quote-stream").json()
+
+    assert payload["running"] is True
+    assert payload["progress"]["status"] == "subscribing"
+    assert payload["progress"]["subscribed_objects"] == 6
+    assert payload["progress"]["total_objects"] == 8
+    assert payload["progress"]["quote_subscribed"] == 4
+    assert payload["progress"]["kline_subscribed"] == 2
+    assert payload["progress"]["near_expiry_months"] == 2
+    assert payload["progress"]["near_expiry_subscribed"] == 5
+    assert payload["progress"]["near_expiry_total"] == 6
+    assert payload["progress"]["elapsed_seconds"] == 8
+    assert payload["progress"]["active_stage"] == "kline"
+    assert payload["progress"]["stage_label"] == "K线"
+    assert payload["progress"]["stage_average_seconds_per_object"] == 2.0
+    assert payload["progress"]["stage_estimated_remaining_seconds"] == 4.0
+    assert payload["progress"]["estimated_remaining_seconds"] == 4.0
+    assert payload["progress"]["estimated_remaining_is_total"] is True
+    assert payload["progress"]["waiting_for_kline_eta"] is False
+    assert payload["progress"]["wait_update_count"] == 2
+    assert payload["progress"]["last_wait_update_at"] == "2026-05-10T00:00:07+00:00"
+    assert payload["progress"]["tqsdk_connection_status"] == "connected"
+    assert payload["progress"]["last_tqsdk_notify_code"] == 2019112902
+    assert payload["progress"]["tqsdk_notify_count"] == 2
+    assert payload["health"]["status"] in {
+        "subscribing",
+        "session_closed",
+        "awaiting_market_evidence",
+        "opening_grace",
+    }
+
+
+def test_quote_stream_progress_resets_when_stopped(tmp_path: Path) -> None:
+    report_dir = tmp_path / "quote-stream-runtime"
+    report_dir.mkdir()
+    (report_dir / "worker-00-of-01.json").write_text(
+        """
+        {
+          "status": "success",
+          "result": {
+            "symbol_count": 4,
+            "kline_symbol_count": 4,
+            "subscribed_quote_count": 4,
+            "subscribed_kline_count": 4,
+            "finished_at": "2026-05-10T00:00:00+00:00"
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    app.state.service_state.set_value("quote_stream.running", "false")
+    app.state.service_state.set_value("quote_stream.report_dir", str(report_dir))
+    client = TestClient(app)
+
+    payload = client.get("/api/quote-stream").json()
+
+    assert payload["running"] is False
+    assert payload["progress"]["subscribed_objects"] == 0
+    assert payload["progress"]["total_objects"] == 0
 
 
 def test_quote_stream_start_blocks_without_credentials() -> None:

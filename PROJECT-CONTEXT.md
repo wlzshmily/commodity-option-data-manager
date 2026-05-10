@@ -27,5 +27,5 @@ Option Data Manager is a local data support service for a future option ratio sp
 ## Current Release Evidence
 
 - Local direct TQSDK acceptance completed on 2026-05-09 with `odm-collect-parallel`: 864/864 full-market batches succeeded, 0 failed, 27,386 active option symbols covered.
-- Realtime Quote freshness is delivered by the quote-only `odm-quote-stream` worker; full-market catch-up is delivered by process-level shards.
+- Realtime freshness is delivered by `odm-quote-stream`, which keeps Quote and Kline subscription objects alive, writes current Quote snapshots, reports runtime subscription-object progress, and surfaces official TQSDK connection notifications for reconnect observability; full-market catch-up is delivered by process-level shards.
 - Remaining source gaps in IV/Greeks or empty price fields are exposed as data-quality diagnostics rather than treated as collection failures.

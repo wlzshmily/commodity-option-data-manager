@@ -13,4 +13,8 @@
 
 ## Current Active Plan
 
-Release-readiness pass is complete for the local production release covering five commodity option exchanges, including WebUI/API controls for quote-only realtime stream workers.
+Release-readiness pass is complete for the local production release covering five commodity option exchanges, including WebUI/API controls for realtime Quote/Kline stream workers and runtime subscription-object progress.
+
+## Draft Follow-Up Specs
+
+- `docs/specs/SPEC-001-dynamic-contract-manager/`: v0.2 candidate for pre-session contract-universe refresh and active/inactive contract management. Implementation is not approved while requirements still contain open clarification items.

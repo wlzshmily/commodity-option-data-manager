@@ -23,6 +23,7 @@ from option_data_manager.collection_state import CollectionStateRepository
 from option_data_manager.klines import KlineRepository
 from option_data_manager.option_metrics import OptionMetricsRepository
 from option_data_manager.quotes import QuoteRepository
+from option_data_manager.realtime_health import build_realtime_health
 from option_data_manager.settings import (
     PlainTextProtector,
     SettingsRepository,
@@ -49,9 +50,20 @@ WAIT_CYCLES_KEY = "collection.wait_cycles"
 DEFAULT_BACKGROUND_MAX_BATCHES = "100"
 QUOTE_STREAM_WORKERS_KEY = "quote_stream.workers"
 QUOTE_STREAM_SHARD_SIZE_KEY = "quote_stream.quote_shard_size"
+QUOTE_STREAM_KLINE_BATCH_SIZE_KEY = "quote_stream.kline_batch_size"
 QUOTE_STREAM_MAX_SYMBOLS_KEY = "quote_stream.max_symbols"
+QUOTE_STREAM_KLINE_DATA_LENGTH_KEY = "quote_stream.kline_data_length"
+QUOTE_STREAM_PRIORITIZE_NEAR_EXPIRY_KEY = "quote_stream.prioritize_near_expiry"
+QUOTE_STREAM_NEAR_EXPIRY_MONTHS_KEY = "quote_stream.near_expiry_months"
+METRICS_MIN_INTERVAL_SECONDS_KEY = "metrics.min_interval_seconds"
+METRICS_UNDERLYING_CHAIN_INTERVAL_SECONDS_KEY = "metrics.underlying_chain_interval_seconds"
 DEFAULT_QUOTE_STREAM_WORKERS = "1"
 DEFAULT_QUOTE_STREAM_SHARD_SIZE = "1000"
+DEFAULT_QUOTE_STREAM_KLINE_BATCH_SIZE = "1"
+DEFAULT_QUOTE_STREAM_KLINE_DATA_LENGTH = "3"
+DEFAULT_QUOTE_STREAM_PRIORITIZE_NEAR_EXPIRY = "true"
+DEFAULT_QUOTE_STREAM_NEAR_EXPIRY_MONTHS = "2"
+DEFAULT_METRICS_MIN_INTERVAL_SECONDS = "30"
 
 
 class TqsdkCredentialUpdate(BaseModel):
@@ -120,6 +132,7 @@ class QuoteStreamStartRequest(BaseModel):
 
     workers: int | None = None
     quote_shard_size: int | None = None
+    kline_batch_size: int | None = None
     max_symbols: int | None = None
     discover: bool = False
 
@@ -135,6 +148,8 @@ class QuoteStreamResponse(BaseModel):
     report_dir: str | None
     started_at: str | None
     finished_at: str | None
+    progress: dict[str, Any] | None = None
+    health: dict[str, Any] | None = None
 
 
 def create_app(
@@ -156,6 +171,7 @@ def create_app(
     refresh_worker: dict[str, threading.Thread | None] = {"thread": None}
     quote_stream_lock = threading.Lock()
     quote_stream_processes: dict[str, list[Any]] = {"processes": []}
+    metrics_worker_processes: dict[str, list[Any]] = {"processes": []}
     if (service_state.get_value("collection.refresh_running") or "false") == "true":
         service_state.set_value("collection.refresh_running", "false")
         service_state.set_value(
@@ -168,8 +184,17 @@ def create_app(
             "quote_stream.message",
             "本地服务重启后，实时订阅 worker 未自动接管。",
         )
+    if (service_state.get_value("metrics_worker.running") or "false") == "true":
+        service_state.set_value("metrics_worker.running", "false")
+        service_state.set_value(
+            "metrics_worker.message",
+            "本地服务重启后，指标刷新 worker 未自动接管。",
+        )
 
     app = FastAPI(title="Option Data Manager API")
+    app.state.service_state = service_state
+    app.state.quote_stream_processes = quote_stream_processes
+    app.state.metrics_worker_processes = metrics_worker_processes
 
     @app.middleware("http")
     async def record_metrics(request: Request, call_next: Any) -> Any:
@@ -268,6 +293,7 @@ def create_app(
             "quote_stream": _quote_stream_status(
                 service_state,
                 quote_stream_processes,
+                connection=connection,
             ),
             "latest_run": latest_run[0].__dict__ if latest_run else None,
             "api": {
@@ -337,7 +363,11 @@ def create_app(
         _: ApiKeyRecord | None = Depends(require_auth),
     ) -> QuoteStreamResponse:
         return QuoteStreamResponse(
-            **_quote_stream_status(service_state, quote_stream_processes)
+            **_quote_stream_status(
+                service_state,
+                quote_stream_processes,
+                connection=connection,
+            )
         )
 
     @app.post("/api/quote-stream/start", response_model=QuoteStreamResponse)
@@ -347,7 +377,11 @@ def create_app(
     ) -> QuoteStreamResponse:
         request = payload or QuoteStreamStartRequest()
         with quote_stream_lock:
-            status = _quote_stream_status(service_state, quote_stream_processes)
+            status = _quote_stream_status(
+                service_state,
+                quote_stream_processes,
+                connection=connection,
+            )
             if status["running"]:
                 return QuoteStreamResponse(**status)
             account = settings.get_value(TQSDK_ACCOUNT_KEY)
@@ -376,17 +410,46 @@ def create_app(
                 settings.get_value(QUOTE_STREAM_SHARD_SIZE_KEY),
                 int(DEFAULT_QUOTE_STREAM_SHARD_SIZE),
             )
+            kline_batch_size = request.kline_batch_size or _positive_int_setting(
+                settings.get_value(QUOTE_STREAM_KLINE_BATCH_SIZE_KEY),
+                int(DEFAULT_QUOTE_STREAM_KLINE_BATCH_SIZE),
+            )
             max_symbols = request.max_symbols
             if max_symbols is None:
                 max_symbols = _optional_positive_int(
                     settings.get_value(QUOTE_STREAM_MAX_SYMBOLS_KEY)
                 )
+            metrics_min_interval_seconds = _positive_int_setting(
+                settings.get_value(METRICS_MIN_INTERVAL_SECONDS_KEY),
+                int(DEFAULT_METRICS_MIN_INTERVAL_SECONDS),
+            )
+            kline_data_length = _positive_int_setting(
+                settings.get_value(QUOTE_STREAM_KLINE_DATA_LENGTH_KEY),
+                int(DEFAULT_QUOTE_STREAM_KLINE_DATA_LENGTH),
+            )
+            prioritize_near_expiry = _bool_setting(
+                settings.get_value(QUOTE_STREAM_PRIORITIZE_NEAR_EXPIRY_KEY),
+                DEFAULT_QUOTE_STREAM_PRIORITIZE_NEAR_EXPIRY == "true",
+            )
+            near_expiry_months = _positive_int_setting(
+                settings.get_value(QUOTE_STREAM_NEAR_EXPIRY_MONTHS_KEY),
+                int(DEFAULT_QUOTE_STREAM_NEAR_EXPIRY_MONTHS),
+            )
+            underlying_chain_interval_seconds = _positive_int_setting(
+                settings.get_value(METRICS_UNDERLYING_CHAIN_INTERVAL_SECONDS_KEY),
+                int(DEFAULT_METRICS_MIN_INTERVAL_SECONDS),
+            )
             if worker_count < 1:
                 raise HTTPException(status_code=400, detail="workers must be positive.")
             if quote_shard_size < 1:
                 raise HTTPException(
                     status_code=400,
                     detail="quote_shard_size must be positive.",
+                )
+            if kline_batch_size < 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="kline_batch_size must be positive.",
                 )
             if max_symbols is not None and max_symbols < 1:
                 raise HTTPException(
@@ -400,11 +463,23 @@ def create_app(
                 report_dir=report_dir,
                 worker_count=worker_count,
                 quote_shard_size=quote_shard_size,
+                kline_batch_size=kline_batch_size,
+                kline_data_length=kline_data_length,
+                prioritize_near_expiry=prioritize_near_expiry,
+                near_expiry_months=near_expiry_months,
                 max_symbols=max_symbols,
                 discover=request.discover,
+                metrics_dirty_min_interval_seconds=metrics_min_interval_seconds,
+                underlying_chain_dirty_interval_seconds=underlying_chain_interval_seconds,
+            )
+            metrics_processes = _start_metrics_worker_processes(
+                database_path=database_path or DEFAULT_DATABASE_PATH,
+                report_dir=report_dir,
+                min_interval_seconds=metrics_min_interval_seconds,
             )
             started_at = datetime.now(UTC).isoformat()
             quote_stream_processes["processes"] = processes
+            metrics_worker_processes["processes"] = metrics_processes
             service_state.set_value("quote_stream.running", "true")
             service_state.set_value("quote_stream.started_at", started_at)
             service_state.set_value("quote_stream.finished_at", None)
@@ -415,6 +490,15 @@ def create_app(
             )
             service_state.set_value("quote_stream.report_dir", str(report_dir))
             service_state.set_value("quote_stream.message", "实时订阅 worker 已启动。")
+            service_state.set_value("metrics_worker.running", "true")
+            service_state.set_value("metrics_worker.started_at", started_at)
+            service_state.set_value("metrics_worker.finished_at", None)
+            service_state.set_value(
+                "metrics_worker.pids",
+                json.dumps([int(process.pid) for process in metrics_processes]),
+            )
+            service_state.set_value("metrics_worker.report_dir", str(report_dir))
+            service_state.set_value("metrics_worker.message", "指标刷新 worker 已启动。")
             service_logs.append(
                 level="info",
                 category="quote_stream",
@@ -422,13 +506,22 @@ def create_app(
                 context={
                     "worker_count": worker_count,
                     "quote_shard_size": quote_shard_size,
+                    "kline_data_length": kline_data_length,
+                    "prioritize_near_expiry": prioritize_near_expiry,
+                    "near_expiry_months": near_expiry_months,
                     "max_symbols_configured": max_symbols is not None,
                     "discover": request.discover,
                     "report_dir": str(report_dir),
+                    "metrics_min_interval_seconds": metrics_min_interval_seconds,
+                    "underlying_chain_interval_seconds": underlying_chain_interval_seconds,
                 },
             )
             return QuoteStreamResponse(
-                **_quote_stream_status(service_state, quote_stream_processes)
+                **_quote_stream_status(
+                    service_state,
+                    quote_stream_processes,
+                    connection=connection,
+                )
             )
 
     @app.post("/api/quote-stream/stop", response_model=QuoteStreamResponse)
@@ -436,30 +529,65 @@ def create_app(
         _: ApiKeyRecord | None = Depends(require_auth),
     ) -> QuoteStreamResponse:
         with quote_stream_lock:
+            _request_quote_stream_stop_files(service_state)
             processes = quote_stream_processes.get("processes", [])
+            persisted_pids = _json_int_list(service_state.get_value("quote_stream.pids"))
+            persisted_metrics_pids = _json_int_list(
+                service_state.get_value("metrics_worker.pids")
+            )
+            attached_pids = {int(process.pid) for process in processes}
+            attached_metrics_pids = {
+                int(process.pid)
+                for process in metrics_worker_processes.get("processes", [])
+            }
             stopped = 0
             for process in processes:
                 if process.poll() is None:
-                    _request_quote_stream_stop_files(service_state)
                     stopped += 1
             for process in processes:
                 if process.poll() is None:
                     try:
-                        process.wait(timeout=30)
+                        process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         process.terminate()
                 if process.poll() is None:
+                    process.terminate()
+                if process.poll() is None:
                     try:
-                        process.wait(timeout=5)
+                        process.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         process.kill()
+            for pid in persisted_pids:
+                if pid in attached_pids:
+                    continue
+                if _pid_is_quote_stream(pid):
+                    _terminate_pid(pid)
+                    stopped += 1
+            metrics_stopped = _stop_attached_processes(
+                metrics_worker_processes.get("processes", [])
+            )
+            for pid in persisted_metrics_pids:
+                if pid in attached_metrics_pids:
+                    continue
+                if _pid_is_metrics_worker(pid):
+                    _terminate_pid(pid)
+                    metrics_stopped += 1
             finished_at = datetime.now(UTC).isoformat()
             quote_stream_processes["processes"] = []
+            metrics_worker_processes["processes"] = []
             service_state.set_value("quote_stream.running", "false")
             service_state.set_value("quote_stream.finished_at", finished_at)
+            service_state.set_value("quote_stream.pids", "[]")
+            service_state.set_value("metrics_worker.running", "false")
+            service_state.set_value("metrics_worker.finished_at", finished_at)
+            service_state.set_value("metrics_worker.pids", "[]")
             service_state.set_value(
                 "quote_stream.message",
-                f"已请求停止 {stopped} 个实时订阅 worker。",
+                f"已请求停止 {stopped} 个实时订阅 worker 和 {metrics_stopped} 个指标 worker。",
+            )
+            service_state.set_value(
+                "metrics_worker.message",
+                f"已请求停止 {metrics_stopped} 个指标刷新 worker。",
             )
             service_logs.append(
                 level="info",
@@ -468,7 +596,11 @@ def create_app(
                 context={"stopped_workers": stopped},
             )
             return QuoteStreamResponse(
-                **_quote_stream_status(service_state, quote_stream_processes)
+                **_quote_stream_status(
+                    service_state,
+                    quote_stream_processes,
+                    connection=connection,
+                )
             )
 
     @app.get("/api/exchanges")
@@ -624,12 +756,39 @@ def create_app(
                     settings.get_value(QUOTE_STREAM_SHARD_SIZE_KEY),
                     int(DEFAULT_QUOTE_STREAM_SHARD_SIZE),
                 ),
+                "kline_batch_size": _positive_int_setting(
+                    settings.get_value(QUOTE_STREAM_KLINE_BATCH_SIZE_KEY),
+                    int(DEFAULT_QUOTE_STREAM_KLINE_BATCH_SIZE),
+                ),
                 "max_symbols": _optional_positive_int(
                     settings.get_value(QUOTE_STREAM_MAX_SYMBOLS_KEY)
+                ),
+                "kline_data_length": _positive_int_setting(
+                    settings.get_value(QUOTE_STREAM_KLINE_DATA_LENGTH_KEY),
+                    int(DEFAULT_QUOTE_STREAM_KLINE_DATA_LENGTH),
+                ),
+                "prioritize_near_expiry": _bool_setting(
+                    settings.get_value(QUOTE_STREAM_PRIORITIZE_NEAR_EXPIRY_KEY),
+                    DEFAULT_QUOTE_STREAM_PRIORITIZE_NEAR_EXPIRY == "true",
+                ),
+                "near_expiry_months": _positive_int_setting(
+                    settings.get_value(QUOTE_STREAM_NEAR_EXPIRY_MONTHS_KEY),
+                    int(DEFAULT_QUOTE_STREAM_NEAR_EXPIRY_MONTHS),
                 ),
                 "status": _quote_stream_status(
                     service_state,
                     quote_stream_processes,
+                    connection=connection,
+                ),
+            },
+            "metrics": {
+                "min_interval_seconds": _positive_int_setting(
+                    settings.get_value(METRICS_MIN_INTERVAL_SECONDS_KEY),
+                    int(DEFAULT_METRICS_MIN_INTERVAL_SECONDS),
+                ),
+                "underlying_chain_interval_seconds": _positive_int_setting(
+                    settings.get_value(METRICS_UNDERLYING_CHAIN_INTERVAL_SECONDS_KEY),
+                    int(DEFAULT_METRICS_MIN_INTERVAL_SECONDS),
                 ),
             },
             "safe_metadata": [item.__dict__ for item in settings.list_metadata()],
@@ -875,14 +1034,22 @@ def _start_quote_stream_processes(
     report_dir: Path,
     worker_count: int,
     quote_shard_size: int,
+    kline_batch_size: int,
+    kline_data_length: int,
+    prioritize_near_expiry: bool,
+    near_expiry_months: int,
     max_symbols: int | None,
     discover: bool,
+    metrics_dirty_min_interval_seconds: int,
+    underlying_chain_dirty_interval_seconds: int,
 ) -> list[subprocess.Popen[Any]]:
     processes: list[subprocess.Popen[Any]] = []
     startupinfo = _hidden_startupinfo()
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     for stale_stop_file in report_dir.glob("worker-*.stop"):
         stale_stop_file.unlink(missing_ok=True)
+    for stale_report_file in report_dir.glob("worker-*.json"):
+        stale_report_file.unlink(missing_ok=True)
     for worker_index in range(worker_count):
         report_path = report_dir / f"worker-{worker_index:02d}-of-{worker_count:02d}.json"
         stop_path = report_dir / f"worker-{worker_index:02d}-of-{worker_count:02d}.stop"
@@ -901,11 +1068,23 @@ def _start_quote_stream_processes(
             str(worker_count),
             "--quote-shard-size",
             str(quote_shard_size),
+            "--kline-batch-size",
+            str(kline_batch_size),
+            "--kline-data-length",
+            str(kline_data_length),
+            "--near-expiry-months",
+            str(near_expiry_months),
+            "--metrics-dirty-min-interval-seconds",
+            str(metrics_dirty_min_interval_seconds),
+            "--underlying-chain-dirty-interval-seconds",
+            str(underlying_chain_dirty_interval_seconds),
             "--stop-file",
             str(stop_path),
         ]
         if max_symbols is not None:
             command.extend(["--max-symbols", str(max_symbols)])
+        if not prioritize_near_expiry:
+            command.append("--no-prioritize-near-expiry")
         if not discover:
             command.append("--no-discover")
         processes.append(
@@ -919,6 +1098,41 @@ def _start_quote_stream_processes(
             )
         )
     return processes
+
+
+def _start_metrics_worker_processes(
+    *,
+    database_path: str,
+    report_dir: Path,
+    min_interval_seconds: int,
+) -> list[subprocess.Popen[Any]]:
+    startupinfo = _hidden_startupinfo()
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    report_path = report_dir / "metrics-worker.json"
+    report_path.unlink(missing_ok=True)
+    command = [
+        sys.executable,
+        "-m",
+        "option_data_manager.cli.metrics_worker",
+        "--database",
+        database_path,
+        "--report",
+        str(report_path),
+        "--min-interval-seconds",
+        str(min_interval_seconds),
+        "--retry-delay-seconds",
+        str(min_interval_seconds),
+    ]
+    return [
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+    ]
 
 
 def _hidden_startupinfo() -> subprocess.STARTUPINFO | None:
@@ -946,34 +1160,564 @@ def _request_quote_stream_stop_files(service_state: ServiceStateRepository) -> N
 def _quote_stream_status(
     service_state: ServiceStateRepository,
     process_table: dict[str, list[Any]],
+    *,
+    connection: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     processes = process_table.get("processes", [])
     attached_pids = [int(process.pid) for process in processes if process.poll() is None]
-    running = bool(attached_pids)
-    if processes and not running:
+    persisted_pids = _json_int_list(service_state.get_value("quote_stream.pids"))
+    live_persisted_pids = [
+        pid for pid in persisted_pids if pid not in attached_pids and _pid_is_quote_stream(pid)
+    ]
+    live_pids = attached_pids or live_persisted_pids
+    running = bool(live_pids)
+    if running:
+        if (service_state.get_value("quote_stream.running") or "false") != "true":
+            service_state.set_value("quote_stream.running", "true")
+            service_state.set_value(
+                "quote_stream.message",
+                "实时订阅 worker 仍在运行。",
+            )
+    elif processes or (service_state.get_value("quote_stream.running") or "false") == "true":
         process_table["processes"] = []
         service_state.set_value("quote_stream.running", "false")
         service_state.set_value("quote_stream.finished_at", datetime.now(UTC).isoformat())
         service_state.set_value("quote_stream.message", "实时订阅 worker 已退出。")
-    persisted_pids = _json_int_list(service_state.get_value("quote_stream.pids"))
     worker_count = _int_or_none(service_state.get_value("quote_stream.worker_count")) or (
-        len(attached_pids) if attached_pids else len(persisted_pids)
-    )
-    running = running or (
-        (service_state.get_value("quote_stream.running") or "false") == "true"
-        and bool(attached_pids)
+        len(live_pids) if live_pids else len(persisted_pids)
     )
     status = "running" if running else "stopped"
+    progress = _quote_stream_progress(
+        service_state.get_value("quote_stream.report_dir"),
+        running=running,
+    )
+    health = build_realtime_health(
+        connection,
+        running=running,
+        progress=progress,
+    )
     return {
         "status": status,
         "running": running,
         "message": service_state.get_value("quote_stream.message"),
         "worker_count": worker_count,
-        "pids": attached_pids or ([] if not running else persisted_pids),
+        "pids": live_pids,
         "report_dir": service_state.get_value("quote_stream.report_dir"),
         "started_at": service_state.get_value("quote_stream.started_at"),
         "finished_at": service_state.get_value("quote_stream.finished_at"),
+        "progress": progress,
+        "health": health,
     }
+
+
+def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str, Any]:
+    if not running:
+        return _empty_quote_stream_progress(running=running)
+    if not report_dir:
+        return _empty_quote_stream_progress(running=running)
+    directory = Path(report_dir)
+    if not directory.exists():
+        return _empty_quote_stream_progress(running=running)
+    progress_rows: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("worker-*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        progress = _progress_from_report(payload)
+        if progress:
+            progress_rows.append(progress)
+    if not progress_rows:
+        return _empty_quote_stream_progress(running=running)
+    quote_subscribed = sum(_int_value(row.get("quote_subscribed")) for row in progress_rows)
+    quote_total = sum(_int_value(row.get("quote_total")) for row in progress_rows)
+    kline_subscribed = sum(_int_value(row.get("kline_subscribed")) for row in progress_rows)
+    kline_total = sum(_int_value(row.get("kline_total")) for row in progress_rows)
+    near_expiry_quote_subscribed = sum(
+        _int_value(row.get("near_expiry_quote_subscribed")) for row in progress_rows
+    )
+    near_expiry_quote_total = sum(
+        _int_value(row.get("near_expiry_quote_total")) for row in progress_rows
+    )
+    near_expiry_kline_subscribed = sum(
+        _int_value(row.get("near_expiry_kline_subscribed")) for row in progress_rows
+    )
+    near_expiry_kline_total = sum(
+        _int_value(row.get("near_expiry_kline_total")) for row in progress_rows
+    )
+    near_expiry_subscribed = near_expiry_quote_subscribed + near_expiry_kline_subscribed
+    near_expiry_total = near_expiry_quote_total + near_expiry_kline_total
+    near_expiry_months = max(
+        _int_value(row.get("near_expiry_months")) for row in progress_rows
+    )
+    subscribed_objects = quote_subscribed + kline_subscribed
+    total_objects = quote_total + kline_total
+    statuses = {str(row.get("status") or "") for row in progress_rows}
+    status = "running" if running else "stopped"
+    if "failed" in statuses:
+        status = "failed"
+    elif running and "subscribing" in statuses:
+        status = "subscribing"
+    updated_values = [
+        str(row.get("updated_at"))
+        for row in progress_rows
+        if row.get("updated_at") is not None
+    ]
+    wait_update_values = [
+        str(row.get("last_wait_update_at"))
+        for row in progress_rows
+        if row.get("last_wait_update_at") is not None
+    ]
+    quote_write_values = [
+        str(row.get("last_quote_write_at"))
+        for row in progress_rows
+        if row.get("last_quote_write_at") is not None
+    ]
+    tqsdk_notify = _latest_tqsdk_notify(progress_rows)
+    tqsdk_connection_status = _aggregate_tqsdk_connection_status(progress_rows)
+    tqsdk_disconnect_values = [
+        str(row.get("last_tqsdk_disconnect_at"))
+        for row in progress_rows
+        if row.get("last_tqsdk_disconnect_at") is not None
+    ]
+    tqsdk_restore_values = [
+        str(row.get("last_tqsdk_restore_at"))
+        for row in progress_rows
+        if row.get("last_tqsdk_restore_at") is not None
+    ]
+    started_values = [
+        str(row.get("started_at"))
+        for row in progress_rows
+        if row.get("started_at") is not None
+    ]
+    elapsed_seconds = _elapsed_seconds(
+        min(started_values) if started_values else None,
+        max(updated_values) if updated_values else None,
+    )
+    eta = _subscription_eta(
+        progress_rows,
+        quote_subscribed=quote_subscribed,
+        quote_total=quote_total,
+        kline_subscribed=kline_subscribed,
+        kline_total=kline_total,
+    )
+    return {
+        "status": status,
+        "worker_reports": len(progress_rows),
+        "quote_subscribed": quote_subscribed,
+        "quote_total": quote_total,
+        "kline_subscribed": kline_subscribed,
+        "kline_total": kline_total,
+        "near_expiry_months": near_expiry_months,
+        "near_expiry_quote_subscribed": near_expiry_quote_subscribed,
+        "near_expiry_quote_total": near_expiry_quote_total,
+        "near_expiry_kline_subscribed": near_expiry_kline_subscribed,
+        "near_expiry_kline_total": near_expiry_kline_total,
+        "near_expiry_subscribed": near_expiry_subscribed,
+        "near_expiry_total": near_expiry_total,
+        "subscribed_objects": subscribed_objects,
+        "total_objects": total_objects,
+        "completion_ratio": subscribed_objects / total_objects
+        if total_objects
+        else 0.0,
+        "started_at": min(started_values) if started_values else None,
+        "updated_at": max(updated_values) if updated_values else None,
+        "last_wait_update_at": max(wait_update_values) if wait_update_values else None,
+        "last_quote_write_at": max(quote_write_values) if quote_write_values else None,
+        "last_tqsdk_notify_at": tqsdk_notify.get("last_tqsdk_notify_at"),
+        "last_tqsdk_notify_code": tqsdk_notify.get("last_tqsdk_notify_code"),
+        "last_tqsdk_notify_level": tqsdk_notify.get("last_tqsdk_notify_level"),
+        "last_tqsdk_notify_content": tqsdk_notify.get("last_tqsdk_notify_content"),
+        "tqsdk_connection_status": tqsdk_connection_status,
+        "last_tqsdk_disconnect_at": max(tqsdk_disconnect_values)
+        if tqsdk_disconnect_values
+        else None,
+        "last_tqsdk_restore_at": max(tqsdk_restore_values)
+        if tqsdk_restore_values
+        else None,
+        "tqsdk_notify_count": sum(
+            _int_value(row.get("tqsdk_notify_count")) for row in progress_rows
+        ),
+        "cycle_count": sum(_int_value(row.get("cycle_count")) for row in progress_rows),
+        "wait_update_count": sum(
+            _int_value(row.get("wait_update_count")) for row in progress_rows
+        ),
+        "quotes_written": sum(_int_value(row.get("quotes_written")) for row in progress_rows),
+        "changed_quotes_written": sum(
+            _int_value(row.get("changed_quotes_written")) for row in progress_rows
+        ),
+        "elapsed_seconds": elapsed_seconds,
+        "active_stage": eta["active_stage"],
+        "stage_label": eta["stage_label"],
+        "stage_average_seconds_per_object": eta["stage_average_seconds_per_object"],
+        "stage_estimated_remaining_seconds": eta["stage_estimated_remaining_seconds"],
+        "estimated_remaining_seconds": eta["estimated_remaining_seconds"],
+        "estimated_remaining_is_total": eta["estimated_remaining_is_total"],
+        "waiting_for_kline_eta": eta["waiting_for_kline_eta"],
+        "average_seconds_per_object": eta["stage_average_seconds_per_object"],
+    }
+
+
+def _progress_from_report(payload: dict[str, Any]) -> dict[str, Any] | None:
+    progress = payload.get("progress")
+    if isinstance(progress, dict):
+        return progress
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+    quote_total = _int_value(result.get("symbol_count"))
+    kline_total = _int_value(result.get("kline_symbol_count"))
+    quote_subscribed = _int_value(result.get("subscribed_quote_count"), quote_total)
+    kline_subscribed = _int_value(result.get("subscribed_kline_count"), kline_total)
+    near_expiry_quote_total = _int_value(
+        result.get("near_expiry_quote_total"),
+        _int_value(result.get("near_expiry_quote_count")),
+    )
+    near_expiry_kline_total = _int_value(
+        result.get("near_expiry_kline_total"),
+        _int_value(result.get("near_expiry_kline_count")),
+    )
+    near_expiry_quote_subscribed = _int_value(
+        result.get("near_expiry_quote_subscribed"),
+        near_expiry_quote_total,
+    )
+    near_expiry_kline_subscribed = _int_value(
+        result.get("near_expiry_kline_subscribed"),
+        near_expiry_kline_total,
+    )
+    near_expiry_total = near_expiry_quote_total + near_expiry_kline_total
+    near_expiry_subscribed = (
+        near_expiry_quote_subscribed + near_expiry_kline_subscribed
+    )
+    total_objects = quote_total + kline_total
+    subscribed_objects = quote_subscribed + kline_subscribed
+    return {
+        "status": str(payload.get("status") or "stopped"),
+        "started_at": result.get("started_at"),
+        "updated_at": result.get("finished_at"),
+        "last_wait_update_at": result.get("last_wait_update_at"),
+        "last_quote_write_at": result.get("last_quote_write_at"),
+        "last_tqsdk_notify_at": result.get("last_tqsdk_notify_at"),
+        "last_tqsdk_notify_code": result.get("last_tqsdk_notify_code"),
+        "last_tqsdk_notify_level": result.get("last_tqsdk_notify_level"),
+        "last_tqsdk_notify_content": result.get("last_tqsdk_notify_content"),
+        "tqsdk_connection_status": result.get("tqsdk_connection_status") or "unknown",
+        "last_tqsdk_disconnect_at": result.get("last_tqsdk_disconnect_at"),
+        "last_tqsdk_restore_at": result.get("last_tqsdk_restore_at"),
+        "tqsdk_notify_count": _int_value(result.get("tqsdk_notify_count")),
+        "cycle_count": _int_value(result.get("cycles")),
+        "wait_update_count": _int_value(result.get("wait_update_count")),
+        "quotes_written": _int_value(result.get("quotes_written")),
+        "changed_quotes_written": _int_value(result.get("changed_quotes_written")),
+        "quote_started_at": result.get("quote_started_at") or result.get("started_at"),
+        "quote_finished_at": result.get("quote_finished_at"),
+        "kline_started_at": result.get("kline_started_at"),
+        "worker_index": result.get("worker_index"),
+        "worker_count": result.get("worker_count"),
+        "quote_subscribed": quote_subscribed,
+        "quote_total": quote_total,
+        "kline_subscribed": kline_subscribed,
+        "kline_total": kline_total,
+        "near_expiry_months": _int_value(result.get("near_expiry_months")),
+        "near_expiry_quote_subscribed": near_expiry_quote_subscribed,
+        "near_expiry_quote_total": near_expiry_quote_total,
+        "near_expiry_kline_subscribed": near_expiry_kline_subscribed,
+        "near_expiry_kline_total": near_expiry_kline_total,
+        "near_expiry_subscribed": near_expiry_subscribed,
+        "near_expiry_total": near_expiry_total,
+        "subscribed_objects": subscribed_objects,
+        "total_objects": total_objects,
+        "completion_ratio": subscribed_objects / total_objects
+        if total_objects
+        else 0.0,
+    }
+
+
+def _latest_tqsdk_notify(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    candidates = [
+        row for row in rows if row.get("last_tqsdk_notify_at") is not None
+    ]
+    if not candidates:
+        return {}
+    latest = max(candidates, key=lambda row: str(row.get("last_tqsdk_notify_at")))
+    return {
+        "last_tqsdk_notify_at": latest.get("last_tqsdk_notify_at"),
+        "last_tqsdk_notify_code": latest.get("last_tqsdk_notify_code"),
+        "last_tqsdk_notify_level": latest.get("last_tqsdk_notify_level"),
+        "last_tqsdk_notify_content": latest.get("last_tqsdk_notify_content"),
+    }
+
+
+def _aggregate_tqsdk_connection_status(rows: list[dict[str, Any]]) -> str:
+    statuses = {
+        str(row.get("tqsdk_connection_status") or "unknown") for row in rows
+    }
+    if "disconnected" in statuses:
+        return "disconnected"
+    if "reconnecting" in statuses:
+        return "reconnecting"
+    if "connected" in statuses:
+        return "connected"
+    return "unknown"
+
+
+def _empty_quote_stream_progress(*, running: bool) -> dict[str, Any]:
+    return {
+        "status": "running" if running else "stopped",
+        "worker_reports": 0,
+        "quote_subscribed": 0,
+        "quote_total": 0,
+        "kline_subscribed": 0,
+        "kline_total": 0,
+        "near_expiry_months": 0,
+        "near_expiry_quote_subscribed": 0,
+        "near_expiry_quote_total": 0,
+        "near_expiry_kline_subscribed": 0,
+        "near_expiry_kline_total": 0,
+        "near_expiry_subscribed": 0,
+        "near_expiry_total": 0,
+        "subscribed_objects": 0,
+        "total_objects": 0,
+        "completion_ratio": 0.0,
+        "started_at": None,
+        "updated_at": None,
+        "last_wait_update_at": None,
+        "last_quote_write_at": None,
+        "last_tqsdk_notify_at": None,
+        "last_tqsdk_notify_code": None,
+        "last_tqsdk_notify_level": None,
+        "last_tqsdk_notify_content": None,
+        "tqsdk_connection_status": "unknown",
+        "last_tqsdk_disconnect_at": None,
+        "last_tqsdk_restore_at": None,
+        "tqsdk_notify_count": 0,
+        "cycle_count": 0,
+        "wait_update_count": 0,
+        "quotes_written": 0,
+        "changed_quotes_written": 0,
+        "elapsed_seconds": None,
+        "active_stage": "stopped" if not running else "initializing",
+        "stage_label": None,
+        "stage_average_seconds_per_object": None,
+        "stage_estimated_remaining_seconds": None,
+        "average_seconds_per_object": None,
+        "estimated_remaining_seconds": None,
+        "estimated_remaining_is_total": False,
+        "waiting_for_kline_eta": False,
+    }
+
+
+def _int_value(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _elapsed_seconds(started_at: str | None, updated_at: str | None) -> float | None:
+    started = _parse_datetime(started_at)
+    updated = _parse_datetime(updated_at)
+    if started is None or updated is None:
+        return None
+    return max(0.0, (updated - started).total_seconds())
+
+
+def _subscription_eta(
+    rows: list[dict[str, Any]],
+    *,
+    quote_subscribed: int,
+    quote_total: int,
+    kline_subscribed: int,
+    kline_total: int,
+) -> dict[str, Any]:
+    if quote_total > 0 and quote_subscribed < quote_total:
+        active_stage = "quote"
+        stage_label = "Quote"
+    elif kline_total > 0 and kline_subscribed < kline_total:
+        active_stage = "kline"
+        stage_label = "K线"
+    else:
+        return {
+            "active_stage": "running",
+            "stage_label": "实时运行",
+            "stage_average_seconds_per_object": None,
+            "stage_estimated_remaining_seconds": 0.0,
+            "estimated_remaining_seconds": 0.0,
+            "estimated_remaining_is_total": True,
+            "waiting_for_kline_eta": False,
+        }
+
+    quote_average = _stage_average_seconds(
+        rows,
+        subscribed_key="quote_subscribed",
+        started_keys=("quote_started_at", "started_at"),
+        finished_keys=("quote_finished_at", "updated_at"),
+    )
+    kline_average = _stage_average_seconds(
+        rows,
+        subscribed_key="kline_subscribed",
+        started_keys=("kline_started_at", "quote_finished_at", "started_at"),
+        finished_keys=("updated_at",),
+    )
+    quote_remaining = (
+        quote_average * max(0, quote_total - quote_subscribed)
+        if quote_average is not None
+        else None
+    )
+    kline_remaining = (
+        kline_average * max(0, kline_total - kline_subscribed)
+        if kline_average is not None
+        else None
+    )
+    if active_stage == "quote":
+        stage_average = quote_average
+        stage_remaining = quote_remaining
+        total_remaining = (
+            quote_remaining + kline_remaining
+            if quote_remaining is not None and kline_remaining is not None
+            else None
+        )
+        waiting_for_kline_eta = kline_total > 0 and kline_remaining is None
+    else:
+        stage_average = kline_average
+        stage_remaining = kline_remaining
+        total_remaining = kline_remaining
+        waiting_for_kline_eta = kline_total > 0 and kline_remaining is None
+
+    return {
+        "active_stage": active_stage,
+        "stage_label": stage_label,
+        "stage_average_seconds_per_object": stage_average,
+        "stage_estimated_remaining_seconds": stage_remaining,
+        "estimated_remaining_seconds": total_remaining,
+        "estimated_remaining_is_total": total_remaining is not None,
+        "waiting_for_kline_eta": waiting_for_kline_eta,
+    }
+
+
+def _stage_average_seconds(
+    rows: list[dict[str, Any]],
+    *,
+    subscribed_key: str,
+    started_keys: tuple[str, ...],
+    finished_keys: tuple[str, ...],
+) -> float | None:
+    elapsed_total = 0.0
+    subscribed_total = 0
+    for row in rows:
+        subscribed = _int_value(row.get(subscribed_key))
+        if subscribed <= 0:
+            continue
+        started_at = _first_text(row, started_keys)
+        finished_at = _first_text(row, finished_keys)
+        elapsed = _elapsed_seconds(started_at, finished_at)
+        if elapsed is None or elapsed <= 0:
+            continue
+        elapsed_total += elapsed
+        subscribed_total += subscribed
+    if subscribed_total <= 0:
+        return None
+    return elapsed_total / subscribed_total
+
+
+def _first_text(row: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _pid_is_quote_stream(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _windows_pid_command_line_contains(pid, "option_data_manager.cli.quote_stream")
+    command_line_path = Path(f"/proc/{pid}/cmdline")
+    try:
+        return "option_data_manager.cli.quote_stream" in command_line_path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except OSError:
+        return False
+
+
+def _pid_is_metrics_worker(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _windows_pid_command_line_contains(
+            pid,
+            "option_data_manager.cli.metrics_worker",
+        )
+    command_line_path = Path(f"/proc/{pid}/cmdline")
+    try:
+        return "option_data_manager.cli.metrics_worker" in command_line_path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except OSError:
+        return False
+
+
+def _windows_pid_command_line_contains(pid: int, needle: str) -> bool:
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return False
+    return needle in (completed.stdout or "")
+
+
+def _terminate_pid(pid: int) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return
+    try:
+        os.kill(pid, 15)
+    except Exception:
+        return
+
+
+def _stop_attached_processes(processes: list[Any]) -> int:
+    stopped = 0
+    for process in processes:
+        if process.poll() is None:
+            stopped += 1
+            process.terminate()
+    for process in processes:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+    return stopped
 
 
 def _json_int_list(value: str | None) -> list[int]:
@@ -997,6 +1741,12 @@ def _json_int_list(value: str | None) -> list[int]:
 def _positive_int_setting(value: str | None, default: int) -> int:
     parsed = _optional_positive_int(value)
     return default if parsed is None else parsed
+
+
+def _bool_setting(value: str | None, default: bool) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _optional_positive_int(value: str | None) -> int | None:

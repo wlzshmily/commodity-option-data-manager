@@ -11,6 +11,18 @@
 ## Done
 
 - Fixed T型报价 exchange/product/month selector switching and displayed remaining expiry days in overview/T型报价.
+- Reduced T型报价 contract switching latency and filled remaining expiry days from stored TQSDK quote payload fields when instrument expiry columns are still empty.
+- Clarified overview realtime Quote status separately from batch collection progress, including worker count/PIDs and latest data write time.
+- Added realtime subscription coverage progress and exchange tabs for the overview underlying summary table.
+- Corrected realtime progress semantics and quote-stream stop behavior for persisted worker PIDs/process trees.
+- Redefined realtime subscription progress to count live Quote subscription objects plus Kline subscription objects, with progress reset on fresh starts/stops.
+- Added realtime subscription total elapsed time and average seconds per subscribed object to the overview progress card.
+- Split realtime progress into distinct Quote and Kline bars and added estimated remaining time.
+- Clarified overview progress cards so batch catch-up is separate from realtime subscription, and changed realtime ETA to use worker-reported cumulative progress plus Quote/Kline phase timestamps with a local countdown between backend reports.
+- Added deterministic IV/K-line window comparison evidence and implemented 3-day incremental K-line fetch plus local 20-day cache splice for batch IV calculation; realtime subscription defaults remain at the safer 20 daily bars.
+- Added realtime metrics dirty queue and independent metrics worker: Quote price changes enqueue option refreshes, underlying price changes enqueue the active chain with interval limiting, and IV/Greeks refresh is throttled to 30 seconds by default without blocking Quote writes.
+- Realtime subscription workers must keep both Quote and Kline object coverage. The rejected Quote-only startup showed why the Kline progress could become `0/0`; the corrected path keeps Kline subscriptions and uses configurable `--kline-data-length` (default 3) only to reduce each serial's history window.
+- Realtime subscription order now prioritizes nearest expiry months by default, and the overview progress bar marks the first configured near-expiry month boundary (default 2 months) so operators can see when the most urgent chains are loaded.
 
 - Requirements reviewed and implementation plan approved.
 - Package structure and `pyproject.toml`.
@@ -32,13 +44,14 @@
 - Full-market performance tuning sample captured: `option_batch_size=40`, `wait_cycles=1` is the current single-process candidate; 2-4 independent TQSDK worker processes improve throughput with sublinear scaling.
 - Quote-only probe confirmed realtime Quote refresh is much cheaper than full Quote/K-line/metrics collection and should be split into bounded long-lived subscription shards.
 - Process-level full-market shard command implemented as `odm-collect-parallel`.
-- Quote-only long-lived subscription command implemented as `odm-quote-stream`.
+- Realtime long-lived subscription command implemented as `odm-quote-stream`.
 - WebUI read model now surfaces latest parallel collection progress while API background refresh can still use the routine scope.
 - Stale interrupted acquisition runs can be marked failed so diagnostics do not show false long-running jobs.
 - Bounded live full-market acceptance windows completed with tuned 4-process shards.
 - Final full-market completion report recorded under ignored `docs/qa/live-evidence/final-parallel-catchup/summary.json`.
 - Data collection readiness reached: 864/864 full-market batches succeeded, 0 failed, 27,386 active options covered with Quote rows, K-line rows, and metrics rows.
 - Final verification rerun passed: `uv run pytest -q` passed 41 tests, compileall, agentic-SDLC check, and real runtime API/WebUI smoke.
-- WebUI/API quote stream controls delivered: operators can start, stop, and inspect quote-only worker shards from the settings page through `/api/quote-stream`.
+- WebUI/API quote stream controls delivered: operators can start, stop, and inspect realtime worker shards from the settings page through `/api/quote-stream`.
 - Live quote stream control smoke passed and left no running worker process.
 - Local acceptance UI polish delivered for settings and overview pages, including clearer progress/status messaging, fixed table widths, Chinese product labels, API Key copy/delete/full fingerprint display, and TQSDK same-name date fields exposed through API payloads.
+- Realtime open-session network health detection added with conservative holiday/post-close quiet handling.

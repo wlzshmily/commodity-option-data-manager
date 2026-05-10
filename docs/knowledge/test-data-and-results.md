@@ -17,3 +17,48 @@
 - 2026-05-08 partial live TQSDK check: market discovery found 27,386 option symbols and 380 underlyings across DCE/CZCE/SHFE/INE/GFEX; a one-underlying collection window wrote quote, K-line, and metrics rows with partial source errors. Full-market acceptance remains pending.
 - 2026-05-08 bounded window check: `odm-collect --max-underlyings 1 --max-batches 1 --option-batch-size 5 --wait-cycles 1` completed in a bounded command window and wrote a partial-failure report without secrets.
 - 2026-05-09 full-market planning smoke: `odm-collect --max-underlyings 1000000 --max-batches 3 --option-batch-size 20 --wait-cycles 1` materialized 380 underlyings, 27,386 options, and 1,544 active batches; selected batches completed successfully while source quality gaps remained visible.
+- 2026-05-10 WSL IV/K-line window diagnostic:
+  - `uv run python -m pytest -s tests/test_quote_streamer.py tests/test_compare_iv_windows_cli.py -q`: 9 passed.
+  - `uv run python -m pytest -s -q`: 57 passed.
+  - `odm-compare-iv-windows --max-options 2 --windows 1,2,5,20 --wait-cycles 2`: generated ignored evidence with one source-empty CALL and one PUT matching the 20-day IV baseline within floating-point noise.
+  - `odm-compare-iv-windows --symbols CZCE.AP610P6500,CZCE.AP610P6600,CZCE.AP610C6700,CZCE.AP610P6700,CZCE.AP610C6800,CZCE.AP610P6800 --windows 1,2,5,20 --wait-cycles 1`: 24 successful points; max absolute latest-IV difference versus 20-day baseline about `3.34e-12`.
+  - Cache-splice unit tests verify `collect_persisted_option_chain` requests 3 daily bars when both option and underlying have at least 20 cached K-line rows, and falls back to 20 daily bars when cache is missing.
+  - Live cache-splice smoke on `CZCE.AP611C8400` observed `data_length=3`, spliced a 20-row IV input frame, and completed with 0 errors and finite IV.
+- 2026-05-10 WSL realtime metrics worker:
+  - `uv run python -m pytest -s tests/test_metrics_dirty_queue.py tests/test_quote_streamer.py tests/test_api_app.py -q`: 18 passed.
+  - `uv run python -m pytest -s -q`: 61 passed.
+  - Live API start/stop smoke with real runtime DB started one quote worker plus one metrics worker, then stopped both; stop response reported 1 quote worker and 1 metrics worker stopped, and `metrics_worker.pids` was cleared.
+- 2026-05-10 realtime Kline coverage correction:
+  - Quote-only realtime startup was rejected after browser review because daily K-lines can update during the trading session.
+  - API-started realtime workers must subscribe Quote plus Kline objects, must not pass `--no-klines`, and now pass configurable `--kline-data-length` (default 3) to reduce each serial's history window without reducing object coverage.
+  - `uv run python -m pytest -s tests/test_api_app.py tests/test_quote_streamer.py -q`: 15 passed.
+  - `uv run python -m pytest -s -q`: 61 passed.
+  - Live 4-worker restart showed quote-stream commands with `--kline-data-length 3` and no `--no-klines`; `/api/quote-stream` reported `quote_subscribed=27766`, `quote_total=27766`, `kline_total=27386`, and Kline subscribed progress advanced from 272 to 544.
+- 2026-05-10 WSL near-expiry subscription priority:
+  - `uv run python -m pytest -s tests/test_api_app.py tests/test_quote_streamer.py -q`: 16 passed.
+  - `uv run python -m pytest -s -q`: 62 passed.
+  - Live 4-worker restart showed quote-stream commands with `--near-expiry-months 2`, default near-expiry priority enabled, and progress fields `near_expiry_subscribed/near_expiry_total` advancing to `6870/15218`.
+  - Overview progress bar now renders a `近2月` marker at the near-expiry object boundary and displays the near-month count summary below the bar.
+- 2026-05-10 WSL Kline de-duplication correction:
+  - Realtime Kline subscriptions now use de-duplicated single-symbol daily Klines instead of `[option, underlying]` pairs per option, so a chain such as 30 CALL + 30 PUT no longer repeats the same underlying Kline 60 times in subscription setup.
+  - IV refresh still passes a two-symbol frame to `OPTION_IMPV`, but it is now built from local cached option Klines plus a once-fetched underlying Kline.
+  - `odm-metrics-worker` groups due dirty tasks by underlying before calling chain collection.
+  - `uv run pytest -s tests/test_quote_streamer.py tests/test_chain_collector.py tests/test_metrics_worker.py -q`: 13 passed.
+  - `uv run pytest -s tests/test_api_app.py tests/test_webui_read_model.py -q`: 17 passed.
+  - Follow-up probe showed Kline setup ETA can worsen when only duplicate underlying data is removed, because TQSDK serial setup is dominated by `get_kline_serial` call latency rather than payload width. Experimental `--kline-batch-size` was added but left defaulted to `1` after local probes showed wide multi-symbol Kline serials can block on some symbol combinations. `uv run pytest -s -q`: 66 passed.
+- 2026-05-10 WSL Kline batch-size setting:
+  - Settings/API/WebUI expose `quote_stream.kline_batch_size`; default remains `1`, and `/api/quote-stream/start` passes the value to `odm-quote-stream --kline-batch-size`.
+  - `uv run pytest -s tests/test_api_app.py tests/test_quote_streamer.py -q`: 18 passed.
+  - `uv run pytest -s -q`: 66 passed.
+- 2026-05-10 WSL realtime health detection:
+  - `odm-quote-stream` progress reports now continue after subscription setup with worker heartbeat fields, `last_wait_update_at`, and `last_quote_write_at`.
+  - Health detection is trading-session aware and waits for current-session futures Quote source-time evidence before flagging stale `wait_update`, avoiding holiday and post-close false alerts.
+  - `uv run pytest -s tests/test_realtime_health.py tests/test_quote_streamer.py tests/test_api_app.py -q`: 22 passed.
+  - `uv run pytest -s -q`: 70 passed.
+  - Follow-up correction: normal Friday night is allowed before a weekend; statutory holiday suppression no longer treats normal weekends as holiday closures. `uv run pytest -s tests/test_realtime_health.py tests/test_api_app.py tests/test_quote_streamer.py -q`: 25 passed; `uv run pytest -s -q`: 73 passed.
+- 2026-05-10 WSL TQSDK reconnect notification observability:
+  - `odm-quote-stream` now records official TQSDK `TqNotify` connection notifications in worker progress reports, including connection status, latest notify code/content, disconnect time, restore time, and notify count.
+  - API/WebUI aggregate the notification fields across quote-stream workers, and realtime health uses SDK `disconnected`/`reconnecting` notifications as a first-class trading-session warning after market evidence is present.
+  - `uv run pytest -s tests/test_quote_streamer.py tests/test_realtime_health.py tests/test_api_app.py -q`: 27 passed.
+  - `uv run python -m compileall -q src tests`: passed.
+  - `uv run pytest -s -q`: 75 passed.

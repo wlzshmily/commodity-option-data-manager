@@ -6,12 +6,14 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 import uvicorn
 
 from option_data_manager.api.app import create_app as create_local_api_app
+from option_data_manager.realtime_health import build_realtime_health
 from option_data_manager.service_state import ServiceStateRepository
 from .read_model import WebuiReadModel
 
@@ -27,6 +29,7 @@ def create_webui_app(
     """Create the local WebUI and its read-only JSON endpoints."""
 
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=30000")
     read_model = WebuiReadModel(connection)
     service_state = ServiceStateRepository(connection)
     app = FastAPI(title="期权数据管理工具 WebUI")
@@ -52,7 +55,11 @@ def create_webui_app(
         initial_state = {
             "overview": overview,
             "selectedUnderlying": selected,
-            "quote": read_model.tquote(underlying_symbol=selected) if selected else None,
+            "quote": (
+                read_model.tquote(underlying_symbol=selected, include_selectors=False)
+                if selected
+                else None
+            ),
             "databasePath": database_path,
         }
         return INDEX_HTML.replace(
@@ -83,8 +90,11 @@ def create_webui_app(
         }
 
     @app.get("/api/webui/tquote")
-    def tquote(underlying: str | None = None) -> dict:
-        return read_model.tquote(underlying_symbol=underlying)
+    def tquote(underlying: str | None = None, selectors: bool = False) -> dict:
+        return read_model.tquote(
+            underlying_symbol=underlying,
+            include_selectors=selectors,
+        )
 
     @app.get("/api/webui/runs")
     def runs(limit: int = Query(default=30, ge=1, le=100)) -> dict:
@@ -118,30 +128,518 @@ def _overview_payload(
             "started_at": service_state.get_value("collection.refresh_started_at"),
             "finished_at": service_state.get_value("collection.refresh_finished_at"),
         },
-        "quote_stream": _quote_stream_payload(service_state),
+        "quote_stream": _quote_stream_payload(
+            service_state,
+            connection=read_model.connection,
+        ),
     }
 
 
 def _int_or_none(value: str | None) -> int | None:
     if value is None:
         return None
-
-
-def _quote_stream_payload(service_state: ServiceStateRepository) -> dict:
-    return {
-        "running": (service_state.get_value("quote_stream.running") or "false")
-        == "true",
-        "message": service_state.get_value("quote_stream.message"),
-        "worker_count": _int_or_none(service_state.get_value("quote_stream.worker_count"))
-        or 0,
-        "report_dir": service_state.get_value("quote_stream.report_dir"),
-        "started_at": service_state.get_value("quote_stream.started_at"),
-        "finished_at": service_state.get_value("quote_stream.finished_at"),
-    }
     try:
         return int(value)
     except ValueError:
         return None
+
+
+def _json_int_list(value: str | None) -> list[int]:
+    if not value:
+        return []
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    result: list[int] = []
+    for item in payload:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _quote_stream_payload(
+    service_state: ServiceStateRepository,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> dict:
+    pids = _json_int_list(service_state.get_value("quote_stream.pids"))
+    live_pids = [pid for pid in pids if _pid_is_quote_stream(pid)]
+    running = (
+        (service_state.get_value("quote_stream.running") or "false") == "true"
+        or bool(live_pids)
+    )
+    progress = _quote_stream_progress(
+        service_state.get_value("quote_stream.report_dir"),
+        running=running,
+    )
+    return {
+        "running": running,
+        "message": service_state.get_value("quote_stream.message"),
+        "worker_count": _int_or_none(service_state.get_value("quote_stream.worker_count"))
+        or len(live_pids),
+        "pids": live_pids,
+        "report_dir": service_state.get_value("quote_stream.report_dir"),
+        "started_at": service_state.get_value("quote_stream.started_at"),
+        "finished_at": service_state.get_value("quote_stream.finished_at"),
+        "progress": progress,
+        "health": build_realtime_health(
+            connection,
+            running=running,
+            progress=progress,
+        ),
+    }
+
+
+def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict:
+    if not running:
+        return _empty_quote_stream_progress(running=running)
+    if not report_dir:
+        return _empty_quote_stream_progress(running=running)
+    directory = Path(report_dir)
+    if not directory.exists():
+        return _empty_quote_stream_progress(running=running)
+    rows: list[dict] = []
+    for path in sorted(directory.glob("worker-*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        progress = _progress_from_report(payload)
+        if progress:
+            rows.append(progress)
+    if not rows:
+        return _empty_quote_stream_progress(running=running)
+    quote_subscribed = sum(_int_value(row.get("quote_subscribed")) for row in rows)
+    quote_total = sum(_int_value(row.get("quote_total")) for row in rows)
+    kline_subscribed = sum(_int_value(row.get("kline_subscribed")) for row in rows)
+    kline_total = sum(_int_value(row.get("kline_total")) for row in rows)
+    near_expiry_quote_subscribed = sum(
+        _int_value(row.get("near_expiry_quote_subscribed")) for row in rows
+    )
+    near_expiry_quote_total = sum(
+        _int_value(row.get("near_expiry_quote_total")) for row in rows
+    )
+    near_expiry_kline_subscribed = sum(
+        _int_value(row.get("near_expiry_kline_subscribed")) for row in rows
+    )
+    near_expiry_kline_total = sum(
+        _int_value(row.get("near_expiry_kline_total")) for row in rows
+    )
+    near_expiry_subscribed = near_expiry_quote_subscribed + near_expiry_kline_subscribed
+    near_expiry_total = near_expiry_quote_total + near_expiry_kline_total
+    near_expiry_months = max(_int_value(row.get("near_expiry_months")) for row in rows)
+    subscribed_objects = quote_subscribed + kline_subscribed
+    total_objects = quote_total + kline_total
+    statuses = {str(row.get("status") or "") for row in rows}
+    status = "running" if running else "stopped"
+    if "failed" in statuses:
+        status = "failed"
+    elif running and "subscribing" in statuses:
+        status = "subscribing"
+    updated_values = [
+        str(row.get("updated_at")) for row in rows if row.get("updated_at") is not None
+    ]
+    wait_update_values = [
+        str(row.get("last_wait_update_at"))
+        for row in rows
+        if row.get("last_wait_update_at") is not None
+    ]
+    quote_write_values = [
+        str(row.get("last_quote_write_at"))
+        for row in rows
+        if row.get("last_quote_write_at") is not None
+    ]
+    tqsdk_notify = _latest_tqsdk_notify(rows)
+    tqsdk_connection_status = _aggregate_tqsdk_connection_status(rows)
+    tqsdk_disconnect_values = [
+        str(row.get("last_tqsdk_disconnect_at"))
+        for row in rows
+        if row.get("last_tqsdk_disconnect_at") is not None
+    ]
+    tqsdk_restore_values = [
+        str(row.get("last_tqsdk_restore_at"))
+        for row in rows
+        if row.get("last_tqsdk_restore_at") is not None
+    ]
+    started_values = [
+        str(row.get("started_at")) for row in rows if row.get("started_at") is not None
+    ]
+    elapsed_seconds = _elapsed_seconds(
+        min(started_values) if started_values else None,
+        max(updated_values) if updated_values else None,
+    )
+    eta = _subscription_eta(
+        rows,
+        quote_subscribed=quote_subscribed,
+        quote_total=quote_total,
+        kline_subscribed=kline_subscribed,
+        kline_total=kline_total,
+    )
+    return {
+        "status": status,
+        "worker_reports": len(rows),
+        "quote_subscribed": quote_subscribed,
+        "quote_total": quote_total,
+        "kline_subscribed": kline_subscribed,
+        "kline_total": kline_total,
+        "near_expiry_months": near_expiry_months,
+        "near_expiry_quote_subscribed": near_expiry_quote_subscribed,
+        "near_expiry_quote_total": near_expiry_quote_total,
+        "near_expiry_kline_subscribed": near_expiry_kline_subscribed,
+        "near_expiry_kline_total": near_expiry_kline_total,
+        "near_expiry_subscribed": near_expiry_subscribed,
+        "near_expiry_total": near_expiry_total,
+        "subscribed_objects": subscribed_objects,
+        "total_objects": total_objects,
+        "completion_ratio": subscribed_objects / total_objects
+        if total_objects
+        else 0.0,
+        "started_at": min(started_values) if started_values else None,
+        "updated_at": max(updated_values) if updated_values else None,
+        "last_wait_update_at": max(wait_update_values) if wait_update_values else None,
+        "last_quote_write_at": max(quote_write_values) if quote_write_values else None,
+        "last_tqsdk_notify_at": tqsdk_notify.get("last_tqsdk_notify_at"),
+        "last_tqsdk_notify_code": tqsdk_notify.get("last_tqsdk_notify_code"),
+        "last_tqsdk_notify_level": tqsdk_notify.get("last_tqsdk_notify_level"),
+        "last_tqsdk_notify_content": tqsdk_notify.get("last_tqsdk_notify_content"),
+        "tqsdk_connection_status": tqsdk_connection_status,
+        "last_tqsdk_disconnect_at": max(tqsdk_disconnect_values)
+        if tqsdk_disconnect_values
+        else None,
+        "last_tqsdk_restore_at": max(tqsdk_restore_values)
+        if tqsdk_restore_values
+        else None,
+        "tqsdk_notify_count": sum(_int_value(row.get("tqsdk_notify_count")) for row in rows),
+        "cycle_count": sum(_int_value(row.get("cycle_count")) for row in rows),
+        "wait_update_count": sum(_int_value(row.get("wait_update_count")) for row in rows),
+        "quotes_written": sum(_int_value(row.get("quotes_written")) for row in rows),
+        "changed_quotes_written": sum(
+            _int_value(row.get("changed_quotes_written")) for row in rows
+        ),
+        "elapsed_seconds": elapsed_seconds,
+        "active_stage": eta["active_stage"],
+        "stage_label": eta["stage_label"],
+        "stage_average_seconds_per_object": eta["stage_average_seconds_per_object"],
+        "stage_estimated_remaining_seconds": eta["stage_estimated_remaining_seconds"],
+        "estimated_remaining_seconds": eta["estimated_remaining_seconds"],
+        "estimated_remaining_is_total": eta["estimated_remaining_is_total"],
+        "waiting_for_kline_eta": eta["waiting_for_kline_eta"],
+        "average_seconds_per_object": eta["stage_average_seconds_per_object"],
+    }
+
+
+def _progress_from_report(payload: dict) -> dict | None:
+    progress = payload.get("progress")
+    if isinstance(progress, dict):
+        return progress
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+    quote_total = _int_value(result.get("symbol_count"))
+    kline_total = _int_value(result.get("kline_symbol_count"))
+    quote_subscribed = _int_value(result.get("subscribed_quote_count"), quote_total)
+    kline_subscribed = _int_value(result.get("subscribed_kline_count"), kline_total)
+    near_expiry_quote_total = _int_value(
+        result.get("near_expiry_quote_total"),
+        _int_value(result.get("near_expiry_quote_count")),
+    )
+    near_expiry_kline_total = _int_value(
+        result.get("near_expiry_kline_total"),
+        _int_value(result.get("near_expiry_kline_count")),
+    )
+    near_expiry_quote_subscribed = _int_value(
+        result.get("near_expiry_quote_subscribed"),
+        near_expiry_quote_total,
+    )
+    near_expiry_kline_subscribed = _int_value(
+        result.get("near_expiry_kline_subscribed"),
+        near_expiry_kline_total,
+    )
+    near_expiry_subscribed = (
+        near_expiry_quote_subscribed + near_expiry_kline_subscribed
+    )
+    near_expiry_total = near_expiry_quote_total + near_expiry_kline_total
+    total_objects = quote_total + kline_total
+    subscribed_objects = quote_subscribed + kline_subscribed
+    return {
+        "status": str(payload.get("status") or "stopped"),
+        "started_at": result.get("started_at"),
+        "updated_at": result.get("finished_at"),
+        "last_wait_update_at": result.get("last_wait_update_at"),
+        "last_quote_write_at": result.get("last_quote_write_at"),
+        "last_tqsdk_notify_at": result.get("last_tqsdk_notify_at"),
+        "last_tqsdk_notify_code": result.get("last_tqsdk_notify_code"),
+        "last_tqsdk_notify_level": result.get("last_tqsdk_notify_level"),
+        "last_tqsdk_notify_content": result.get("last_tqsdk_notify_content"),
+        "tqsdk_connection_status": result.get("tqsdk_connection_status") or "unknown",
+        "last_tqsdk_disconnect_at": result.get("last_tqsdk_disconnect_at"),
+        "last_tqsdk_restore_at": result.get("last_tqsdk_restore_at"),
+        "tqsdk_notify_count": _int_value(result.get("tqsdk_notify_count")),
+        "cycle_count": _int_value(result.get("cycles")),
+        "wait_update_count": _int_value(result.get("wait_update_count")),
+        "quotes_written": _int_value(result.get("quotes_written")),
+        "changed_quotes_written": _int_value(result.get("changed_quotes_written")),
+        "quote_started_at": result.get("quote_started_at") or result.get("started_at"),
+        "quote_finished_at": result.get("quote_finished_at"),
+        "kline_started_at": result.get("kline_started_at"),
+        "quote_subscribed": quote_subscribed,
+        "quote_total": quote_total,
+        "kline_subscribed": kline_subscribed,
+        "kline_total": kline_total,
+        "near_expiry_months": _int_value(result.get("near_expiry_months")),
+        "near_expiry_quote_subscribed": near_expiry_quote_subscribed,
+        "near_expiry_quote_total": near_expiry_quote_total,
+        "near_expiry_kline_subscribed": near_expiry_kline_subscribed,
+        "near_expiry_kline_total": near_expiry_kline_total,
+        "near_expiry_subscribed": near_expiry_subscribed,
+        "near_expiry_total": near_expiry_total,
+        "subscribed_objects": subscribed_objects,
+        "total_objects": total_objects,
+        "completion_ratio": subscribed_objects / total_objects
+        if total_objects
+        else 0.0,
+    }
+
+
+def _latest_tqsdk_notify(rows: list[dict]) -> dict:
+    candidates = [row for row in rows if row.get("last_tqsdk_notify_at") is not None]
+    if not candidates:
+        return {}
+    latest = max(candidates, key=lambda row: str(row.get("last_tqsdk_notify_at")))
+    return {
+        "last_tqsdk_notify_at": latest.get("last_tqsdk_notify_at"),
+        "last_tqsdk_notify_code": latest.get("last_tqsdk_notify_code"),
+        "last_tqsdk_notify_level": latest.get("last_tqsdk_notify_level"),
+        "last_tqsdk_notify_content": latest.get("last_tqsdk_notify_content"),
+    }
+
+
+def _aggregate_tqsdk_connection_status(rows: list[dict]) -> str:
+    statuses = {str(row.get("tqsdk_connection_status") or "unknown") for row in rows}
+    if "disconnected" in statuses:
+        return "disconnected"
+    if "reconnecting" in statuses:
+        return "reconnecting"
+    if "connected" in statuses:
+        return "connected"
+    return "unknown"
+
+
+def _empty_quote_stream_progress(*, running: bool) -> dict:
+    return {
+        "status": "running" if running else "stopped",
+        "worker_reports": 0,
+        "quote_subscribed": 0,
+        "quote_total": 0,
+        "kline_subscribed": 0,
+        "kline_total": 0,
+        "near_expiry_months": 0,
+        "near_expiry_quote_subscribed": 0,
+        "near_expiry_quote_total": 0,
+        "near_expiry_kline_subscribed": 0,
+        "near_expiry_kline_total": 0,
+        "near_expiry_subscribed": 0,
+        "near_expiry_total": 0,
+        "subscribed_objects": 0,
+        "total_objects": 0,
+        "completion_ratio": 0.0,
+        "started_at": None,
+        "updated_at": None,
+        "last_wait_update_at": None,
+        "last_quote_write_at": None,
+        "last_tqsdk_notify_at": None,
+        "last_tqsdk_notify_code": None,
+        "last_tqsdk_notify_level": None,
+        "last_tqsdk_notify_content": None,
+        "tqsdk_connection_status": "unknown",
+        "last_tqsdk_disconnect_at": None,
+        "last_tqsdk_restore_at": None,
+        "tqsdk_notify_count": 0,
+        "cycle_count": 0,
+        "wait_update_count": 0,
+        "quotes_written": 0,
+        "changed_quotes_written": 0,
+        "elapsed_seconds": None,
+        "active_stage": "stopped" if not running else "initializing",
+        "stage_label": None,
+        "stage_average_seconds_per_object": None,
+        "stage_estimated_remaining_seconds": None,
+        "average_seconds_per_object": None,
+        "estimated_remaining_seconds": None,
+        "estimated_remaining_is_total": False,
+        "waiting_for_kline_eta": False,
+    }
+
+
+def _int_value(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _elapsed_seconds(started_at: str | None, updated_at: str | None) -> float | None:
+    started = _parse_datetime(started_at)
+    updated = _parse_datetime(updated_at)
+    if started is None or updated is None:
+        return None
+    return max(0.0, (updated - started).total_seconds())
+
+
+def _subscription_eta(
+    rows: list[dict],
+    *,
+    quote_subscribed: int,
+    quote_total: int,
+    kline_subscribed: int,
+    kline_total: int,
+) -> dict:
+    if quote_total > 0 and quote_subscribed < quote_total:
+        active_stage = "quote"
+        stage_label = "Quote"
+    elif kline_total > 0 and kline_subscribed < kline_total:
+        active_stage = "kline"
+        stage_label = "K线"
+    else:
+        return {
+            "active_stage": "running",
+            "stage_label": "实时运行",
+            "stage_average_seconds_per_object": None,
+            "stage_estimated_remaining_seconds": 0.0,
+            "estimated_remaining_seconds": 0.0,
+            "estimated_remaining_is_total": True,
+            "waiting_for_kline_eta": False,
+        }
+
+    quote_average = _stage_average_seconds(
+        rows,
+        subscribed_key="quote_subscribed",
+        started_keys=("quote_started_at", "started_at"),
+        finished_keys=("quote_finished_at", "updated_at"),
+    )
+    kline_average = _stage_average_seconds(
+        rows,
+        subscribed_key="kline_subscribed",
+        started_keys=("kline_started_at", "quote_finished_at", "started_at"),
+        finished_keys=("updated_at",),
+    )
+    quote_remaining = (
+        quote_average * max(0, quote_total - quote_subscribed)
+        if quote_average is not None
+        else None
+    )
+    kline_remaining = (
+        kline_average * max(0, kline_total - kline_subscribed)
+        if kline_average is not None
+        else None
+    )
+    if active_stage == "quote":
+        stage_average = quote_average
+        stage_remaining = quote_remaining
+        total_remaining = (
+            quote_remaining + kline_remaining
+            if quote_remaining is not None and kline_remaining is not None
+            else None
+        )
+        waiting_for_kline_eta = kline_total > 0 and kline_remaining is None
+    else:
+        stage_average = kline_average
+        stage_remaining = kline_remaining
+        total_remaining = kline_remaining
+        waiting_for_kline_eta = kline_total > 0 and kline_remaining is None
+
+    return {
+        "active_stage": active_stage,
+        "stage_label": stage_label,
+        "stage_average_seconds_per_object": stage_average,
+        "stage_estimated_remaining_seconds": stage_remaining,
+        "estimated_remaining_seconds": total_remaining,
+        "estimated_remaining_is_total": total_remaining is not None,
+        "waiting_for_kline_eta": waiting_for_kline_eta,
+    }
+
+
+def _stage_average_seconds(
+    rows: list[dict],
+    *,
+    subscribed_key: str,
+    started_keys: tuple[str, ...],
+    finished_keys: tuple[str, ...],
+) -> float | None:
+    elapsed_total = 0.0
+    subscribed_total = 0
+    for row in rows:
+        subscribed = _int_value(row.get(subscribed_key))
+        if subscribed <= 0:
+            continue
+        started_at = _first_text(row, started_keys)
+        finished_at = _first_text(row, finished_keys)
+        elapsed = _elapsed_seconds(started_at, finished_at)
+        if elapsed is None or elapsed <= 0:
+            continue
+        elapsed_total += elapsed
+        subscribed_total += subscribed
+    if subscribed_total <= 0:
+        return None
+    return elapsed_total / subscribed_total
+
+
+def _first_text(row: dict, keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _parse_datetime(value: str | None):
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _pid_is_quote_stream(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _windows_pid_command_line_contains(pid, "option_data_manager.cli.quote_stream")
+    command_line_path = Path(f"/proc/{pid}/cmdline")
+    try:
+        return "option_data_manager.cli.quote_stream" in command_line_path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except OSError:
+        return False
+
+
+def _windows_pid_command_line_contains(pid: int, needle: str) -> bool:
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return False
+    return needle in (completed.stdout or "")
 
 
 def create_app_from_database() -> FastAPI:
@@ -149,7 +647,7 @@ def create_app_from_database() -> FastAPI:
 
     database_path = os.environ.get("ODM_DATABASE_PATH", DEFAULT_DATABASE_PATH)
     Path(database_path).parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database_path, check_same_thread=False)
+    connection = sqlite3.connect(database_path, check_same_thread=False, timeout=30)
     return create_webui_app(connection, database_path=database_path)
 
 
@@ -224,7 +722,7 @@ INDEX_HTML = """<!doctype html>
 
           <section class="panel card collection-panel">
             <div class="panel-header">
-              <div><span class="panel-title">采集分片进度</span><span class="panel-note">手动刷新会按分片窗口推进，失败分片会保留以便后续重试。</span></div>
+              <div><span class="panel-title">采集与订阅进度</span><span class="panel-note">实时订阅负责盘中 Quote/K线；IV/Greeks 由独立指标 worker 按需刷新，批量补采负责分片落库。</span></div>
             </div>
             <div class="progress-cards" id="collection-progress"></div>
             <div class="collection-failures notice warn mt-3" id="collection-failures" hidden></div>
@@ -238,6 +736,7 @@ INDEX_HTML = """<!doctype html>
                 <button class="btn btn-outline-warning" type="button" id="show-issues">只看缺口</button>
               </div>
             </div>
+            <div class="exchange-tabs" id="exchange-tabs" role="tablist" aria-label="交易所筛选"></div>
             <div class="table-responsive table-shell">
               <table class="table table-sm align-middle summary-table underlying-table">
                 <colgroup><col class="underlying-exchange"><col class="underlying-product"><col class="underlying-symbol"><col class="underlying-expiry"><col class="underlying-count"><col class="underlying-count"><col class="underlying-count"><col class="underlying-ratio"><col class="underlying-ratio"><col class="underlying-kline"><col class="underlying-time"><col class="underlying-status"><col class="underlying-action"></colgroup>
@@ -333,11 +832,17 @@ INDEX_HTML = """<!doctype html>
             </div>
           </section>
           <section class="panel card">
-            <div class="panel-header"><span class="panel-title">实时 Quote Worker</span><span class="panel-note">quote-only 常驻订阅分片，负责让 T 型报价跟随实时行情更新。</span></div>
+            <div class="panel-header"><span class="panel-title">实时 Quote/指标 Worker</span><span class="panel-note">常驻 Quote 订阅分片负责行情刷新；指标 worker 异步刷新 IV/Greeks，不阻塞 Quote 采集。</span></div>
             <div class="settings-grid">
               <label>Worker 数<select class="form-select form-select-sm" id="setting-quote-workers"><option value="1">1 个 worker</option><option value="2">2 个 worker</option><option value="3">3 个 worker</option><option value="4">4 个 worker</option></select></label>
               <label>订阅分片大小<input class="form-control form-control-sm" id="setting-quote-shard-size" type="number" min="1" /></label>
+              <label>K线批量大小<input class="form-control form-control-sm" id="setting-kline-batch-size" type="number" min="1" /></label>
+              <label>K线窗口天数<input class="form-control form-control-sm" id="setting-kline-data-length" type="number" min="1" /></label>
+              <label>近月数量<input class="form-control form-control-sm" id="setting-near-expiry-months" type="number" min="1" /></label>
               <label>最大 symbols<input class="form-control form-control-sm" id="setting-quote-max-symbols" type="number" min="1" placeholder="留空为全量" /></label>
+              <label>指标最小间隔秒<input class="form-control form-control-sm" id="setting-metrics-min-interval" type="number" min="1" /></label>
+              <label>标的全链间隔秒<input class="form-control form-control-sm" id="setting-metrics-chain-interval" type="number" min="1" /></label>
+              <label class="checkline"><input class="form-check-input" id="setting-prioritize-near-expiry" type="checkbox" /> 近月优先订阅</label>
               <div class="settings-actions">
                 <button class="btn btn-sm btn-primary" type="button" id="start-quote-stream">启动实时订阅</button>
                 <button class="btn btn-sm btn-light" type="button" id="stop-quote-stream">停止实时订阅</button>
@@ -609,6 +1114,95 @@ body {
 .collection-failures[hidden] {
   display: none !important;
 }
+.stream-progress-card {
+  grid-column: 1 / -1;
+}
+.stream-stage {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 4px;
+  background: rgba(59,143,143,.10);
+  color: var(--aqua);
+  font-size: 11px;
+  font-weight: 900;
+}
+.stream-progress-line {
+  display: grid;
+  grid-template-columns: minmax(90px, max-content) 1fr minmax(82px, max-content);
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+}
+.stream-progress-track {
+  position: relative;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(234, 222, 214, .78);
+}
+.stream-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--aqua), #7da95e);
+  transition: width .25s ease;
+}
+.stream-progress-marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--brand);
+  transform: translateX(-50%);
+  z-index: 3;
+  pointer-events: none;
+}
+.stream-progress-meta {
+  color: var(--muted);
+  font: 800 11px/1.2 var(--mono);
+  text-align: right;
+}
+.stream-split-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px 14px;
+  margin-top: 12px;
+}
+.stream-split-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+@media (max-width: 720px) {
+  .stream-split-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.exchange-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 16px 12px;
+}
+.exchange-tab {
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: rgba(255, 253, 248, .92);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+.exchange-tab.active {
+  border-color: rgba(138, 66, 70, .34);
+  background: var(--brand);
+  color: #fff;
+}
 .table-shell, .quote-table-wrap {
   border: 1px solid var(--line);
   border-radius: 4px;
@@ -841,8 +1435,14 @@ const state = {
   overview: null,
   quote: null,
   selectedUnderlying: null,
+  selectedExchange: "ALL",
   showIssuesOnly: false,
   previousLatest: new Map(),
+  streamEta: {
+    lastSample: null,
+    estimate: null,
+  },
+  quoteStreamRefreshBusy: false,
 };
 
 const exchangeNames = {
@@ -1002,6 +1602,34 @@ function fmtDateTime(value) {
     .replace(/(Z|[+-]\d{2}:?\d{2})$/, "");
 }
 
+function fmtDuration(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return "--";
+  const total = Math.max(0, Math.round(Number(seconds)));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours > 0) return `${hours}小时${minutes}分${secs}秒`;
+  if (minutes > 0) return `${minutes}分${secs}秒`;
+  return `${secs}秒`;
+}
+
+function fmtAvgDuration(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return "--";
+  const value = Number(seconds);
+  if (value >= 10) return `${value.toFixed(1)}秒/对象`;
+  if (value >= 1) return `${value.toFixed(2)}秒/对象`;
+  return `${Math.round(value * 1000)}毫秒/对象`;
+}
+
+function fmtStreamStage(progress, running) {
+  if (!running) return "未运行";
+  if (!progress || progress.workerReports === 0) return "初始化";
+  if (progress.quoteTotal === 0 && progress.klineTotal === 0) return "初始化";
+  if (progress.quoteSubscribed < progress.quoteTotal) return "Quote订阅中";
+  if (progress.klineSubscribed < progress.klineTotal) return "K线订阅中";
+  return "实时运行中";
+}
+
 function symbolParts(symbol) {
   const [exchange = "--", instrument = symbol ?? "--"] = String(symbol ?? "--").split(".");
   const product = instrument.match(/^[A-Za-z]+/)?.[0] ?? "--";
@@ -1024,12 +1652,14 @@ async function init() {
     state.overview = window.__ODM_INITIAL_STATE__.overview;
     state.selectedUnderlying = window.__ODM_INITIAL_STATE__.selectedUnderlying;
     state.quote = window.__ODM_INITIAL_STATE__.quote;
+    observeStreamProgress(quoteStreamProgress(state.overview.quote_stream));
     renderOverview();
     renderSelectors();
     if (state.quote) renderQuote({ animate: false });
     await renderRuns();
   } else {
     state.overview = await fetchJson("/api/webui/overview?limit=500");
+    observeStreamProgress(quoteStreamProgress(state.overview.quote_stream));
     renderOverview();
     const first = state.overview.underlyings[0];
     if (first) {
@@ -1041,6 +1671,10 @@ async function init() {
   }
   setInterval(refreshCurrentQuote, 2500);
   setInterval(refreshOverview, 10000);
+  setInterval(refreshQuoteStreamStatusForOverview, 2500);
+  setInterval(() => {
+    if (state.overview) renderCollectionProgress();
+  }, 1000);
   setInterval(() => { if ($("#runs").classList.contains("active")) renderRuns(); }, 10000);
 }
 
@@ -1098,7 +1732,13 @@ async function loadSettings() {
     $("#setting-max-batches").value = settings.collection.max_batches ?? 100;
     $("#setting-quote-workers").value = settings.quote_stream?.workers ?? 1;
     $("#setting-quote-shard-size").value = settings.quote_stream?.quote_shard_size ?? 1000;
+    $("#setting-kline-batch-size").value = settings.quote_stream?.kline_batch_size ?? 1;
+    $("#setting-kline-data-length").value = settings.quote_stream?.kline_data_length ?? 3;
+    $("#setting-near-expiry-months").value = settings.quote_stream?.near_expiry_months ?? 2;
+    $("#setting-prioritize-near-expiry").checked = settings.quote_stream?.prioritize_near_expiry ?? true;
     $("#setting-quote-max-symbols").value = settings.quote_stream?.max_symbols ?? "";
+    $("#setting-metrics-min-interval").value = settings.metrics?.min_interval_seconds ?? 30;
+    $("#setting-metrics-chain-interval").value = settings.metrics?.underlying_chain_interval_seconds ?? 30;
     renderQuoteStreamStatus(settings.quote_stream?.status);
     setNotice(
       "#settings-message",
@@ -1141,7 +1781,13 @@ async function saveRuntimeSettings() {
     ["collection.max_batches", $("#setting-max-batches").value || "100"],
     ["quote_stream.workers", $("#setting-quote-workers").value || "1"],
     ["quote_stream.quote_shard_size", $("#setting-quote-shard-size").value || "1000"],
+    ["quote_stream.kline_batch_size", $("#setting-kline-batch-size").value || "1"],
+    ["quote_stream.kline_data_length", $("#setting-kline-data-length").value || "3"],
+    ["quote_stream.near_expiry_months", $("#setting-near-expiry-months").value || "2"],
+    ["quote_stream.prioritize_near_expiry", $("#setting-prioritize-near-expiry").checked ? "true" : "false"],
     ["quote_stream.max_symbols", $("#setting-quote-max-symbols").value || ""],
+    ["metrics.min_interval_seconds", $("#setting-metrics-min-interval").value || "30"],
+    ["metrics.underlying_chain_interval_seconds", $("#setting-metrics-chain-interval").value || "30"],
   ];
   for (const [key, value] of updates) {
     await fetchJsonWithBody(`/api/settings/${encodeURIComponent(key)}`, "PUT", { value });
@@ -1165,6 +1811,7 @@ async function startQuoteStream() {
     const payload = {
       workers: Number($("#setting-quote-workers").value || 1),
       quote_shard_size: Number($("#setting-quote-shard-size").value || 1000),
+      kline_batch_size: Number($("#setting-kline-batch-size").value || 1),
       discover: false,
     };
     const maxSymbols = $("#setting-quote-max-symbols").value;
@@ -1204,15 +1851,25 @@ function renderQuoteStreamStatus(status) {
     : `配置为启动 ${fmtNum(configuredWorkers)} 个独立 worker 进程`;
   const message = status.message ? `上次状态：${status.message}` : "等待启动。";
   const reports = status.report_dir ? `报告目录：${status.report_dir}` : "";
-  const tone = status.running ? "good" : status.status === "blocked" ? "bad" : "warn";
-  setNotice("#quote-stream-message", [stateText, workerText, message, reports].filter(Boolean).join(" · "), tone);
+  const health = status.health ? `网络健康：${status.health.label ?? status.health.status}` : "";
+  const notify = fmtTqsdkNotifyHint(status);
+  const tone = status.health?.tone === "bad" ? "bad" : status.running ? "good" : status.status === "blocked" ? "bad" : "warn";
+  setNotice("#quote-stream-message", [stateText, workerText, health, notify, message, reports].filter(Boolean).join(" · "), tone);
   setQuoteStreamControls({ running: Boolean(status.running) });
 }
 
 function setQuoteStreamControls({ running, busy = false }) {
   $("#start-quote-stream").disabled = Boolean(running || busy);
   $("#stop-quote-stream").disabled = Boolean(!running || busy);
-  ["setting-quote-workers", "setting-quote-shard-size", "setting-quote-max-symbols"].forEach((id) => {
+  [
+    "setting-quote-workers",
+    "setting-quote-shard-size",
+    "setting-kline-batch-size",
+    "setting-kline-data-length",
+    "setting-near-expiry-months",
+    "setting-quote-max-symbols",
+    "setting-prioritize-near-expiry",
+  ].forEach((id) => {
     $(`#${id}`).disabled = Boolean(running || busy);
   });
 }
@@ -1307,6 +1964,7 @@ function renderOverview() {
   updateHealthPill(summary);
   renderExchangeCards();
   renderCollectionProgress();
+  renderExchangeTabs();
   renderUnderlyingRows();
 }
 
@@ -1334,7 +1992,189 @@ function fmtCollectionProgress(progress) {
   return `${fmtNum(progress.success_batches)} / ${fmtNum(progress.active_batches)}`;
 }
 
+function fmtQuoteStreamValue(quoteStream) {
+  if (!quoteStream?.running) return "空闲";
+  const workers = Number(quoteStream.worker_count ?? 0);
+  return workers > 0 ? `${fmtNum(workers)} worker` : "运行中";
+}
+
+function fmtQuoteStreamHint(quoteStream) {
+  const message = localizeStatusMessage(quoteStream?.message);
+  const pids = quoteStream?.pids ?? [];
+  if (quoteStream?.running && pids.length) return `PID ${pids.join(", ")}`;
+  if (message) return message;
+  if (quoteStream?.finished_at) return fmtDateTime(quoteStream.finished_at);
+  return quoteStream?.running ? "实时订阅已启动" : "等待启动";
+}
+
+function fmtRealtimeHealthValue(quoteStream) {
+  const health = quoteStream?.health;
+  if (!health) return "--";
+  return health.label ?? health.status ?? "--";
+}
+
+function fmtRealtimeHealthHint(quoteStream) {
+  const health = quoteStream?.health;
+  if (!health) return "等待健康检测。";
+  const notify = fmtTqsdkNotifyHint(quoteStream);
+  return [health.message ?? "等待健康检测。", notify].filter(Boolean).join(" · ");
+}
+
+function realtimeHealthTone(quoteStream) {
+  const tone = quoteStream?.health?.tone;
+  if (tone === "bad" || tone === "warn" || tone === "good") return tone;
+  return "";
+}
+
+function fmtTqsdkNotifyHint(quoteStream) {
+  const progress = quoteStream?.progress ?? {};
+  const content = progress.last_tqsdk_notify_content;
+  if (!content) return "";
+  const status = progress.tqsdk_connection_status;
+  const statusLabels = {
+    connected: "连接正常",
+    reconnecting: "重连中",
+    disconnected: "已断开",
+  };
+  const label = statusLabels[status] ? `TQSDK ${statusLabels[status]}` : "TQSDK 通知";
+  return `${label}：${content}`;
+}
+
+function fmtBatchRefreshHint(refresh) {
+  const message = localizeStatusMessage(refresh?.message);
+  if (refresh?.running) return message ?? "批量补采正在按分片窗口推进。";
+  if (message?.includes("本地服务已重启")) {
+    return "本地服务重启后，上一次批量补采已停止；实时订阅单独运行。";
+  }
+  if (refresh?.finished_at) return `上次批量补采结束：${fmtDateTime(refresh.finished_at)}`;
+  return "当前没有批量补采任务；实时订阅看上方进度。";
+}
+
+function quoteStreamProgress(quoteStream) {
+  const progress = quoteStream?.progress ?? {};
+  const total = Number(progress.total_objects ?? 0);
+  const subscribed = Number(progress.subscribed_objects ?? 0);
+  const ratio = total > 0
+    ? Math.min(1, Math.max(0, Number(progress.completion_ratio ?? subscribed / total)))
+    : 0;
+  return {
+    total,
+    subscribed,
+    ratio,
+    quoteSubscribed: Number(progress.quote_subscribed ?? 0),
+    quoteTotal: Number(progress.quote_total ?? 0),
+    klineSubscribed: Number(progress.kline_subscribed ?? 0),
+    klineTotal: Number(progress.kline_total ?? 0),
+    nearExpiryMonths: Number(progress.near_expiry_months ?? 0),
+    nearExpirySubscribed: Number(progress.near_expiry_subscribed ?? 0),
+    nearExpiryTotal: Number(progress.near_expiry_total ?? 0),
+    nearExpiryQuoteSubscribed: Number(progress.near_expiry_quote_subscribed ?? 0),
+    nearExpiryQuoteTotal: Number(progress.near_expiry_quote_total ?? 0),
+    nearExpiryKlineSubscribed: Number(progress.near_expiry_kline_subscribed ?? 0),
+    nearExpiryKlineTotal: Number(progress.near_expiry_kline_total ?? 0),
+    workerReports: Number(progress.worker_reports ?? 0),
+    updatedAt: progress.updated_at,
+    elapsedSeconds: progress.elapsed_seconds,
+    averageSecondsPerObject: progress.average_seconds_per_object,
+    estimatedRemainingSeconds: progress.estimated_remaining_seconds,
+    activeStage: progress.active_stage,
+    stageLabel: progress.stage_label,
+    stageAverageSecondsPerObject: progress.stage_average_seconds_per_object,
+    stageEstimatedRemainingSeconds: progress.stage_estimated_remaining_seconds,
+    estimatedRemainingIsTotal: Boolean(progress.estimated_remaining_is_total),
+    waitingForKlineEta: Boolean(progress.waiting_for_kline_eta),
+    status: progress.status ?? (quoteStream?.running ? "running" : "stopped"),
+  };
+}
+
+function activeStreamStage(progress) {
+  if (!progress) return null;
+  if (progress.quoteTotal > 0 && progress.quoteSubscribed < progress.quoteTotal) return "quote";
+  if (progress.klineTotal > 0 && progress.klineSubscribed < progress.klineTotal) return "kline";
+  return null;
+}
+
+function streamStageCounters(progress, stage) {
+  if (stage === "quote") {
+    return { subscribed: progress.quoteSubscribed, total: progress.quoteTotal, label: "Quote" };
+  }
+  if (stage === "kline") {
+    return { subscribed: progress.klineSubscribed, total: progress.klineTotal, label: "K线对象" };
+  }
+  return { subscribed: progress.subscribed, total: progress.total, label: "订阅" };
+}
+
+function observeStreamProgress(progress) {
+  const stage = progress.activeStage || activeStreamStage(progress);
+  if (!stage || stage === "running" || stage === "stopped") {
+    state.streamEta.lastSample = null;
+    state.streamEta.estimate = null;
+    return;
+  }
+  state.streamEta.estimate = {
+    stage,
+    stageLabel: progress.stageLabel || streamStageCounters(progress, stage).label,
+    totalRemainingSeconds: progress.estimatedRemainingIsTotal ? progress.estimatedRemainingSeconds : null,
+    stageRemainingSeconds: progress.stageEstimatedRemainingSeconds,
+    stageAverageSecondsPerObject: progress.stageAverageSecondsPerObject,
+    waitingForKlineEta: progress.waitingForKlineEta,
+    estimatedAtMs: Date.now(),
+  };
+}
+
+function liveCountdown(value, estimatedAtMs) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return null;
+  const elapsedSeconds = (Date.now() - estimatedAtMs) / 1000;
+  return Math.max(0, Number(value) - elapsedSeconds);
+}
+
+function liveStreamEta() {
+  const estimate = state.streamEta.estimate;
+  if (!estimate) return null;
+  return liveCountdown(estimate.totalRemainingSeconds, estimate.estimatedAtMs);
+}
+
+function liveStageEta() {
+  const estimate = state.streamEta.estimate;
+  if (!estimate) return null;
+  return liveCountdown(estimate.stageRemainingSeconds, estimate.estimatedAtMs);
+}
+
+function streamEtaSummary(progress) {
+  const stage = progress.activeStage || activeStreamStage(progress);
+  if (!stage || stage === "running") return "订阅对象已建立，进入实时运行。";
+  const counters = streamStageCounters(progress, stage);
+  const estimate = state.streamEta.estimate?.stage === stage ? state.streamEta.estimate : null;
+  const totalRemaining = liveStreamEta();
+  const stageRemaining = liveStageEta();
+  if (!estimate) {
+    return `${counters.label}速度校准中`;
+  }
+  const speedText = estimate.stageAverageSecondsPerObject === null || estimate.stageAverageSecondsPerObject === undefined
+    ? `${counters.label}速度校准中`
+    : `${counters.label}平均 ${fmtAvgDuration(estimate.stageAverageSecondsPerObject)}`;
+  if (totalRemaining !== null) {
+    return `${speedText} · 总预计剩余 ${fmtDuration(totalRemaining)}`;
+  }
+  if (stageRemaining !== null && estimate.waitingForKlineEta) {
+    return `${speedText} · ${counters.label}剩余 ${fmtDuration(stageRemaining)} · 总剩余待K线速度校准`;
+  }
+  if (stageRemaining !== null) {
+    return `${speedText} · ${counters.label}剩余 ${fmtDuration(stageRemaining)}`;
+  }
+  return speedText;
+}
+
+function streamNearExpiryKlineMarker(progress) {
+  if (!progress || progress.klineTotal <= 0 || progress.nearExpiryKlineTotal <= 0) return "";
+  const markerRatio = Math.min(1, Math.max(0, progress.nearExpiryKlineTotal / progress.klineTotal));
+  const months = progress.nearExpiryMonths || 2;
+  const title = `近${months}月K线对象 ${fmtNum(progress.nearExpiryKlineSubscribed)} / ${fmtNum(progress.nearExpiryKlineTotal)}`;
+  return `<div class="stream-progress-marker" title="${escapeHtml(title)}" style="left: ${escapeHtml((markerRatio * 100).toFixed(2))}%"></div>`;
+}
+
 function renderCollectionProgress() {
+  const summary = state.overview.summary ?? {};
   const progress = state.overview.collection ?? {};
   const refresh = state.overview.refresh ?? {};
   const quoteStream = state.overview.quote_stream ?? {};
@@ -1342,26 +2182,71 @@ function renderCollectionProgress() {
   const pending = Number(progress.pending_batches ?? 0);
   const failed = Number(progress.failed_batches ?? 0);
   const complete = active > 0 && Number(progress.success_batches ?? 0) >= active;
+  const streamProgress = quoteStreamProgress(quoteStream);
+  const quoteRatio = streamProgress.quoteTotal > 0
+    ? Math.min(1, Math.max(0, streamProgress.quoteSubscribed / streamProgress.quoteTotal))
+    : 0;
+  const klineRatio = streamProgress.klineTotal > 0
+    ? Math.min(1, Math.max(0, streamProgress.klineSubscribed / streamProgress.klineTotal))
+    : 0;
+  const streamStage = fmtStreamStage(streamProgress, quoteStream.running);
   const cards = [
     ["总分片", fmtNum(active), `${fmtNum(progress.planned_underlyings ?? 0)} 标的`, ""],
     ["已完成", fmtNum(progress.success_batches ?? 0), fmtPct(progress.completion_ratio ?? 0), complete ? "good" : ""],
     ["待采集", fmtNum(pending), "等待窗口执行", pending > 0 ? "warn" : ""],
     ["失败待重试", fmtNum(failed), "不会丢失进度", failed > 0 ? "bad" : "good"],
     [
-      "后台任务",
-      refresh.running ? "运行中" : "空闲",
-      localizeStatusMessage(refresh.message) ?? (refresh.finished_at ? fmtDateTime(refresh.finished_at) : "等待触发"),
+      "批量补采",
+      refresh.running ? "运行中" : "未运行",
+      fmtBatchRefreshHint(refresh),
       refresh.running ? "warn" : "",
     ],
     [
       "实时 Quote",
-      quoteStream.running ? "运行中" : "空闲",
-      localizeStatusMessage(quoteStream.message) ?? (quoteStream.finished_at ? fmtDateTime(quoteStream.finished_at) : "等待启动"),
+      fmtQuoteStreamValue(quoteStream),
+      fmtQuoteStreamHint(quoteStream),
       quoteStream.running ? "warn" : "",
     ],
-    ["最近分片更新", fmtDateTime(progress.latest_batch_update), progress.latest_batch_update ? "进度已保存" : "暂无更新", ""],
+    [
+      "开盘网络",
+      fmtRealtimeHealthValue(quoteStream),
+      fmtRealtimeHealthHint(quoteStream),
+      realtimeHealthTone(quoteStream),
+    ],
+    ["最新数据写入", fmtDateTime(summary.latest_update), summary.latest_update ? "Quote/指标/K线最新落库" : "暂无写入", ""],
+    ["最近批量分片更新", fmtDateTime(progress.latest_batch_update), progress.latest_batch_update ? "仅批量采集进度" : "暂无更新", ""],
   ];
-  $("#collection-progress").innerHTML = cards.map(([label, value, hint, tone]) => `
+  const streamProgressHtml = `
+    <div class="progress-card stream-progress-card ${quoteStream.running ? "warn" : ""}">
+      <span>实时订阅对象进度</span>
+      <strong>${escapeHtml(streamStage)}</strong>
+      <div class="stream-split-grid">
+        <div>
+          <div class="stream-split-title"><span>Quote</span><span>${escapeHtml(fmtPct(quoteRatio))}</span></div>
+          <div class="stream-progress-line">
+            <small>${escapeHtml(fmtNum(streamProgress.quoteSubscribed))} / ${escapeHtml(fmtNum(streamProgress.quoteTotal))}</small>
+            <div class="stream-progress-track" aria-hidden="true">
+              <div class="stream-progress-fill" style="width: ${escapeHtml((quoteRatio * 100).toFixed(1))}%"></div>
+            </div>
+            <small class="stream-progress-meta">${escapeHtml(streamProgress.quoteSubscribed >= streamProgress.quoteTotal && streamProgress.quoteTotal > 0 ? "完成" : "订阅中")}</small>
+          </div>
+        </div>
+        <div>
+          <div class="stream-split-title"><span>K线对象</span><span>${escapeHtml(fmtPct(klineRatio))}</span></div>
+          <div class="stream-progress-line">
+            <small>${escapeHtml(fmtNum(streamProgress.klineSubscribed))} / ${escapeHtml(fmtNum(streamProgress.klineTotal))}</small>
+            <div class="stream-progress-track" aria-hidden="true">
+              <div class="stream-progress-fill" style="width: ${escapeHtml((klineRatio * 100).toFixed(1))}%"></div>
+              ${streamNearExpiryKlineMarker(streamProgress)}
+            </div>
+            <small class="stream-progress-meta">${escapeHtml(streamProgress.klineSubscribed >= streamProgress.klineTotal && streamProgress.klineTotal > 0 ? "完成" : "订阅中")}</small>
+          </div>
+        </div>
+      </div>
+      <small>${escapeHtml(fmtNum(streamProgress.workerReports))} worker报告 · 近${escapeHtml(fmtNum(streamProgress.nearExpiryMonths || 2))}月K线对象 ${escapeHtml(fmtNum(streamProgress.nearExpiryKlineSubscribed))}/${escapeHtml(fmtNum(streamProgress.nearExpiryKlineTotal))} · 近${escapeHtml(fmtNum(streamProgress.nearExpiryMonths || 2))}月Quote ${escapeHtml(fmtNum(streamProgress.nearExpiryQuoteSubscribed))}/${escapeHtml(fmtNum(streamProgress.nearExpiryQuoteTotal))} · 订阅总用时 ${escapeHtml(fmtDuration(streamProgress.elapsedSeconds))} · ${escapeHtml(streamEtaSummary(streamProgress))}</small>
+    </div>
+  `;
+  $("#collection-progress").innerHTML = streamProgressHtml + cards.map(([label, value, hint, tone]) => `
     <div class="progress-card ${escapeHtml(tone)}">
       <span>${escapeHtml(label)}</span>
       <strong>${escapeHtml(value)}</strong>
@@ -1376,8 +2261,40 @@ function renderCollectionProgress() {
     : "";
 }
 
+function renderExchangeTabs() {
+  const rows = state.overview?.underlyings ?? [];
+  const exchanges = unique(rows.map((row) => row.exchange_id));
+  if (!exchanges.includes(state.selectedExchange) && state.selectedExchange !== "ALL") {
+    state.selectedExchange = "ALL";
+  }
+  const tabs = [
+    { value: "ALL", label: "全部", count: rows.length },
+    ...exchanges.map((exchange) => ({
+      value: exchange,
+      label: exchangeNames[exchange] ?? exchange,
+      count: rows.filter((row) => row.exchange_id === exchange).length,
+    })),
+  ];
+  $("#exchange-tabs").innerHTML = tabs.map((tab) => `
+    <button class="exchange-tab ${tab.value === state.selectedExchange ? "active" : ""}" type="button" role="tab" data-exchange="${escapeHtml(tab.value)}">
+      ${escapeHtml(tab.label)} ${escapeHtml(fmtNum(tab.count))}
+    </button>
+  `).join("");
+  $$("#exchange-tabs .exchange-tab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      state.selectedExchange = tab.dataset.exchange ?? "ALL";
+      renderExchangeTabs();
+      renderUnderlyingRows();
+    });
+  });
+}
+
 function renderUnderlyingRows() {
-  const rows = state.overview.underlyings.filter((row) => !state.showIssuesOnly || row.status !== "正常");
+  const rows = state.overview.underlyings.filter((row) => {
+    const exchangeMatch = state.selectedExchange === "ALL" || row.exchange_id === state.selectedExchange;
+    const issueMatch = !state.showIssuesOnly || row.status !== "正常";
+    return exchangeMatch && issueMatch;
+  });
   $("#overview-empty").classList.toggle("d-none", rows.length !== 0);
   $("#underlying-rows").innerHTML = rows.map((row) => {
     const statusClass = row.status === "正常" ? "good" : row.status === "数据缺口" ? "warn" : "bad";
@@ -1482,14 +2399,14 @@ async function onSelectorChange(changedId) {
 
 async function loadQuote(underlying, options = {}) {
   state.selectedUnderlying = underlying;
-  state.quote = await fetchJson(`/api/webui/tquote?underlying=${encodeURIComponent(underlying)}`);
+  state.quote = await fetchJson(`/api/webui/tquote?selectors=false&underlying=${encodeURIComponent(underlying)}`);
   renderQuote(options);
 }
 
 async function refreshCurrentQuote() {
   if (!state.selectedUnderlying || !$("#quote").classList.contains("active")) return;
   try {
-    state.quote = await fetchJson(`/api/webui/tquote?underlying=${encodeURIComponent(state.selectedUnderlying)}`);
+    state.quote = await fetchJson(`/api/webui/tquote?selectors=false&underlying=${encodeURIComponent(state.selectedUnderlying)}`);
     renderQuote({ animate: true });
   } catch {
     // Keep the last rendered quote visible if the local API is temporarily unavailable.
@@ -1499,6 +2416,7 @@ async function refreshCurrentQuote() {
 async function refreshOverview() {
   try {
     state.overview = await fetchJson("/api/webui/overview?limit=500");
+    observeStreamProgress(quoteStreamProgress(state.overview.quote_stream));
     if (
       state.selectedUnderlying &&
       !state.overview.underlyings.some((row) => row.underlying_symbol === state.selectedUnderlying)
@@ -1512,6 +2430,24 @@ async function refreshOverview() {
     renderSelectors();
   } catch {
     // Keep the existing selector universe visible if the local API is temporarily unavailable.
+  }
+}
+
+async function refreshQuoteStreamStatusForOverview() {
+  if (!state.overview || state.quoteStreamRefreshBusy) return;
+  state.quoteStreamRefreshBusy = true;
+  try {
+    const status = await fetchJson("/api/quote-stream");
+    state.overview.quote_stream = status;
+    observeStreamProgress(quoteStreamProgress(status));
+    renderCollectionProgress();
+    if ($("#settings").classList.contains("active")) {
+      renderQuoteStreamStatus(status);
+    }
+  } catch {
+    // Keep the existing stream status visible until the next overview refresh.
+  } finally {
+    state.quoteStreamRefreshBusy = false;
   }
 }
 

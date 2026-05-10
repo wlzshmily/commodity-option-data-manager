@@ -28,9 +28,23 @@
   - Full Quote/K-line/metrics mode, 54 options, 3 cycles: 43.515 internal seconds, status `partial_source_unavailable`.
   - Quote-only mode, 54 options, 10 cycles: 43.723 internal seconds, status `success`.
   - Conclusion: long-lived quote subscriptions are suitable for realtime UI freshness; K-line and metrics refresh should be decoupled and lower frequency.
+- 2026-05-10 IV/K-line window diagnostic on WSL:
+  - Command: `odm-compare-iv-windows --symbols CZCE.AP610P6500,CZCE.AP610P6600,CZCE.AP610C6700,CZCE.AP610P6700,CZCE.AP610C6800,CZCE.AP610P6800 --windows 1,2,5,20 --wait-cycles 1`.
+  - Result: 6 options, 24 successful points, 0 empty/failed points, max absolute latest-IV difference versus 20-day baseline about `3.34e-12`.
+  - Cache-splice unit evidence: with existing 20-day option and underlying caches, `collect_persisted_option_chain` requests `data_length=3`, merges fresh rows with cached rows by `bar_datetime`, clips to the latest 20 rows, and passes a TQSDK-like multi-symbol DataFrame with `duration` to the IV calculator. With missing cache it requests `data_length=20`.
+  - Live cache-splice smoke: `CZCE.AP611C8400`/`CZCE.AP611` had 20 cached rows, the wrapped API observed `data_length=3`, and the collection finished success with 0 errors and finite IV.
+  - Conclusion: batch IV refresh can use 3-day incremental K-line fetch plus local 20-day cache splice when both option and underlying caches are complete; cache-missing contracts still fetch 20 days. Realtime subscription setup remains at 20 daily K-line bars by default.
+- 2026-05-10 realtime metrics worker:
+  - Quote stream marks dirty metrics tasks only after effective price changes: option price changes enqueue that option, while underlying future price changes enqueue the active option chain through an interval-limited chain marker.
+  - `odm-metrics-worker` processes the SQLite dirty queue in a separate process with default `metrics.min_interval_seconds=30`, so `query_option_greeks` and `OPTION_IMPV` never block Quote writes.
+  - Live API smoke started 1 quote worker and 1 metrics worker with `max_symbols=5`, then stopped both cleanly; service state showed `metrics_worker.running=false` and no persisted metrics worker PIDs after stop.
+- 2026-05-10 realtime Kline coverage correction:
+  - Quote-only realtime startup was rejected: daily K-lines can update during the trading session, so `/api/quote-stream/start` must subscribe Kline objects as well as Quote objects.
+  - The 3-day optimization reduces each Kline serial's history window but does not reduce required object count. API-started realtime workers pass configurable `--kline-data-length` (default 3) and no longer pass `--no-klines`.
+  - IV calculation remains protected by the metrics worker cache-splice path: fetch 3 fresh daily bars, merge with local 20-day cache, and fall back to 20-day fetch when cache is incomplete.
 - Implemented commands from the tuning results:
   - `odm-collect-parallel` for process-level full-market catch-up using disjoint underlying ranges and independent TQSDK API instances.
-  - `odm-quote-stream` for long-lived Quote-only subscription shards.
+  - `odm-quote-stream` for long-lived Quote and Kline subscription shards.
 - 2026-05-09 final local full-market catch-up acceptance:
   - Command: `odm-collect-parallel --workers 4 --max-batches-per-worker 60 --option-batch-size 40 --wait-cycles 1 --until-complete --max-waves 10`.
   - Evidence: ignored `docs/qa/live-evidence/final-parallel-catchup/summary.json`.

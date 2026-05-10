@@ -1,4 +1,4 @@
-"""CLI for long-lived quote-only TQSDK subscription shards."""
+"""CLI for long-lived quote and kline TQSDK subscription shards."""
 
 from __future__ import annotations
 
@@ -19,7 +19,12 @@ from option_data_manager.cli.collect_market import (
     _discover_and_persist_market,
     _resolve_credentials,
 )
-from option_data_manager.quote_streamer import DEFAULT_QUOTE_SHARD_SIZE, stream_quotes
+from option_data_manager.quote_streamer import (
+    DEFAULT_KLINE_BATCH_SIZE,
+    DEFAULT_KLINE_DATA_LENGTH,
+    DEFAULT_QUOTE_SHARD_SIZE,
+    stream_quotes,
+)
 from option_data_manager.tqsdk_connection import create_tqsdk_api_with_retries
 
 
@@ -63,12 +68,28 @@ def main(argv: list[str] | None = None) -> int:
                 worker_index=args.worker_index,
                 worker_count=args.worker_count,
                 quote_shard_size=args.quote_shard_size,
+                kline_batch_size=args.kline_batch_size,
+                kline_data_length=args.kline_data_length,
+                metrics_dirty_min_interval_seconds=(
+                    args.metrics_dirty_min_interval_seconds
+                ),
+                underlying_chain_dirty_interval_seconds=(
+                    args.underlying_chain_dirty_interval_seconds
+                ),
                 max_symbols=args.max_symbols,
                 cycles=args.cycles,
                 duration_seconds=args.duration_seconds,
                 wait_deadline_seconds=args.wait_deadline_seconds,
                 include_futures=not args.options_only,
                 include_options=not args.futures_only,
+                include_klines=args.include_klines,
+                prioritize_near_expiry=args.prioritize_near_expiry,
+                near_expiry_months=args.near_expiry_months,
+                progress_callback=_progress_writer(
+                    report_path,
+                    credential_source=credentials.source,
+                    database_path=database_path,
+                ),
                 stop_requested=_stop_file_requested(Path(args.stop_file))
                 if args.stop_file
                 else None,
@@ -122,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a quote-only long-lived TQSDK subscription worker."
+        description="Run a long-lived TQSDK Quote/Kline subscription worker."
     )
     parser.add_argument("--database", default=str(DEFAULT_DATABASE_PATH))
     parser.add_argument("--source-database", default=str(DEFAULT_SOURCE_DATABASE_PATH))
@@ -130,15 +151,30 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--worker-index", type=int, default=0)
     parser.add_argument("--worker-count", type=int, default=1)
     parser.add_argument("--quote-shard-size", type=int, default=DEFAULT_QUOTE_SHARD_SIZE)
+    parser.add_argument("--kline-batch-size", type=int, default=DEFAULT_KLINE_BATCH_SIZE)
+    parser.add_argument("--kline-data-length", type=int, default=DEFAULT_KLINE_DATA_LENGTH)
+    parser.add_argument("--metrics-dirty-min-interval-seconds", type=int, default=30)
+    parser.add_argument("--underlying-chain-dirty-interval-seconds", type=int, default=30)
     parser.add_argument("--max-symbols", type=int, default=None)
     parser.add_argument("--cycles", type=int, default=None)
     parser.add_argument("--duration-seconds", type=float, default=None)
     parser.add_argument("--wait-deadline-seconds", type=float, default=1.0)
     parser.add_argument("--stop-file", default=None)
     parser.add_argument("--no-discover", dest="discover", action="store_false")
+    parser.add_argument("--no-klines", dest="include_klines", action="store_false")
+    parser.add_argument(
+        "--no-prioritize-near-expiry",
+        dest="prioritize_near_expiry",
+        action="store_false",
+    )
+    parser.add_argument("--near-expiry-months", type=int, default=2)
     parser.add_argument("--futures-only", action="store_true")
     parser.add_argument("--options-only", action="store_true")
-    parser.set_defaults(discover=True)
+    parser.set_defaults(
+        discover=True,
+        include_klines=True,
+        prioritize_near_expiry=True,
+    )
     args = parser.parse_args(argv)
     if args.futures_only and args.options_only:
         parser.error("--futures-only and --options-only are mutually exclusive.")
@@ -149,8 +185,34 @@ def _stop_file_requested(path: Path):
     return path.exists
 
 
+def _progress_writer(
+    path: Path,
+    *,
+    credential_source: str,
+    database_path: Path,
+):
+    def write_progress(progress: dict[str, Any]) -> None:
+        _write_json(
+            path,
+            {
+                "status": progress.get("status", "subscribing"),
+                "progress": progress,
+                "credential_source": credential_source,
+                "database": str(database_path),
+                "secret_handling": "No credential value was written to this report.",
+            },
+        )
+
+    return write_progress
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temp_path.replace(path)
 
 
 if __name__ == "__main__":

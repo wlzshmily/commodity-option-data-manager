@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 import json
 import sqlite3
@@ -43,6 +43,7 @@ KLINE_20D_CURRENT_MIGRATION = Migration(
 
 KLINE_BASE_FIELDS = (
     "datetime",
+    "id",
     "open",
     "high",
     "low",
@@ -51,6 +52,17 @@ KLINE_BASE_FIELDS = (
     "open_oi",
     "close_oi",
     "symbol",
+    "duration",
+)
+
+KLINE_NUMERIC_FIELDS = (
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "open_oi",
+    "close_oi",
 )
 
 
@@ -165,6 +177,80 @@ class KlineRepository:
         return [KlineRecord(**dict(row)) for row in rows]
 
 
+def merge_kline_records(
+    existing: Iterable[KlineRecord],
+    fresh: Iterable[KlineRecord],
+    *,
+    limit: int = 20,
+) -> list[KlineRecord]:
+    """Merge cached and fresh rows by bar time, keeping the latest rows.
+
+    Fresh rows win when the same bar exists in both inputs. The returned rows
+    are sorted by bar time and clipped to the latest `limit` records.
+    """
+
+    if limit < 1:
+        raise ValueError("K-line merge limit must be positive.")
+    rows_by_datetime: dict[str, KlineRecord] = {}
+    for record in existing:
+        rows_by_datetime[record.bar_datetime] = record
+    for record in fresh:
+        rows_by_datetime[record.bar_datetime] = record
+    return [
+        rows_by_datetime[bar_datetime]
+        for bar_datetime in sorted(rows_by_datetime)[-limit:]
+    ]
+
+
+def records_to_multi_symbol_kline_frame(
+    symbols: Sequence[str],
+    records_by_symbol: Mapping[str, Sequence[KlineRecord]],
+) -> object:
+    """Build a TQSDK-like multi-symbol K-line DataFrame from normalized rows."""
+
+    cleaned_symbols = [symbol.strip() for symbol in symbols]
+    if not cleaned_symbols or any(not symbol for symbol in cleaned_symbols):
+        raise ValueError("K-line symbols must not be empty.")
+    records_by_datetime = {
+        symbol: {record.bar_datetime: record for record in records_by_symbol.get(symbol, ())}
+        for symbol in cleaned_symbols
+    }
+    common_datetimes: set[str] | None = None
+    for symbol in cleaned_symbols:
+        datetimes = set(records_by_datetime[symbol])
+        common_datetimes = datetimes if common_datetimes is None else common_datetimes & datetimes
+    ordered_datetimes = sorted(common_datetimes or set())
+    rows: list[dict[str, Any]] = []
+    for bar_datetime in ordered_datetimes:
+        row: dict[str, Any] = {"datetime": bar_datetime}
+        for index, symbol in enumerate(cleaned_symbols):
+            suffix = "" if index == 0 else str(index)
+            record = records_by_datetime[symbol][bar_datetime]
+            payload = _record_payload(record)
+            row["duration"] = payload.get("duration", 24 * 60 * 60)
+            if suffix:
+                row[_field_name("datetime", suffix)] = payload.get(
+                    "datetime",
+                    bar_datetime,
+                )
+            else:
+                row["datetime"] = payload.get("datetime", bar_datetime)
+            row[_field_name("symbol", suffix)] = symbol
+            row[_field_name("id", suffix)] = payload.get("id", float(len(rows)))
+            for field in KLINE_NUMERIC_FIELDS:
+                row[_field_name(field, suffix)] = payload.get(
+                    field,
+                    _record_numeric_value(record, field),
+                )
+        rows.append(row)
+
+    try:
+        import pandas as pd
+    except ImportError as exc:  # pragma: no cover - TQSDK runtime provides pandas.
+        raise RuntimeError("pandas is required to build spliced K-line frames.") from exc
+    return pd.DataFrame(rows)
+
+
 def normalize_kline_rows(
     symbol: str,
     raw_rows: Iterable[Mapping[str, Any]] | object,
@@ -274,6 +360,26 @@ def _rows_from_raw(raw_rows: Iterable[Mapping[str, Any]] | object) -> list[dict[
     return [dict(row) for row in raw_rows]  # type: ignore[arg-type]
 
 
+def _record_payload(record: KlineRecord) -> dict[str, Any]:
+    try:
+        payload = json.loads(record.raw_payload_json)
+    except json.JSONDecodeError:
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _record_numeric_value(record: KlineRecord, field: str) -> float | None:
+    return {
+        "open": record.open_price,
+        "high": record.high_price,
+        "low": record.low_price,
+        "close": record.close_price,
+        "volume": record.volume,
+        "open_oi": record.open_oi,
+        "close_oi": record.close_oi,
+    }[field]
+
+
 def _field_name(base_name: str, suffix: str) -> str:
     return f"{base_name}{suffix}" if suffix else base_name
 
@@ -282,7 +388,10 @@ def _raw_payload_for_suffix(row: Mapping[str, Any], suffix: str) -> dict[str, An
     return {
         field: _value_with_shared_datetime(row, field, suffix)
         for field in KLINE_BASE_FIELDS
-        if _field_name(field, suffix) in row or (suffix and field == "datetime" and field in row)
+        if (
+            _field_name(field, suffix) in row
+            or (suffix and field in {"datetime", "duration"} and field in row)
+        )
     }
 
 
@@ -294,6 +403,6 @@ def _value_with_shared_datetime(
     field_name = _field_name(base_name, suffix)
     if field_name in row:
         return row.get(field_name)
-    if suffix and base_name == "datetime":
+    if suffix and base_name in {"datetime", "duration"}:
         return row.get(base_name)
     return None

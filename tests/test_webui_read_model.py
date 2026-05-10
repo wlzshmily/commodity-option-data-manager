@@ -304,6 +304,100 @@ def test_expiry_days_are_exposed_for_overview_and_tquote() -> None:
     assert quote["selectors"][0]["days_to_expiry"] == row["days_to_expiry"]
 
 
+def test_expiry_days_fall_back_to_quote_payload() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    connection.executemany(
+        """
+        INSERT INTO instruments (
+            symbol,
+            exchange_id,
+            product_id,
+            instrument_id,
+            instrument_name,
+            ins_class,
+            underlying_symbol,
+            option_class,
+            strike_price,
+            expire_datetime,
+            last_exercise_datetime,
+            price_tick,
+            volume_multiple,
+            expired,
+            active,
+            inactive_reason,
+            last_seen_at,
+            raw_payload_json
+        )
+        VALUES (?, 'SHFE', 'zn', ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 1, NULL, '2026-05-08T00:00:00+00:00', '{}')
+        """,
+        [
+            ("SHFE.zn2606", "zn2606", "FUTURE", None, None, None),
+            (
+                "SHFE.zn2606C24000",
+                "zn2606C24000",
+                "OPTION",
+                "SHFE.zn2606",
+                "CALL",
+                24000,
+            ),
+            (
+                "SHFE.zn2606P24000",
+                "zn2606P24000",
+                "OPTION",
+                "SHFE.zn2606",
+                "PUT",
+                24000,
+            ),
+        ],
+    )
+    connection.executemany(
+        """
+        INSERT INTO quote_current (
+            symbol,
+            source_datetime,
+            received_at,
+            last_price,
+            raw_payload_json
+        )
+        VALUES (?, '2026-05-09 00:59:59.000001', '2026-05-09T12:36:13+00:00', ?, ?)
+        """,
+        [
+            (
+                "SHFE.zn2606",
+                24030,
+                '{"expire_datetime":1781506800.0,"expire_rest_days":37}',
+            ),
+            (
+                "SHFE.zn2606C24000",
+                62,
+                '{"expire_datetime":1779692400.0,"last_exercise_datetime":1779692400.0,"expire_rest_days":16}',
+            ),
+            (
+                "SHFE.zn2606P24000",
+                235,
+                '{"expire_datetime":1779692400.0,"last_exercise_datetime":1779692400.0,"expire_rest_days":16}',
+            ),
+        ],
+    )
+
+    overview_row = read_model.overview()["underlyings"][0]
+    quote = read_model.tquote(
+        underlying_symbol="SHFE.zn2606",
+        include_selectors=False,
+    )
+
+    assert overview_row["expire_datetime"] == "2026-05-25"
+    assert overview_row["days_to_expiry"] == (date(2026, 5, 25) - date.today()).days
+    assert quote["selectors"] == []
+    assert quote["underlying"]["expire_datetime"] == "2026-05-25"
+    assert quote["underlying"]["days_to_expiry"] == overview_row["days_to_expiry"]
+    assert quote["strikes"][0]["CALL"]["expire_datetime"] == "2026-05-25"
+    assert quote["strikes"][0]["CALL"]["days_to_expire_datetime"] == overview_row[
+        "days_to_expiry"
+    ]
+
+
 def test_runs_include_service_logs() -> None:
     connection = sqlite3.connect(":memory:")
     read_model = WebuiReadModel(connection)
