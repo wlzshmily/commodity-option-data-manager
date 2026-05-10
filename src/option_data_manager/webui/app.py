@@ -1805,7 +1805,7 @@ async function triggerRefresh() {
 
 async function startQuoteStream() {
   setQuoteStreamControls({ running: true, busy: true });
-  setNotice("#quote-stream-message", "正在启动实时订阅 worker。", "warn");
+  setNotice("#quote-stream-message", "正在检查合约列表并启动实时订阅 worker。", "warn");
   try {
     await saveRuntimeSettings();
     const payload = {

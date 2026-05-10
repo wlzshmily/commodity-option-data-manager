@@ -62,3 +62,9 @@
   - `uv run pytest -s tests/test_quote_streamer.py tests/test_realtime_health.py tests/test_api_app.py -q`: 27 passed.
   - `uv run python -m compileall -q src tests`: passed.
   - `uv run pytest -s -q`: 75 passed.
+- 2026-05-11 WSL realtime startup bootstrap:
+  - Empty/new databases no longer let realtime workers exit with no symbols. `/api/quote-stream/start` runs one parent-process TQSDK contract discovery pass when active options are zero, persists instruments, then starts workers with `--no-discover`.
+  - Startup returns a blocked status with an explicit message when discovery fails or still produces zero active options.
+  - `uv run pytest -s tests/test_api_app.py tests/test_quote_streamer.py tests/test_realtime_health.py -q`: 28 passed.
+  - `uv run python -m compileall -q src tests`: passed.
+  - `uv run pytest -s -q`: 76 passed.

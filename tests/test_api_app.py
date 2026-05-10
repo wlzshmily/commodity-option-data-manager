@@ -4,6 +4,10 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from option_data_manager.api.app import API_AUTH_REQUIRED_KEY, create_app
+from option_data_manager.instruments import (
+    InstrumentRepository,
+    normalize_option_chain_discovery,
+)
 from option_data_manager.settings import PlainTextProtector, SettingsRepository
 
 
@@ -109,6 +113,14 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
 
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C100",),
+            put_symbols=("DCE.a2601P100",),
+            last_seen_at="2026-05-11T00:00:00+08:00",
+        )
+    )
     client = TestClient(app)
     client.put(
         "/api/settings/tqsdk-credentials",
@@ -156,6 +168,74 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
     assert stopped.status_code == 200
     assert stopped.json()["running"] is False
     assert all(process.terminated for process in created)
+
+
+def test_quote_stream_start_initializes_empty_contract_universe(monkeypatch) -> None:
+    class FakeProcess:
+        _next_pid = 32100
+
+        def __init__(self, command, **kwargs) -> None:
+            self.command = command
+            self.kwargs = kwargs
+            self.pid = FakeProcess._next_pid
+            FakeProcess._next_pid += 1
+            created.append(self)
+
+        def poll(self):
+            return None
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    created = []
+    fake_api = FakeApi()
+    monkeypatch.setattr("option_data_manager.api.app.subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(
+        "option_data_manager.api.app.create_tqsdk_api_with_retries",
+        lambda account, password: fake_api,
+    )
+
+    def fake_discover(api, connection):
+        assert api is fake_api
+        InstrumentRepository(connection).upsert_instruments(
+            normalize_option_chain_discovery(
+                underlying_symbol="DCE.a2601",
+                call_symbols=("DCE.a2601C100",),
+                put_symbols=("DCE.a2601P100",),
+                last_seen_at="2026-05-11T00:00:00+08:00",
+            )
+        )
+        return None
+
+    monkeypatch.setattr(
+        "option_data_manager.api.app._discover_and_persist_market",
+        fake_discover,
+    )
+
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    client = TestClient(app)
+    client.put(
+        "/api/settings/tqsdk-credentials",
+        json={"account": "demo", "password": "super-secret"},
+    )
+
+    response = client.post("/api/quote-stream/start", json={"workers": 1})
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["running"] is True
+    assert payload["message"] == "已初始化合约列表并启动实时订阅 worker。"
+    assert fake_api.closed is True
+    assert len(created) == 2
+    assert "--no-discover" in created[0].command
+    assert connection.execute(
+        "SELECT COUNT(*) FROM instruments WHERE option_class IN ('CALL', 'PUT')"
+    ).fetchone()[0] == 2
 
 
 def test_quote_stream_status_aggregates_runtime_subscription_progress(

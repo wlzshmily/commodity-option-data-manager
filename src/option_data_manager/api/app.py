@@ -18,6 +18,7 @@ from pydantic import BaseModel
 import uvicorn
 
 from option_data_manager.acquisition import AcquisitionRepository
+from option_data_manager.cli.collect_market import _discover_and_persist_market
 from option_data_manager.api_keys import ApiKeyRecord, ApiKeyRepository
 from option_data_manager.collection_state import CollectionStateRepository
 from option_data_manager.klines import KlineRepository
@@ -456,6 +457,27 @@ def create_app(
                     status_code=400,
                     detail="max_symbols must be positive when provided.",
                 )
+            universe_ready, universe_message, discovery_ran = (
+                _ensure_quote_stream_universe(
+                    connection,
+                    account=account,
+                    password=password,
+                    force_discovery=request.discover,
+                    service_state=service_state,
+                    service_logs=service_logs,
+                )
+            )
+            if not universe_ready:
+                return QuoteStreamResponse(
+                    status="blocked",
+                    running=False,
+                    message=universe_message,
+                    worker_count=0,
+                    pids=[],
+                    report_dir=None,
+                    started_at=None,
+                    finished_at=None,
+                )
             report_dir = Path("docs/qa/live-evidence/quote-stream-runtime")
             report_dir.mkdir(parents=True, exist_ok=True)
             processes = _start_quote_stream_processes(
@@ -468,7 +490,7 @@ def create_app(
                 prioritize_near_expiry=prioritize_near_expiry,
                 near_expiry_months=near_expiry_months,
                 max_symbols=max_symbols,
-                discover=request.discover,
+                discover=False,
                 metrics_dirty_min_interval_seconds=metrics_min_interval_seconds,
                 underlying_chain_dirty_interval_seconds=underlying_chain_interval_seconds,
             )
@@ -489,7 +511,12 @@ def create_app(
                 json.dumps([int(process.pid) for process in processes]),
             )
             service_state.set_value("quote_stream.report_dir", str(report_dir))
-            service_state.set_value("quote_stream.message", "实时订阅 worker 已启动。")
+            start_message = (
+                "已初始化合约列表并启动实时订阅 worker。"
+                if discovery_ran
+                else "实时订阅 worker 已启动。"
+            )
+            service_state.set_value("quote_stream.message", start_message)
             service_state.set_value("metrics_worker.running", "true")
             service_state.set_value("metrics_worker.started_at", started_at)
             service_state.set_value("metrics_worker.finished_at", None)
@@ -502,7 +529,7 @@ def create_app(
             service_logs.append(
                 level="info",
                 category="quote_stream",
-                message="实时订阅 worker 已启动。",
+                message=start_message,
                 context={
                     "worker_count": worker_count,
                     "quote_shard_size": quote_shard_size,
@@ -510,7 +537,8 @@ def create_app(
                     "prioritize_near_expiry": prioritize_near_expiry,
                     "near_expiry_months": near_expiry_months,
                     "max_symbols_configured": max_symbols is not None,
-                    "discover": request.discover,
+                    "discover_requested": request.discover,
+                    "discovery_ran": discovery_ran,
                     "report_dir": str(report_dir),
                     "metrics_min_interval_seconds": metrics_min_interval_seconds,
                     "underlying_chain_interval_seconds": underlying_chain_interval_seconds,
@@ -1026,6 +1054,96 @@ def _collection_args(
         "--max-batches",
         settings.get_value("collection.max_batches") or DEFAULT_BACKGROUND_MAX_BATCHES,
     ]
+
+
+def _ensure_quote_stream_universe(
+    connection: sqlite3.Connection,
+    *,
+    account: str,
+    password: str,
+    force_discovery: bool,
+    service_state: ServiceStateRepository,
+    service_logs: ServiceLogRepository,
+) -> tuple[bool, str, bool]:
+    """Ensure realtime subscriptions have an active contract universe."""
+
+    if not force_discovery and _active_option_count(connection) > 0:
+        return (True, "已有可订阅合约。", False)
+    reason = "手动刷新合约列表" if force_discovery else "首次启动前初始化合约列表"
+    service_state.set_value("quote_stream.message", f"实时订阅启动前正在{reason}。")
+    service_logs.append(
+        level="info",
+        category="quote_stream",
+        message="实时订阅启动前初始化合约列表。",
+        context={"force_discovery": force_discovery},
+    )
+    api = None
+    try:
+        api = create_tqsdk_api_with_retries(account, password)
+        discovery = _discover_and_persist_market(api, connection)
+    except Exception as exc:
+        message = f"实时订阅启动前合约初始化失败：{type(exc).__name__}: {exc}"
+        service_state.set_value("quote_stream.message", message)
+        service_logs.append(
+            level="error",
+            category="quote_stream",
+            message="实时订阅启动前合约初始化失败。",
+            context={"error_type": type(exc).__name__},
+        )
+        return (False, message, True)
+    finally:
+        if api is not None:
+            close = getattr(api, "close", None)
+            if callable(close):
+                close()
+    active_options = _active_option_count(connection)
+    if active_options < 1:
+        message = "实时订阅启动前未发现可订阅期权合约，请检查 TQSDK 合约查询权限或交易所数据。"
+        service_state.set_value("quote_stream.message", message)
+        service_logs.append(
+            level="warning",
+            category="quote_stream",
+            message="实时订阅启动前未发现可订阅期权合约。",
+            context={
+                "discovery_returned": discovery is not None,
+                "option_symbol_count": getattr(discovery, "option_symbol_count", 0)
+                if discovery is not None
+                else 0,
+            },
+        )
+        return (False, message, True)
+    service_logs.append(
+        level="info",
+        category="quote_stream",
+        message="实时订阅启动前合约列表初始化完成。",
+        context={
+            "active_options": active_options,
+            "discovered_options": getattr(discovery, "option_symbol_count", 0)
+            if discovery is not None
+            else None,
+            "discovered_underlyings": getattr(discovery, "underlying_count", 0)
+            if discovery is not None
+            else None,
+        },
+    )
+    return (True, f"已初始化 {active_options} 个可订阅期权合约。", True)
+
+
+def _active_option_count(connection: sqlite3.Connection) -> int:
+    try:
+        row = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM instruments
+            WHERE active = 1
+              AND option_class IN ('CALL', 'PUT')
+            """
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    if row is None:
+        return 0
+    return int(row[0])
 
 
 def _start_quote_stream_processes(
