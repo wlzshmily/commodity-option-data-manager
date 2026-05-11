@@ -1,4 +1,4 @@
 # Debugging Lessons
 
 - 2026-05-08: Source files were originally under `src/` while imports expected `option_data_manager`; standard package structure was required before API/WebUI could run.
-
+- 2026-05-11: Public server realtime Quote worker can exit if TQSDK `get_quote_list` times out on a large exchange/product batch. Treat batch Quote subscription like Kline batch subscription: fall back to single-symbol `get_quote`, skip only symbols that still fail, and keep the long-lived worker alive. For small test servers, keep `quote_stream.workers=1`, `quote_stream.quote_shard_size` around 50, and `quote_stream.kline_batch_size=1` until live evidence supports higher values.

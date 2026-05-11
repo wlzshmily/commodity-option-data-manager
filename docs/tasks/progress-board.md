@@ -10,6 +10,7 @@
 
 ## Done
 
+- Hardened realtime Quote subscription startup so TQSDK batch Quote timeouts fall back to single-symbol subscription and do not terminate the whole worker; public server hotpatch smoke passed with 20 symbols.
 - Hardened realtime status and stop endpoints so transient SQLite service-state write locks do not surface as 500 responses; remote start/stop smoke now stops quote and metrics workers cleanly.
 - Documented Linux server deployment with GitHub commit releases, shared runtime data, systemd service, verification, public test exposure, upgrade, and rollback steps.
 - Fixed T型报价 exchange/product/month selector switching and displayed remaining expiry days in overview/T型报价.

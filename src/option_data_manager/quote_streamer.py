@@ -234,7 +234,9 @@ def stream_quotes(
         batch = symbols[index : index + quote_shard_size]
         if not batch:
             continue
-        quote_refs.update(zip(batch, _quote_list(api, batch), strict=True))
+        refs, batch_error_count = _subscribe_quote_ref_batch(api, batch)
+        quote_refs.update(refs)
+        error_count += batch_error_count
         _emit_progress(
             progress_callback,
             status="quote_subscribing",
@@ -390,6 +392,7 @@ def stream_quotes(
             reconcile_removed_quote_count += reconcile["removed_quote_count"]
             reconcile_added_kline_count += reconcile["added_kline_count"]
             reconcile_removed_kline_count += reconcile["removed_kline_count"]
+            error_count += reconcile["error_count"]
             if (
                 reconcile["added_quote_count"]
                 or reconcile["removed_quote_count"]
@@ -765,8 +768,13 @@ def _reconcile_subscriptions(
             kline_refs.pop(symbol, None)
             removed_kline_count += 1
     added_quote_symbols = [symbol for symbol in symbols if symbol not in quote_refs]
+    added_quote_count = 0
+    quote_error_count = 0
     for batch in _batches(added_quote_symbols, quote_shard_size):
-        quote_refs.update(zip(batch, _quote_list(api, batch), strict=True))
+        refs, batch_error_count = _subscribe_quote_ref_batch(api, batch)
+        quote_refs.update(refs)
+        added_quote_count += len(refs)
+        quote_error_count += batch_error_count
     added_kline_count = 0
     for batch in _batches(
         [symbol for symbol in kline_symbols if symbol not in kline_refs],
@@ -810,10 +818,11 @@ def _reconcile_subscriptions(
         "kline_symbols": kline_symbols,
         "near_quote_total": near_quote_total,
         "near_kline_total": near_kline_total,
-        "added_quote_count": len(added_quote_symbols),
+        "added_quote_count": added_quote_count,
         "removed_quote_count": removed_quote_count,
         "added_kline_count": added_kline_count,
         "removed_kline_count": removed_kline_count,
+        "error_count": quote_error_count,
     }
 
 
@@ -1003,6 +1012,24 @@ def _quote_list(api: Any, symbols: list[str]) -> list[Any]:
         except (AttributeError, TypeError):
             pass
     return [api.get_quote(symbol) for symbol in symbols]
+
+
+def _subscribe_quote_ref_batch(api: Any, symbols: list[str]) -> tuple[dict[str, Any], int]:
+    """Subscribe one Quote batch, falling back to single symbols on source timeouts."""
+
+    if not symbols:
+        return ({}, 0)
+    try:
+        return (dict(zip(symbols, _quote_list(api, symbols), strict=True)), 0)
+    except Exception:
+        refs: dict[str, Any] = {}
+        error_count = 0
+        for symbol in symbols:
+            try:
+                refs[symbol] = api.get_quote(symbol)
+            except Exception:
+                error_count += 1
+        return (refs, error_count)
 
 
 def _is_changing(api: Any, quote_ref: Any) -> bool:

@@ -285,6 +285,63 @@ def test_stream_quotes_falls_back_when_kline_batch_subscription_fails() -> None:
     ]
 
 
+def test_stream_quotes_falls_back_when_quote_batch_subscription_times_out() -> None:
+    connection = sqlite3.connect(":memory:")
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C100",),
+            put_symbols=("DCE.a2601P100",),
+            last_seen_at="2026-05-08T00:00:00+00:00",
+        )
+    )
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.single_quote_symbols: list[str] = []
+
+        def get_quote_list(self, symbols: list[str]) -> list[dict[str, object]]:
+            raise TimeoutError("batch quote timeout")
+
+        def get_quote(self, symbol: str) -> dict[str, object]:
+            self.single_quote_symbols.append(symbol)
+            if symbol == "DCE.a2601P100":
+                raise TimeoutError("single quote timeout")
+            return {"datetime": "2026-05-09T00:00:00+00:00"}
+
+        def wait_update(self, *, deadline: float) -> bool:
+            return False
+
+        def is_changing(self, quote: object, fields: object) -> bool:
+            return False
+
+        def get_kline_serial(
+            self,
+            symbol: object,
+            *,
+            duration_seconds: int,
+            data_length: int,
+        ) -> list[dict[str, object]]:
+            return []
+
+    api = FakeApi()
+    result = stream_quotes(
+        api,
+        connection,
+        cycles=1,
+        wait_deadline_seconds=1,
+    )
+
+    assert result.subscribed_quote_count == 2
+    assert result.quotes_written == 2
+    assert result.error_count == 1
+    assert api.single_quote_symbols == [
+        "DCE.a2601",
+        "DCE.a2601C100",
+        "DCE.a2601P100",
+    ]
+
+
 def test_stream_quotes_can_batch_kline_subscriptions_when_requested() -> None:
     connection = sqlite3.connect(":memory:")
     InstrumentRepository(connection).upsert_instruments(
