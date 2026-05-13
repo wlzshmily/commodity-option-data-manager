@@ -87,6 +87,84 @@ QUOTE_SOURCE_FIELDS = (
 )
 
 
+QUOTE_CURRENT_UPSERT_SQL = """
+    INSERT INTO quote_current (
+        symbol,
+        source_datetime,
+        received_at,
+        last_price,
+        ask_price1,
+        bid_price1,
+        ask_volume1,
+        bid_volume1,
+        volume,
+        open_interest,
+        open_price,
+        high_price,
+        low_price,
+        close_price,
+        average_price,
+        price_tick,
+        volume_multiple,
+        raw_payload_json
+    )
+    VALUES (
+        :symbol,
+        :source_datetime,
+        :received_at,
+        :last_price,
+        :ask_price1,
+        :bid_price1,
+        :ask_volume1,
+        :bid_volume1,
+        :volume,
+        :open_interest,
+        :open_price,
+        :high_price,
+        :low_price,
+        :close_price,
+        :average_price,
+        :price_tick,
+        :volume_multiple,
+        :raw_payload_json
+    )
+    ON CONFLICT(symbol) DO UPDATE SET
+        source_datetime = CASE
+            WHEN
+                excluded.last_price IS NOT NULL
+                OR excluded.ask_price1 IS NOT NULL
+                OR excluded.bid_price1 IS NOT NULL
+                OR excluded.ask_volume1 IS NOT NULL
+                OR excluded.bid_volume1 IS NOT NULL
+                OR excluded.volume IS NOT NULL
+                OR excluded.open_interest IS NOT NULL
+                OR excluded.open_price IS NOT NULL
+                OR excluded.high_price IS NOT NULL
+                OR excluded.low_price IS NOT NULL
+                OR excluded.close_price IS NOT NULL
+                OR excluded.average_price IS NOT NULL
+            THEN COALESCE(excluded.source_datetime, quote_current.source_datetime)
+            ELSE quote_current.source_datetime
+        END,
+        received_at = excluded.received_at,
+        last_price = COALESCE(excluded.last_price, quote_current.last_price),
+        ask_price1 = COALESCE(excluded.ask_price1, quote_current.ask_price1),
+        bid_price1 = COALESCE(excluded.bid_price1, quote_current.bid_price1),
+        ask_volume1 = COALESCE(excluded.ask_volume1, quote_current.ask_volume1),
+        bid_volume1 = COALESCE(excluded.bid_volume1, quote_current.bid_volume1),
+        volume = COALESCE(excluded.volume, quote_current.volume),
+        open_interest = COALESCE(excluded.open_interest, quote_current.open_interest),
+        open_price = COALESCE(excluded.open_price, quote_current.open_price),
+        high_price = COALESCE(excluded.high_price, quote_current.high_price),
+        low_price = COALESCE(excluded.low_price, quote_current.low_price),
+        close_price = COALESCE(excluded.close_price, quote_current.close_price),
+        average_price = COALESCE(excluded.average_price, quote_current.average_price),
+        price_tick = COALESCE(excluded.price_tick, quote_current.price_tick),
+        volume_multiple = COALESCE(excluded.volume_multiple, quote_current.volume_multiple),
+        raw_payload_json = excluded.raw_payload_json
+"""
+
+
 @dataclass(frozen=True)
 class QuoteRecord:
     """Normalized current Quote data ready for SQLite storage."""
@@ -125,84 +203,16 @@ class QuoteRepository:
     def upsert_quote(self, record: QuoteRecord) -> None:
         """Insert or replace the current Quote slice for one symbol."""
 
-        self._connection.execute(
-            """
-            INSERT INTO quote_current (
-                symbol,
-                source_datetime,
-                received_at,
-                last_price,
-                ask_price1,
-                bid_price1,
-                ask_volume1,
-                bid_volume1,
-                volume,
-                open_interest,
-                open_price,
-                high_price,
-                low_price,
-                close_price,
-                average_price,
-                price_tick,
-                volume_multiple,
-                raw_payload_json
-            )
-            VALUES (
-                :symbol,
-                :source_datetime,
-                :received_at,
-                :last_price,
-                :ask_price1,
-                :bid_price1,
-                :ask_volume1,
-                :bid_volume1,
-                :volume,
-                :open_interest,
-                :open_price,
-                :high_price,
-                :low_price,
-                :close_price,
-                :average_price,
-                :price_tick,
-                :volume_multiple,
-                :raw_payload_json
-            )
-            ON CONFLICT(symbol) DO UPDATE SET
-                source_datetime = CASE
-                    WHEN
-                        excluded.last_price IS NOT NULL
-                        OR excluded.ask_price1 IS NOT NULL
-                        OR excluded.bid_price1 IS NOT NULL
-                        OR excluded.ask_volume1 IS NOT NULL
-                        OR excluded.bid_volume1 IS NOT NULL
-                        OR excluded.volume IS NOT NULL
-                        OR excluded.open_interest IS NOT NULL
-                        OR excluded.open_price IS NOT NULL
-                        OR excluded.high_price IS NOT NULL
-                        OR excluded.low_price IS NOT NULL
-                        OR excluded.close_price IS NOT NULL
-                        OR excluded.average_price IS NOT NULL
-                    THEN COALESCE(excluded.source_datetime, quote_current.source_datetime)
-                    ELSE quote_current.source_datetime
-                END,
-                received_at = excluded.received_at,
-                last_price = COALESCE(excluded.last_price, quote_current.last_price),
-                ask_price1 = COALESCE(excluded.ask_price1, quote_current.ask_price1),
-                bid_price1 = COALESCE(excluded.bid_price1, quote_current.bid_price1),
-                ask_volume1 = COALESCE(excluded.ask_volume1, quote_current.ask_volume1),
-                bid_volume1 = COALESCE(excluded.bid_volume1, quote_current.bid_volume1),
-                volume = COALESCE(excluded.volume, quote_current.volume),
-                open_interest = COALESCE(excluded.open_interest, quote_current.open_interest),
-                open_price = COALESCE(excluded.open_price, quote_current.open_price),
-                high_price = COALESCE(excluded.high_price, quote_current.high_price),
-                low_price = COALESCE(excluded.low_price, quote_current.low_price),
-                close_price = COALESCE(excluded.close_price, quote_current.close_price),
-                average_price = COALESCE(excluded.average_price, quote_current.average_price),
-                price_tick = COALESCE(excluded.price_tick, quote_current.price_tick),
-                volume_multiple = COALESCE(excluded.volume_multiple, quote_current.volume_multiple),
-                raw_payload_json = excluded.raw_payload_json
-            """,
-            asdict(record),
+        self.upsert_quotes([record])
+
+    def upsert_quotes(self, records: list[QuoteRecord]) -> None:
+        """Insert or replace current Quote slices in one SQLite transaction."""
+
+        if not records:
+            return
+        self._connection.executemany(
+            QUOTE_CURRENT_UPSERT_SQL,
+            [asdict(record) for record in records],
         )
         self._connection.commit()
 

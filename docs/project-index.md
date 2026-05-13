@@ -15,7 +15,7 @@
 
 ## Current Active Plan
 
-Release-readiness pass is complete for the local production release covering five commodity option exchanges, including WebUI/API controls for realtime Quote/Kline stream workers, runtime subscription-object progress, current-realtime-slice display semantics, near-contract remaining-day filtering, enum-driven realtime state, and WEBUI-021 overview lifecycle consistency.
+Release-readiness pass is complete for the local production release covering five commodity option exchanges, including WebUI/API controls for realtime Quote/Kline stream workers, runtime subscription-object progress, current-realtime-slice display semantics, near-contract remaining-day filtering, enum-driven realtime state, WEBUI-021 overview lifecycle consistency, and WEBUI-022 live T型报价 freshness during Kline setup.
 
 ## Draft Follow-Up Specs
 

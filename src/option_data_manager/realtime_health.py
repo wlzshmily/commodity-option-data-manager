@@ -157,7 +157,10 @@ def build_realtime_health(
     report_age = _age_seconds(progress.get("updated_at"), current)
     wait_age = _age_seconds(progress.get("last_wait_update_at"), current)
     quote_age = _age_seconds(
-        progress.get("last_quote_write_at") or (latest_quote or {}).get("received_at"),
+        _latest_datetime_value(
+            progress.get("last_quote_write_at"),
+            (latest_quote or {}).get("received_at"),
+        ),
         current,
     )
     if report_age is None or report_age > HEARTBEAT_STALE_SECONDS:
@@ -169,15 +172,6 @@ def build_realtime_health(
             "tone": "bad",
             "last_report_age_seconds": report_age,
         }
-    if wait_age is None or wait_age > WAIT_UPDATE_STALE_SECONDS:
-        return {
-            **base,
-            "status": "wait_update_stale",
-            "label": "疑似网络异常",
-            "message": "交易时段内市场已确认开盘，但 TQSDK wait_update 长时间没有成功返回。",
-            "tone": "bad",
-            "last_wait_update_age_seconds": wait_age,
-        }
     if quote_age is None or quote_age > QUOTE_WRITE_STALE_SECONDS:
         return {
             **base,
@@ -185,6 +179,17 @@ def build_realtime_health(
             "label": "行情写入停滞",
             "message": "TQSDK 有更新心跳，但本地 Quote 长时间没有写入新数据。",
             "tone": "warn",
+            "last_quote_write_age_seconds": quote_age,
+        }
+    if wait_age is None or wait_age > WAIT_UPDATE_STALE_SECONDS:
+        return {
+            **base,
+            "status": "ok",
+            "label": "链路正常",
+            "message": "本地 Quote 仍在写入当前交易时段行情；忽略滞后的 wait_update 统计字段。",
+            "tone": "good",
+            "last_report_age_seconds": report_age,
+            "last_wait_update_age_seconds": wait_age,
             "last_quote_write_age_seconds": quote_age,
         }
     return {
@@ -333,6 +338,17 @@ def _age_seconds(value: Any, now: datetime) -> float | None:
     if parsed is None:
         return None
     return max(0.0, (now - parsed.astimezone(SHANGHAI_TZ)).total_seconds())
+
+
+def _latest_datetime_value(*values: Any) -> Any:
+    parsed_values: list[tuple[datetime, Any]] = []
+    for value in values:
+        parsed = _parse_datetime(value)
+        if parsed is not None:
+            parsed_values.append((parsed.astimezone(UTC), value))
+    if not parsed_values:
+        return None
+    return max(parsed_values, key=lambda item: item[0])[1]
 
 
 def _int_value(value: Any) -> int:

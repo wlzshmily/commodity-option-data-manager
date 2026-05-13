@@ -2,6 +2,7 @@ import sqlite3
 import time
 from datetime import date, timedelta
 
+import option_data_manager.quote_streamer as quote_streamer_module
 from option_data_manager.instruments import (
     InstrumentRecord,
     InstrumentRepository,
@@ -388,6 +389,85 @@ def test_stream_quotes_writes_initial_snapshot_only_when_unchanged() -> None:
     assert tuple(row) == ("2026-06-10", "2026-06-09", 2026, 6)
 
 
+def test_stream_quotes_refreshes_all_quotes_during_kline_setup_without_ui(
+    monkeypatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C100",),
+            put_symbols=("DCE.a2601P100",),
+            last_seen_at="2026-05-08T00:00:00+00:00",
+        )
+    )
+    clock = {"value": 0.0}
+    monkeypatch.setattr(
+        quote_streamer_module.time,
+        "monotonic",
+        lambda: clock["value"],
+    )
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.quotes: dict[str, dict[str, object]] = {}
+
+        def get_quote_list(self, symbols: list[str]) -> list[dict[str, object]]:
+            self.quotes = {
+                symbol: {
+                    "datetime": "2026-05-09T00:00:00+00:00",
+                    "last_price": 1.0,
+                }
+                for symbol in symbols
+            }
+            return [self.quotes[symbol] for symbol in symbols]
+
+        def wait_update(self, *, deadline: float) -> bool:
+            clock["value"] += (
+                quote_streamer_module.KLINE_SETUP_QUOTE_REFRESH_SECONDS + 1
+            )
+            for quote in self.quotes.values():
+                quote["last_price"] = float(quote["last_price"]) + 1.0
+            return True
+
+        def is_changing(self, quote: object, fields: object) -> bool:
+            return False
+
+        def get_kline_serial(
+            self,
+            symbol: object,
+            *,
+            duration_seconds: int,
+            data_length: int,
+        ) -> list[dict[str, object]]:
+            clock["value"] += (
+                quote_streamer_module.KLINE_SETUP_QUOTE_REFRESH_SECONDS + 1
+            )
+            return []
+
+    result = stream_quotes(
+        FakeApi(),
+        connection,
+        cycles=1,
+        wait_deadline_seconds=1,
+    )
+
+    assert result.wait_update_count == 4
+    assert result.quotes_written == 12
+    rows = connection.execute(
+        """
+        SELECT symbol, last_price
+        FROM quote_current
+        ORDER BY symbol
+        """
+    ).fetchall()
+    assert [(row["symbol"], row["last_price"]) for row in rows] == [
+        ("DCE.a2601", 4.0),
+        ("DCE.a2601C100", 4.0),
+        ("DCE.a2601P100", 4.0),
+    ]
+
+
 def test_stream_quotes_honors_stop_requested_before_next_cycle() -> None:
     connection = sqlite3.connect(":memory:")
     InstrumentRepository(connection).upsert_instruments(
@@ -647,7 +727,7 @@ def test_stream_quotes_marks_dirty_metrics_without_blocking_quote_writes() -> No
         underlying_chain_dirty_interval_seconds=30,
     )
 
-    assert result.quotes_written == 6
+    assert result.quotes_written == 9
     rows = connection.execute(
         """
         SELECT symbol, dirty_count, status

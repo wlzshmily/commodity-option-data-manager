@@ -119,7 +119,7 @@ def test_settings_save_survives_best_effort_log_commit_failure(monkeypatch) -> N
     assert client.get("/api/settings").json()["api"]["bind"] == "127.0.0.1"
 
 
-def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
+def test_quote_stream_controls_start_and_stop_workers(monkeypatch, tmp_path: Path) -> None:
     class FakeProcess:
         _next_pid = 32000
 
@@ -177,6 +177,10 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
     app.state.service_state.set_value("contract_manager.running", "true")
     app.state.service_state.set_value("contract_manager.last_success_at", "2026-05-11T00:00:00+00:00")
     app.state.service_state.set_value("quote_stream.contract_list_ready", "true")
+    app.state.service_state.set_value(
+        "quote_stream.report_dir",
+        str(tmp_path / "quote-stream-runtime"),
+    )
 
     started = client.post(
         "/api/quote-stream/start",
@@ -455,8 +459,11 @@ def test_quote_stream_contract_discovery_initializes_empty_universe(monkeypatch)
 
     assert response.status_code == 200
     payload = client.get("/api/quote-stream").json()
-    for _ in range(100):
-        if not payload["contract_discovery_running"]:
+    for _ in range(200):
+        if (
+            not payload["contract_discovery_running"]
+            and payload["contract_list_ready"]
+        ):
             break
         time.sleep(0.02)
         payload = client.get("/api/quote-stream").json()

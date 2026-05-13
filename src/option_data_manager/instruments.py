@@ -205,25 +205,27 @@ class InstrumentRepository:
     ) -> bool:
         """Update persisted instrument metadata with TQSDK same-name quote fields."""
 
-        payload = _payload_from_object(raw_quote)
-        values = {
-            "expire_datetime": _optional_text(payload, "expire_datetime"),
-            "delivery_year": _optional_int(payload, "delivery_year"),
-            "delivery_month": _optional_int(payload, "delivery_month"),
-            "last_exercise_datetime": _optional_text(payload, "last_exercise_datetime"),
-            "exercise_year": _optional_int(payload, "exercise_year"),
-            "exercise_month": _optional_int(payload, "exercise_month"),
-        }
-        updates = {key: value for key, value in values.items() if value is not None}
-        if not updates:
-            return False
-        assignments = ", ".join(f"{key} = ?" for key in updates)
-        cursor = self._connection.execute(
-            f"UPDATE instruments SET {assignments} WHERE symbol = ?",
-            (*updates.values(), symbol),
-        )
+        return self.update_tqsdk_quote_fields_many({symbol: raw_quote}) > 0
+
+    def update_tqsdk_quote_fields_many(
+        self,
+        raw_quotes: Mapping[str, Mapping[str, Any] | object],
+    ) -> int:
+        """Update persisted instrument metadata for many TQSDK Quote objects."""
+
+        updated_count = 0
+        for symbol, raw_quote in raw_quotes.items():
+            updates = _tqsdk_quote_field_updates(raw_quote)
+            if not updates:
+                continue
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            cursor = self._connection.execute(
+                f"UPDATE instruments SET {assignments} WHERE symbol = ?",
+                (*updates.values(), symbol),
+            )
+            updated_count += cursor.rowcount
         self._connection.commit()
-        return cursor.rowcount > 0
+        return updated_count
 
     def mark_missing_inactive(
         self,
@@ -438,6 +440,21 @@ def normalize_instrument(
         exercise_year=_optional_int(record, "exercise_year"),
         exercise_month=_optional_int(record, "exercise_month"),
     )
+
+
+def _tqsdk_quote_field_updates(
+    raw_quote: Mapping[str, Any] | object,
+) -> dict[str, Any]:
+    payload = _payload_from_object(raw_quote)
+    values = {
+        "expire_datetime": _optional_text(payload, "expire_datetime"),
+        "delivery_year": _optional_int(payload, "delivery_year"),
+        "delivery_month": _optional_int(payload, "delivery_month"),
+        "last_exercise_datetime": _optional_text(payload, "last_exercise_datetime"),
+        "exercise_year": _optional_int(payload, "exercise_year"),
+        "exercise_month": _optional_int(payload, "exercise_month"),
+    }
+    return {key: value for key, value in values.items() if value is not None}
 
 
 def _normalize_symbol(

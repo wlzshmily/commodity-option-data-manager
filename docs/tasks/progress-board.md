@@ -10,6 +10,7 @@
 
 ## Done
 
+- WEBUI-022 completed: T型报价 no longer waits for the full Kline subscription phase before receiving fresh Quote rows. Quote workers update subscribed data in the backend independently from WebUI pages, bulk-write startup snapshots, periodically refresh Quote snapshots during Kline setup, avoid startup metrics-queue storms, and health checks prefer actual fresh DB quote writes over stale worker statistic fields.
 - WEBUI-021 completed: overview row status now follows realtime subscription lifecycle enums instead of fresh Quote write coverage, scoped summary counts align with worker subscription progress, WebUI SQLite runtime uses WAL for concurrent realtime reads/writes, and live local verification returned 128 subscribed underlyings including `CZCE.FG607`/`CZCE.FG608`.
 - WEBUI-020 completed: realtime quote-stream lifecycle state is now a stable enum (`blocked`/`starting`/`running`/`stopped`) persisted in service state and returned by API/WebUI; frontend controls no longer infer startup state from Chinese message text, and live local start transitioned `starting` to `running` with 4 worker PIDs.
 - WEBUI-019 completed: realtime start now returns a `starting` response immediately while worker launch continues in the background; status prefill skips expensive SQLite range recalculation once worker reports exist, and worker subscription-scope reads retry temporary SQLite locks instead of exiting.

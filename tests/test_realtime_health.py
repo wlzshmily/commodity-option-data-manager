@@ -33,8 +33,8 @@ def test_realtime_health_detects_stale_wait_update_after_market_opens() -> None:
     connection = sqlite3.connect(":memory:")
     _insert_future_quote(
         connection,
-        source_datetime="2026-05-11T09:08:00+08:00",
-        received_at="2026-05-11T09:08:05+08:00",
+        source_datetime="2026-05-11T09:06:00+08:00",
+        received_at="2026-05-11T09:06:05+08:00",
     )
 
     health = build_realtime_health(
@@ -44,13 +44,37 @@ def test_realtime_health_detects_stale_wait_update_after_market_opens() -> None:
             "status": "running",
             "updated_at": "2026-05-11T09:09:55+08:00",
             "last_wait_update_at": "2026-05-11T09:05:00+08:00",
-            "last_quote_write_at": "2026-05-11T09:08:05+08:00",
+            "last_quote_write_at": "2026-05-11T09:06:05+08:00",
         },
         now=datetime.fromisoformat("2026-05-11T09:10:00+08:00"),
     )
 
-    assert health["status"] == "wait_update_stale"
-    assert health["tone"] == "bad"
+    assert health["status"] == "quote_write_stale"
+    assert health["tone"] == "warn"
+
+
+def test_realtime_health_prefers_fresh_quote_writes_over_stale_wait_stat() -> None:
+    connection = sqlite3.connect(":memory:")
+    _insert_future_quote(
+        connection,
+        source_datetime="2026-05-11T09:09:30+08:00",
+        received_at="2026-05-11T09:09:35+08:00",
+    )
+
+    health = build_realtime_health(
+        connection,
+        running=True,
+        progress={
+            "status": "running",
+            "updated_at": "2026-05-11T09:09:55+08:00",
+            "last_wait_update_at": "2026-05-11T09:05:00+08:00",
+            "last_quote_write_at": "2026-05-11T09:05:00+08:00",
+        },
+        now=datetime.fromisoformat("2026-05-11T09:10:00+08:00"),
+    )
+
+    assert health["status"] == "ok"
+    assert health["tone"] == "good"
 
 
 def test_realtime_health_does_not_alert_before_subscription_setup_finishes() -> None:

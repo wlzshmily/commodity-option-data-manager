@@ -26,6 +26,7 @@ DEFAULT_NEAR_EXPIRY_MONTHS = 2
 DEFAULT_CONTRACT_MONTH_LIMIT = 2
 DEFAULT_MIN_DAYS_TO_EXPIRY = 1
 DEFAULT_CONTRACT_REFRESH_INTERVAL_SECONDS = 30 * 60
+KLINE_SETUP_QUOTE_REFRESH_SECONDS = 5.0
 _FAR_EXPIRY_KEY = (9999, 99)
 _MONTH_PATTERN = re.compile(r"(\d{3,4})")
 
@@ -279,9 +280,36 @@ def stream_quotes(
             tq_notify_state=tqsdk_notify_state,
         )
     quote_finished_at = datetime.now(UTC).isoformat()
+    cycle_count = 0
+    wait_update_count = 0
+    quotes_written = 0
+    changed_quotes_written = 0
+    last_wait_update_at: str | None = None
+    last_quote_write_at: str | None = None
+    initial_quote_snapshot_written = False
+    if stop_requested is None or not stop_requested():
+        received_at = datetime.now(UTC).isoformat()
+        write_result = _write_quote_refs(
+            api,
+            quote_refs=quote_refs,
+            repository=repository,
+            instrument_repository=instrument_repository,
+            metrics_dirty_queue=metrics_dirty_queue,
+            symbol_metadata=symbol_metadata,
+            received_at=received_at,
+            force_all=True,
+            count_changed=False,
+        )
+        quotes_written += write_result["quotes_written"]
+        changed_quotes_written += write_result["changed_quotes_written"]
+        error_count += write_result["error_count"]
+        if write_result["wrote_quote"]:
+            last_quote_write_at = received_at
+            initial_quote_snapshot_written = True
     kline_started_at = datetime.now(UTC).isoformat()
     kline_progress_step = max(1, min(100, len(kline_symbols) // 100 or 1))
     next_kline_progress_at = kline_progress_step
+    next_kline_quote_refresh_at = time.monotonic() + KLINE_SETUP_QUOTE_REFRESH_SECONDS
     attempted_kline_count = 0
     for batch in _batches(kline_symbols, kline_batch_size):
         attempted_kline_count += len(batch)
@@ -296,6 +324,35 @@ def stream_quotes(
             attempted_kline_count == len(kline_symbols)
             or attempted_kline_count >= next_kline_progress_at
         ):
+            now_monotonic = time.monotonic()
+            if (
+                (stop_requested is None or not stop_requested())
+                and now_monotonic >= next_kline_quote_refresh_at
+            ):
+                next_kline_quote_refresh_at = (
+                    now_monotonic + KLINE_SETUP_QUOTE_REFRESH_SECONDS
+                )
+                wait_update_succeeded = api.wait_update(deadline=time.time() + 0.1)
+                if wait_update_succeeded:
+                    wait_update_count += 1
+                    last_wait_update_at = datetime.now(UTC).isoformat()
+                received_at = datetime.now(UTC).isoformat()
+                write_result = _write_quote_refs(
+                    api,
+                    quote_refs=quote_refs,
+                    repository=repository,
+                    instrument_repository=instrument_repository,
+                    metrics_dirty_queue=metrics_dirty_queue,
+                    symbol_metadata=symbol_metadata,
+                    received_at=received_at,
+                    force_all=True,
+                    count_changed=False,
+                )
+                quotes_written += write_result["quotes_written"]
+                changed_quotes_written += write_result["changed_quotes_written"]
+                error_count += write_result["error_count"]
+                if write_result["wrote_quote"]:
+                    last_quote_write_at = received_at
             while next_kline_progress_at <= attempted_kline_count:
                 next_kline_progress_at += kline_progress_step
             _emit_progress(
@@ -317,6 +374,11 @@ def stream_quotes(
                 near_expiry_kline_subscribed=min(len(kline_refs), near_kline_total),
                 near_expiry_kline_total=near_kline_total,
                 contract_month_limit=contract_month_limit,
+                wait_update_count=wait_update_count,
+                quotes_written=quotes_written,
+                changed_quotes_written=changed_quotes_written,
+                last_wait_update_at=last_wait_update_at,
+                last_quote_write_at=last_quote_write_at,
                 tq_notify_state=tqsdk_notify_state,
             )
     _emit_progress(
@@ -338,15 +400,14 @@ def stream_quotes(
         near_expiry_kline_subscribed=min(len(kline_refs), near_kline_total),
         near_expiry_kline_total=near_kline_total,
         contract_month_limit=contract_month_limit,
+        wait_update_count=wait_update_count,
+        quotes_written=quotes_written,
+        changed_quotes_written=changed_quotes_written,
+        last_wait_update_at=last_wait_update_at,
+        last_quote_write_at=last_quote_write_at,
         tq_notify_state=tqsdk_notify_state,
     )
     deadline_at = time.monotonic() + duration_seconds if duration_seconds else None
-    cycle_count = 0
-    wait_update_count = 0
-    quotes_written = 0
-    changed_quotes_written = 0
-    last_wait_update_at: str | None = None
-    last_quote_write_at: str | None = None
     next_progress_heartbeat_at = time.monotonic()
     next_contract_refresh_at = (
         time.monotonic() + contract_refresh_interval_seconds
@@ -426,36 +487,24 @@ def stream_quotes(
             ):
                 last_contract_reconcile_at = datetime.now(UTC).isoformat()
         received_at = datetime.now(UTC).isoformat()
-        wrote_quote_this_cycle = False
-        for symbol, quote_ref in quote_refs.items():
-            should_write = cycle_count == 1 or _is_changing(api, quote_ref)
-            if not should_write:
-                continue
-            try:
-                previous_quote = repository.get_quote(symbol)
-                quote = normalize_quote(symbol, quote_ref, received_at=received_at)
-                repository.upsert_quote(quote)
-                instrument_repository.update_tqsdk_quote_fields(symbol, quote_ref)
-                if previous_quote is not None and _quote_price_changed(
-                    previous_quote,
-                    quote,
-                ):
-                    _mark_metrics_dirty(
-                        metrics_dirty_queue,
-                        symbol_metadata=symbol_metadata,
-                        symbol=symbol,
-                        dirty_at=received_at,
-                        underlying_chain_interval_seconds=(
-                            underlying_chain_dirty_interval_seconds
-                        ),
-                    )
-                quotes_written += 1
-                wrote_quote_this_cycle = True
-                if cycle_count > 1:
-                    changed_quotes_written += 1
-            except Exception:
-                error_count += 1
-        if wrote_quote_this_cycle:
+        write_result = _write_quote_refs(
+            api,
+            quote_refs=quote_refs,
+            repository=repository,
+            instrument_repository=instrument_repository,
+            metrics_dirty_queue=metrics_dirty_queue,
+            symbol_metadata=symbol_metadata,
+            received_at=received_at,
+            force_all=cycle_count == 1 and not initial_quote_snapshot_written,
+            count_changed=cycle_count > 1,
+            underlying_chain_dirty_interval_seconds=(
+                underlying_chain_dirty_interval_seconds
+            ),
+        )
+        quotes_written += write_result["quotes_written"]
+        changed_quotes_written += write_result["changed_quotes_written"]
+        error_count += write_result["error_count"]
+        if write_result["wrote_quote"]:
             last_quote_write_at = received_at
         now_monotonic = time.monotonic()
         if (
@@ -544,6 +593,71 @@ def stream_quotes(
         contract_reconcile_removed_kline_count=reconcile_removed_kline_count,
         error_count=error_count,
     )
+
+
+def _write_quote_refs(
+    api: Any,
+    *,
+    quote_refs: dict[str, Any],
+    repository: QuoteRepository,
+    instrument_repository: InstrumentRepository,
+    metrics_dirty_queue: MetricsDirtyQueueRepository,
+    symbol_metadata: dict[str, dict[str, Any]],
+    received_at: str,
+    force_all: bool,
+    count_changed: bool,
+    underlying_chain_dirty_interval_seconds: int = DEFAULT_UNDERLYING_CHAIN_DIRTY_INTERVAL_SECONDS,
+) -> dict[str, int | bool]:
+    quotes_written = 0
+    changed_quotes_written = 0
+    error_count = 0
+    wrote_quote = False
+    records: list[QuoteRecord] = []
+    metadata_updates: dict[str, Any] = {}
+    for symbol, quote_ref in quote_refs.items():
+        if not force_all and not _is_changing(api, quote_ref):
+            continue
+        try:
+            previous_quote = repository.get_quote(symbol)
+            quote = normalize_quote(symbol, quote_ref, received_at=received_at)
+            records.append(quote)
+            metadata_updates[symbol] = quote_ref
+            price_changed = (
+                previous_quote is not None
+                and _quote_price_changed(
+                    previous_quote,
+                    quote,
+                )
+            )
+            if count_changed and price_changed:
+                _mark_metrics_dirty(
+                    metrics_dirty_queue,
+                    symbol_metadata=symbol_metadata,
+                    symbol=symbol,
+                    dirty_at=received_at,
+                    underlying_chain_interval_seconds=(
+                        underlying_chain_dirty_interval_seconds
+                    ),
+                )
+                changed_quotes_written += 1
+            quotes_written += 1
+            wrote_quote = True
+        except Exception:
+            error_count += 1
+    try:
+        repository.upsert_quotes(records)
+        instrument_repository.update_tqsdk_quote_fields_many(metadata_updates)
+    except Exception:
+        error_count += len(records)
+        quotes_written -= len(records)
+        changed_quotes_written = max(0, changed_quotes_written - len(records))
+        wrote_quote = False
+    return {
+        "quotes_written": quotes_written,
+        "changed_quotes_written": changed_quotes_written,
+        "error_count": error_count,
+        "wrote_quote": wrote_quote,
+    }
 
 
 def select_quote_symbols(
