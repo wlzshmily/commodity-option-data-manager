@@ -266,6 +266,73 @@ def test_overview_subscription_status_can_follow_worker_lifecycle() -> None:
     assert all(row["current_quote_count"] == 0 for row in rows)
 
 
+def test_overview_subscription_status_can_follow_underlying_progress() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    cutoff = "2026-05-12T01:00:00+00:00"
+    today = date.today()
+    for symbol, product, month in (
+        ("CZCE.FG607", "FG", 7),
+        ("CZCE.FG608", "FG", 8),
+    ):
+        _insert_simple_chain(
+            connection,
+            underlying_symbol=symbol,
+            exchange_id="CZCE",
+            product_id=product,
+            delivery_year=2026,
+            delivery_month=month,
+            received_at="2026-05-09T01:00:00+00:00",
+        )
+        connection.execute(
+            """
+            UPDATE instruments
+            SET expire_datetime = ?
+            WHERE underlying_symbol = ? AND option_class IN ('CALL', 'PUT')
+            """,
+            ((today + timedelta(days=30)).isoformat(), symbol),
+        )
+    connection.commit()
+
+    rows = read_model.overview(
+        current_quote_after=cutoff,
+        require_current_quote=True,
+        subscription_scope_enabled=True,
+        subscription_contract_month_limit=2,
+        subscription_min_days_to_expiry=1,
+        subscription_lifecycle_status="subscribing",
+        subscription_underlying_progress={
+            "CZCE.FG607": {
+                "status": "subscribed",
+                "quote_subscribed": 3,
+                "quote_total": 3,
+                "kline_subscribed": 3,
+                "kline_total": 3,
+                "subscribed_objects": 6,
+                "total_objects": 6,
+            },
+            "CZCE.FG608": {
+                "status": "subscribing",
+                "quote_subscribed": 3,
+                "quote_total": 3,
+                "kline_subscribed": 1,
+                "kline_total": 3,
+                "subscribed_objects": 4,
+                "total_objects": 6,
+            },
+        },
+    )["underlyings"]
+
+    assert {row["underlying_symbol"]: row["status"] for row in rows} == {
+        "CZCE.FG607": "已订阅",
+        "CZCE.FG608": "订阅中",
+    }
+    assert {row["underlying_symbol"]: row["subscription_subscribed"] for row in rows} == {
+        "CZCE.FG607": 6,
+        "CZCE.FG608": 4,
+    }
+
+
 def test_tquote_marks_historical_cache_as_unsubscribed_until_realtime_refresh() -> None:
     connection = sqlite3.connect(":memory:")
     read_model = WebuiReadModel(connection)

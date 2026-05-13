@@ -2464,6 +2464,7 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str
         kline_subscribed=kline_subscribed,
         kline_total=kline_total,
     )
+    underlying_progress = _aggregate_underlying_progress(progress_rows)
     return {
         "status": status,
         "worker_reports": len(progress_rows),
@@ -2479,6 +2480,7 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str
         "near_expiry_subscribed": near_expiry_subscribed,
         "near_expiry_total": near_expiry_total,
         "contract_months": contract_months,
+        "underlying_progress": underlying_progress,
         "subscribed_objects": subscribed_objects,
         "total_objects": total_objects,
         "completion_ratio": subscribed_objects / total_objects
@@ -2635,7 +2637,56 @@ def _progress_from_report(payload: dict[str, Any]) -> dict[str, Any] | None:
         "completion_ratio": subscribed_objects / total_objects
         if total_objects
         else 0.0,
+        "underlying_progress": result.get("underlying_progress") or {},
     }
+
+
+def _aggregate_underlying_progress(
+    rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    aggregated: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        progress = row.get("underlying_progress")
+        if not isinstance(progress, dict):
+            continue
+        for symbol, item in progress.items():
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("underlying_symbol") or symbol)
+            target = aggregated.setdefault(
+                key,
+                {
+                    "underlying_symbol": key,
+                    "quote_subscribed": 0,
+                    "quote_total": 0,
+                    "kline_subscribed": 0,
+                    "kline_total": 0,
+                    "subscribed_objects": 0,
+                    "total_objects": 0,
+                    "completion_ratio": 0.0,
+                    "status": "pending",
+                },
+            )
+            for field in (
+                "quote_subscribed",
+                "quote_total",
+                "kline_subscribed",
+                "kline_total",
+                "subscribed_objects",
+                "total_objects",
+            ):
+                target[field] += _int_value(item.get(field))
+    for item in aggregated.values():
+        total = _int_value(item.get("total_objects"))
+        subscribed = _int_value(item.get("subscribed_objects"))
+        item["completion_ratio"] = subscribed / total if total else 0.0
+        if total > 0 and subscribed >= total:
+            item["status"] = "subscribed"
+        elif subscribed > 0:
+            item["status"] = "subscribing"
+        else:
+            item["status"] = "pending"
+    return dict(sorted(aggregated.items()))
 
 
 def _latest_tqsdk_notify(rows: list[dict[str, Any]]) -> dict[str, Any]:

@@ -229,7 +229,10 @@ def stream_quotes(
     repository = QuoteRepository(connection)
     instrument_repository = InstrumentRepository(connection)
     metrics_dirty_queue = MetricsDirtyQueueRepository(connection)
-    symbol_metadata = _quote_symbol_metadata(connection, symbols)
+    symbol_metadata = _quote_symbol_metadata(
+        connection,
+        sorted(set(symbols) | set(kline_symbols)),
+    )
     error_count = 0
     quote_refs: dict[str, Any] = {}
     kline_refs: dict[str, Any] = {}
@@ -253,6 +256,13 @@ def stream_quotes(
         near_expiry_kline_subscribed=0,
         near_expiry_kline_total=near_kline_total,
         contract_month_limit=contract_month_limit,
+        underlying_progress=_underlying_subscription_progress(
+            quote_symbols=symbols,
+            kline_symbols=kline_symbols,
+            quote_refs=quote_refs,
+            kline_refs=kline_refs,
+            symbol_metadata=symbol_metadata,
+        ),
         tq_notify_state=tqsdk_notify_state,
     )
     for index in range(0, len(symbols), quote_shard_size):
@@ -281,6 +291,13 @@ def stream_quotes(
             near_expiry_kline_subscribed=0,
             near_expiry_kline_total=near_kline_total,
             contract_month_limit=contract_month_limit,
+            underlying_progress=_underlying_subscription_progress(
+                quote_symbols=symbols,
+                kline_symbols=kline_symbols,
+                quote_refs=quote_refs,
+                kline_refs=kline_refs,
+                symbol_metadata=symbol_metadata,
+            ),
             tq_notify_state=tqsdk_notify_state,
         )
     quote_finished_at = datetime.now(UTC).isoformat()
@@ -378,6 +395,13 @@ def stream_quotes(
                 near_expiry_kline_subscribed=min(len(kline_refs), near_kline_total),
                 near_expiry_kline_total=near_kline_total,
                 contract_month_limit=contract_month_limit,
+                underlying_progress=_underlying_subscription_progress(
+                    quote_symbols=symbols,
+                    kline_symbols=kline_symbols,
+                    quote_refs=quote_refs,
+                    kline_refs=kline_refs,
+                    symbol_metadata=symbol_metadata,
+                ),
                 wait_update_count=wait_update_count,
                 quotes_written=quotes_written,
                 changed_quotes_written=changed_quotes_written,
@@ -404,6 +428,13 @@ def stream_quotes(
         near_expiry_kline_subscribed=min(len(kline_refs), near_kline_total),
         near_expiry_kline_total=near_kline_total,
         contract_month_limit=contract_month_limit,
+        underlying_progress=_underlying_subscription_progress(
+            quote_symbols=symbols,
+            kline_symbols=kline_symbols,
+            quote_refs=quote_refs,
+            kline_refs=kline_refs,
+            symbol_metadata=symbol_metadata,
+        ),
         wait_update_count=wait_update_count,
         quotes_written=quotes_written,
         changed_quotes_written=changed_quotes_written,
@@ -478,7 +509,10 @@ def stream_quotes(
             kline_symbols = reconcile["kline_symbols"]
             near_quote_total = reconcile["near_quote_total"]
             near_kline_total = reconcile["near_kline_total"]
-            symbol_metadata = _quote_symbol_metadata(connection, symbols)
+            symbol_metadata = _quote_symbol_metadata(
+                connection,
+                sorted(set(symbols) | set(kline_symbols)),
+            )
             reconcile_added_quote_count += reconcile["added_quote_count"]
             reconcile_removed_quote_count += reconcile["removed_quote_count"]
             reconcile_added_kline_count += reconcile["added_kline_count"]
@@ -547,6 +581,13 @@ def stream_quotes(
                 ),
                 near_expiry_kline_total=near_kline_total,
                 contract_month_limit=contract_month_limit,
+                underlying_progress=_underlying_subscription_progress(
+                    quote_symbols=symbols,
+                    kline_symbols=kline_symbols,
+                    quote_refs=quote_refs,
+                    kline_refs=kline_refs,
+                    symbol_metadata=symbol_metadata,
+                ),
                 cycle_count=cycle_count,
                 wait_update_count=wait_update_count,
                 quotes_written=quotes_written,
@@ -1650,6 +1691,68 @@ def _quote_symbol_metadata(
     }
 
 
+def _underlying_subscription_progress(
+    *,
+    quote_symbols: list[str],
+    kline_symbols: list[str],
+    quote_refs: dict[str, Any],
+    kline_refs: dict[str, Any],
+    symbol_metadata: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    progress: dict[str, dict[str, Any]] = {}
+
+    def ensure(symbol: str) -> dict[str, Any]:
+        underlying = _progress_underlying_symbol(symbol, symbol_metadata.get(symbol))
+        return progress.setdefault(
+            underlying,
+            {
+                "underlying_symbol": underlying,
+                "quote_subscribed": 0,
+                "quote_total": 0,
+                "kline_subscribed": 0,
+                "kline_total": 0,
+                "subscribed_objects": 0,
+                "total_objects": 0,
+                "completion_ratio": 0.0,
+                "status": "pending",
+            },
+        )
+
+    for symbol in quote_symbols:
+        row = ensure(symbol)
+        row["quote_total"] += 1
+        row["total_objects"] += 1
+        if symbol in quote_refs:
+            row["quote_subscribed"] += 1
+            row["subscribed_objects"] += 1
+    for symbol in kline_symbols:
+        row = ensure(symbol)
+        row["kline_total"] += 1
+        row["total_objects"] += 1
+        if symbol in kline_refs:
+            row["kline_subscribed"] += 1
+            row["subscribed_objects"] += 1
+    for row in progress.values():
+        total = int(row["total_objects"] or 0)
+        subscribed = int(row["subscribed_objects"] or 0)
+        row["completion_ratio"] = subscribed / total if total else 0.0
+        if total > 0 and subscribed >= total:
+            row["status"] = "subscribed"
+        elif subscribed > 0:
+            row["status"] = "subscribing"
+        else:
+            row["status"] = "pending"
+    return dict(sorted(progress.items()))
+
+
+def _progress_underlying_symbol(
+    symbol: str,
+    metadata: dict[str, Any] | None,
+) -> str:
+    underlying = str((metadata or {}).get("underlying_symbol") or "").strip()
+    return underlying or symbol
+
+
 def _quote_price_changed(previous: QuoteRecord, current: QuoteRecord) -> bool:
     if _changed_price(previous.last_price, current.last_price):
         return True
@@ -1832,6 +1935,7 @@ def _emit_progress(
     contract_reconcile_removed_quote_count: int = 0,
     contract_reconcile_added_kline_count: int = 0,
     contract_reconcile_removed_kline_count: int = 0,
+    underlying_progress: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     if progress_callback is None:
         return
@@ -1864,6 +1968,7 @@ def _emit_progress(
             "contract_months": _contract_months_progress_value(
                 contract_month_limit
             ),
+            "underlying_progress": underlying_progress or {},
             "subscribed_objects": subscribed_objects,
             "total_objects": total_objects,
             "cycle_count": cycle_count,

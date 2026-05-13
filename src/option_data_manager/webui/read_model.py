@@ -60,6 +60,7 @@ class WebuiReadModel:
         subscription_contract_month_limit: int | None = None,
         subscription_min_days_to_expiry: int = 1,
         subscription_lifecycle_status: SubscriptionLifecycleStatus | str | None = None,
+        subscription_underlying_progress: dict[str, Any] | None = None,
         subscription_fast_totals: bool = False,
     ) -> dict[str, Any]:
         """Return acquisition health summarized by underlying contract."""
@@ -85,6 +86,7 @@ class WebuiReadModel:
                 allowed_underlying_symbols=subscription_symbols,
                 subscription_status_enabled=subscription_scope_enabled,
                 subscription_lifecycle_status=subscription_lifecycle_status,
+                subscription_underlying_progress=subscription_underlying_progress,
             )
         )
         totals = (
@@ -696,6 +698,7 @@ def _underlying_rows(
     allowed_underlying_symbols: set[str] | None = None,
     subscription_status_enabled: bool = False,
     subscription_lifecycle_status: SubscriptionLifecycleStatus | str | None = None,
+    subscription_underlying_progress: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if allowed_underlying_symbols is not None and not allowed_underlying_symbols:
         return []
@@ -845,6 +848,10 @@ def _underlying_rows(
             row,
             subscription_status_enabled=subscription_status_enabled,
             subscription_lifecycle_status=subscription_lifecycle_status,
+            subscription_progress=_subscription_progress_for_row(
+                subscription_underlying_progress,
+                str(row["underlying_symbol"]),
+            ),
         )
         for row in rows
     ]
@@ -855,6 +862,7 @@ def _format_underlying_row(
     *,
     subscription_status_enabled: bool = False,
     subscription_lifecycle_status: SubscriptionLifecycleStatus | str | None = None,
+    subscription_progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     data = _row_dict(row)
     option_count = int(data["option_count"])
@@ -887,11 +895,13 @@ def _format_underlying_row(
         data.get("latest_kline_time"),
         reference_datetime=data.get("display_market_time") or data.get("latest_update"),
     )
+    _apply_subscription_progress(data, subscription_progress)
     data["status"] = (
         _subscription_status_from_counts(
             data,
             option_count,
             lifecycle_status=subscription_lifecycle_status,
+            subscription_progress=subscription_progress,
         )
         if subscription_status_enabled
         else _status_from_counts(data, option_count)
@@ -1443,9 +1453,19 @@ def _subscription_status_from_counts(
     option_count: int,
     *,
     lifecycle_status: SubscriptionLifecycleStatus | str | None = None,
+    subscription_progress: dict[str, Any] | None = None,
 ) -> str:
     if option_count <= 0:
         return "无合约"
+    progress_status = _coerce_subscription_lifecycle_status(
+        (subscription_progress or {}).get("status")
+    )
+    if progress_status == SubscriptionLifecycleStatus.SUBSCRIBED:
+        return "已订阅"
+    if progress_status == SubscriptionLifecycleStatus.SUBSCRIBING:
+        return "订阅中"
+    if progress_status == SubscriptionLifecycleStatus.PENDING:
+        return "待订阅"
     lifecycle = _coerce_subscription_lifecycle_status(lifecycle_status)
     if lifecycle == SubscriptionLifecycleStatus.SUBSCRIBED:
         return "已订阅"
@@ -1459,6 +1479,44 @@ def _subscription_status_from_counts(
     if current_quote_count > 0:
         return "订阅中"
     return "待订阅"
+
+
+def _subscription_progress_for_row(
+    progress: dict[str, Any] | None,
+    underlying_symbol: str,
+) -> dict[str, Any] | None:
+    if not isinstance(progress, dict):
+        return None
+    item = progress.get(underlying_symbol)
+    return item if isinstance(item, dict) else None
+
+
+def _apply_subscription_progress(
+    data: dict[str, Any],
+    progress: dict[str, Any] | None,
+) -> None:
+    if not isinstance(progress, dict):
+        data["subscription_quote_subscribed"] = None
+        data["subscription_quote_total"] = None
+        data["subscription_kline_subscribed"] = None
+        data["subscription_kline_total"] = None
+        data["subscription_subscribed"] = None
+        data["subscription_total"] = None
+        data["subscription_completion_ratio"] = None
+        return
+    quote_subscribed = int(progress.get("quote_subscribed") or 0)
+    quote_total = int(progress.get("quote_total") or 0)
+    kline_subscribed = int(progress.get("kline_subscribed") or 0)
+    kline_total = int(progress.get("kline_total") or 0)
+    subscribed = int(progress.get("subscribed_objects") or 0)
+    total = int(progress.get("total_objects") or 0)
+    data["subscription_quote_subscribed"] = quote_subscribed
+    data["subscription_quote_total"] = quote_total
+    data["subscription_kline_subscribed"] = kline_subscribed
+    data["subscription_kline_total"] = kline_total
+    data["subscription_subscribed"] = subscribed
+    data["subscription_total"] = total
+    data["subscription_completion_ratio"] = subscribed / total if total else 0.0
 
 
 def _coerce_subscription_lifecycle_status(

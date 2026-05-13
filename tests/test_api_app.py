@@ -523,6 +523,18 @@ def test_quote_stream_status_aggregates_runtime_subscription_progress(
             "near_expiry_subscribed": 5,
             "near_expiry_total": 6,
             "contract_months": "all",
+            "underlying_progress": {
+              "DCE.a2601": {
+                "underlying_symbol": "DCE.a2601",
+                "quote_subscribed": 2,
+                "quote_total": 2,
+                "kline_subscribed": 1,
+                "kline_total": 2,
+                "subscribed_objects": 3,
+                "total_objects": 4,
+                "status": "subscribing"
+              }
+            },
             "subscribed_objects": 6,
             "total_objects": 8,
             "completion_ratio": 0.75
@@ -557,6 +569,11 @@ def test_quote_stream_status_aggregates_runtime_subscription_progress(
     assert payload["progress"]["contract_months"] == "all"
     assert payload["progress"]["near_expiry_subscribed"] == 5
     assert payload["progress"]["near_expiry_total"] == 6
+    assert payload["progress"]["underlying_progress"]["DCE.a2601"]["status"] == "subscribing"
+    assert (
+        payload["progress"]["underlying_progress"]["DCE.a2601"]["subscribed_objects"]
+        == 3
+    )
     assert payload["progress"]["elapsed_seconds"] == 8
     assert payload["progress"]["active_stage"] == "kline"
     assert payload["progress"]["stage_label"] == "K线"

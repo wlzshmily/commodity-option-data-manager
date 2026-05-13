@@ -159,6 +159,9 @@ def _overview_payload(
                 quote_stream
             ),
             subscription_lifecycle_status=_quote_stream_lifecycle_status(quote_stream),
+            subscription_underlying_progress=(
+                quote_stream.get("progress") or {}
+            ).get("underlying_progress"),
             subscription_fast_totals=_quote_stream_scope_active(quote_stream),
         ),
         "refresh": {
@@ -546,6 +549,7 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict:
         kline_subscribed=kline_subscribed,
         kline_total=kline_total,
     )
+    underlying_progress = _aggregate_underlying_progress(rows)
     return {
         "status": status,
         "worker_reports": len(rows),
@@ -561,6 +565,7 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict:
         "near_expiry_subscribed": near_expiry_subscribed,
         "near_expiry_total": near_expiry_total,
         "contract_months": contract_months,
+        "underlying_progress": underlying_progress,
         "subscribed_objects": subscribed_objects,
         "total_objects": total_objects,
         "completion_ratio": subscribed_objects / total_objects
@@ -711,7 +716,54 @@ def _progress_from_report(payload: dict) -> dict | None:
         "completion_ratio": subscribed_objects / total_objects
         if total_objects
         else 0.0,
+        "underlying_progress": result.get("underlying_progress") or {},
     }
+
+
+def _aggregate_underlying_progress(rows: list[dict]) -> dict:
+    aggregated: dict[str, dict] = {}
+    for row in rows:
+        progress = row.get("underlying_progress")
+        if not isinstance(progress, dict):
+            continue
+        for symbol, item in progress.items():
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("underlying_symbol") or symbol)
+            target = aggregated.setdefault(
+                key,
+                {
+                    "underlying_symbol": key,
+                    "quote_subscribed": 0,
+                    "quote_total": 0,
+                    "kline_subscribed": 0,
+                    "kline_total": 0,
+                    "subscribed_objects": 0,
+                    "total_objects": 0,
+                    "completion_ratio": 0.0,
+                    "status": "pending",
+                },
+            )
+            for field in (
+                "quote_subscribed",
+                "quote_total",
+                "kline_subscribed",
+                "kline_total",
+                "subscribed_objects",
+                "total_objects",
+            ):
+                target[field] += _int_value(item.get(field))
+    for item in aggregated.values():
+        total = _int_value(item.get("total_objects"))
+        subscribed = _int_value(item.get("subscribed_objects"))
+        item["completion_ratio"] = subscribed / total if total else 0.0
+        if total > 0 and subscribed >= total:
+            item["status"] = "subscribed"
+        elif subscribed > 0:
+            item["status"] = "subscribing"
+        else:
+            item["status"] = "pending"
+    return dict(sorted(aggregated.items()))
 
 
 def _latest_tqsdk_notify(rows: list[dict]) -> dict:
@@ -1657,6 +1709,8 @@ body {
 .tag.good { background: var(--matcha); color: var(--aqua); }
 .tag.warn { background: #fff2dc; color: var(--warn); }
 .tag.bad { background: #fae3e6; color: var(--brand); }
+.status-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.status-subline { font-size: 11px; line-height: 1; color: var(--muted); white-space: nowrap; }
 .quote-shell { overflow: hidden; }
 .quote-toolbar {
   min-height: 54px;
@@ -2860,6 +2914,9 @@ function renderUnderlyingRows() {
       : ["数据缺口", "待订阅", "订阅中"].includes(row.status)
       ? "warn"
       : "bad";
+    const subscriptionText = row.subscription_total
+      ? `${fmtNum(row.subscription_subscribed)}/${fmtNum(row.subscription_total)}`
+      : "";
     return `<tr class="clickable" data-underlying="${escapeHtml(row.underlying_symbol)}">
       <td>${escapeHtml(exchangeNames[row.exchange_id] ?? row.exchange_id)}</td>
       <td>${escapeHtml(productNames[row.product_id] ?? row.product_id)}</td>
@@ -2872,7 +2929,7 @@ function renderUnderlyingRows() {
       <td class="${row.iv_coverage < 0.98 ? "warn" : "good"}">${fmtPct(row.iv_coverage)}</td>
       <td class="${row.kline_count ? "good" : "warn"}">${row.kline_count ? escapeHtml(fmtDateTime(row.display_kline_time ?? row.latest_kline_time)) : "缺口"}</td>
       <td class="mono">${escapeHtml(fmtDateTime(row.display_market_time ?? row.latest_quote_time))}</td>
-      <td><span class="tag ${statusClass}">${escapeHtml(row.status)}</span></td>
+      <td><div class="status-cell"><span class="tag ${statusClass}">${escapeHtml(row.status)}</span>${subscriptionText ? `<span class="status-subline mono">${escapeHtml(subscriptionText)}</span>` : ""}</div></td>
       <td><button class="btn btn-sm btn-light" type="button">进入T型</button></td>
     </tr>`;
   }).join("");

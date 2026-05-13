@@ -371,6 +371,17 @@ def test_stream_quotes_writes_initial_snapshot_only_when_unchanged() -> None:
     assert progress_events[-1]["contract_months"] == "2"
     assert progress_events[-1]["near_expiry_subscribed"] == 6
     assert progress_events[-1]["near_expiry_total"] == 6
+    assert progress_events[-1]["underlying_progress"]["DCE.a2601"] == {
+        "underlying_symbol": "DCE.a2601",
+        "quote_subscribed": 3,
+        "quote_total": 3,
+        "kline_subscribed": 3,
+        "kline_total": 3,
+        "subscribed_objects": 6,
+        "total_objects": 6,
+        "completion_ratio": 1.0,
+        "status": "subscribed",
+    }
     assert progress_events[-1]["quote_started_at"] is not None
     assert progress_events[-1]["quote_finished_at"] is not None
     assert progress_events[-1]["kline_started_at"] is not None
