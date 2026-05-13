@@ -46,6 +46,21 @@ QUOTE_CURRENT_MIGRATION = Migration(
     ),
 )
 
+QUOTE_CURRENT_READ_MODEL_INDEX_MIGRATION = Migration(
+    201,
+    "add quote_current read model indexes",
+    (
+        """
+        CREATE INDEX IF NOT EXISTS idx_quote_current_received_at
+        ON quote_current(received_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_quote_current_source_datetime
+        ON quote_current(source_datetime)
+        """,
+    ),
+)
+
 
 QUOTE_SOURCE_FIELDS = (
     "datetime",
@@ -102,7 +117,10 @@ class QuoteRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         connection.row_factory = sqlite3.Row
         self._connection = connection
-        apply_migrations(connection, (QUOTE_CURRENT_MIGRATION,))
+        apply_migrations(
+            connection,
+            (QUOTE_CURRENT_MIGRATION, QUOTE_CURRENT_READ_MODEL_INDEX_MIGRATION),
+        )
 
     def upsert_quote(self, record: QuoteRecord) -> None:
         """Insert or replace the current Quote slice for one symbol."""

@@ -1,7 +1,9 @@
 import sqlite3
 import time
+from datetime import date, timedelta
 
 from option_data_manager.instruments import (
+    InstrumentRecord,
     InstrumentRepository,
     normalize_option_chain_discovery,
 )
@@ -83,11 +85,215 @@ def test_subscription_order_prioritizes_near_expiry_months() -> None:
         connection,
         include_futures=False,
         near_expiry_months=2,
-    ) == 4
+    ) == 6
     assert count_near_expiry_kline_symbols(
         connection,
         near_expiry_months=2,
-    ) == 6
+    ) == 9
+    assert "DCE.c2603C100" in quote_symbols
+    assert "DCE.c2603C100" in select_quote_symbols(
+        connection,
+        include_futures=False,
+        contract_month_limit=None,
+    )
+
+
+def test_subscription_scope_limits_contract_months() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = InstrumentRepository(connection)
+    for underlying in ("DCE.a2601", "DCE.a2602", "DCE.a2603"):
+        repository.upsert_instruments(
+            normalize_option_chain_discovery(
+                underlying_symbol=underlying,
+                call_symbols=(f"{underlying}C100",),
+                put_symbols=(f"{underlying}P100",),
+                last_seen_at="2026-05-08T00:00:00+00:00",
+            )
+        )
+
+    one_month_quotes = select_quote_symbols(connection, contract_month_limit=1)
+    two_month_klines = select_kline_symbols(connection, contract_month_limit=2)
+    all_quotes = select_quote_symbols(connection, contract_month_limit=None)
+
+    assert one_month_quotes == [
+        "DCE.a2601",
+        "DCE.a2601C100",
+        "DCE.a2601P100",
+    ]
+    assert two_month_klines == [
+        "DCE.a2601",
+        "DCE.a2601C100",
+        "DCE.a2601P100",
+        "DCE.a2602",
+        "DCE.a2602C100",
+        "DCE.a2602P100",
+    ]
+    assert len(all_quotes) == 9
+
+
+def test_subscription_scope_limits_each_product_contract_months() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = InstrumentRepository(connection)
+    for underlying in ("DCE.a2601", "DCE.a2602", "DCE.b2601", "DCE.b2602"):
+        repository.upsert_instruments(
+            normalize_option_chain_discovery(
+                underlying_symbol=underlying,
+                call_symbols=(f"{underlying}C100",),
+                put_symbols=(f"{underlying}P100",),
+                last_seen_at="2026-05-08T00:00:00+00:00",
+            )
+        )
+
+    symbols = select_quote_symbols(connection, contract_month_limit=1)
+
+    assert symbols == [
+        "DCE.a2601",
+        "DCE.a2601C100",
+        "DCE.a2601P100",
+        "DCE.b2601",
+        "DCE.b2601C100",
+        "DCE.b2601P100",
+    ]
+
+
+def test_subscription_scope_skips_contracts_below_min_days_to_expiry() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = InstrumentRepository(connection)
+    for underlying in ("DCE.pt2606", "DCE.pt2608", "DCE.pt2610"):
+        repository.upsert_instruments(
+            normalize_option_chain_discovery(
+                underlying_symbol=underlying,
+                call_symbols=(f"{underlying}C100",),
+                put_symbols=(f"{underlying}P100",),
+                last_seen_at="2026-05-12T00:00:00+08:00",
+            )
+        )
+    today = date.today()
+    for symbol, expiry in (
+        ("DCE.pt2606", today),
+        ("DCE.pt2608", today + timedelta(days=30)),
+        ("DCE.pt2610", today + timedelta(days=90)),
+    ):
+        connection.execute(
+            "UPDATE instruments SET expire_datetime = ? WHERE symbol = ?",
+            (expiry.isoformat(), symbol),
+        )
+    connection.commit()
+
+    symbols = select_quote_symbols(
+        connection,
+        contract_month_limit=2,
+        min_days_to_expiry=1,
+    )
+    all_valid_symbols = select_quote_symbols(
+        connection,
+        contract_month_limit=None,
+        min_days_to_expiry=1,
+    )
+
+    assert symbols == [
+        "DCE.pt2608",
+        "DCE.pt2608C100",
+        "DCE.pt2608P100",
+        "DCE.pt2610",
+        "DCE.pt2610C100",
+        "DCE.pt2610P100",
+    ]
+    assert "DCE.pt2606" not in all_valid_symbols
+    assert "DCE.pt2606C100" not in all_valid_symbols
+
+
+def test_subscription_scope_uses_option_expiry_before_future_delivery() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = InstrumentRepository(connection)
+    for underlying in ("CZCE.FG606", "CZCE.FG607", "CZCE.FG608"):
+        repository.upsert_instruments(
+            normalize_option_chain_discovery(
+                underlying_symbol=underlying,
+                call_symbols=(f"{underlying}C100",),
+                put_symbols=(f"{underlying}P100",),
+                last_seen_at="2026-05-12T00:00:00+08:00",
+            )
+        )
+    today = date.today()
+    for symbol, option_expiry, future_expiry in (
+        ("CZCE.FG606", today, today + timedelta(days=20)),
+        ("CZCE.FG607", today + timedelta(days=30), today + timedelta(days=50)),
+        ("CZCE.FG608", today + timedelta(days=60), today + timedelta(days=80)),
+    ):
+        connection.execute(
+            "UPDATE instruments SET expire_datetime = ? WHERE symbol = ?",
+            (future_expiry.isoformat(), symbol),
+        )
+        connection.execute(
+            """
+            UPDATE instruments
+            SET expire_datetime = ?
+            WHERE underlying_symbol = ? AND option_class IN ('CALL', 'PUT')
+            """,
+            (option_expiry.isoformat(), symbol),
+        )
+    connection.commit()
+
+    symbols = select_quote_symbols(
+        connection,
+        contract_month_limit=2,
+        min_days_to_expiry=1,
+    )
+
+    assert symbols == [
+        "CZCE.FG607",
+        "CZCE.FG607C100",
+        "CZCE.FG607P100",
+        "CZCE.FG608",
+        "CZCE.FG608C100",
+        "CZCE.FG608P100",
+    ]
+
+
+def test_subscription_scope_includes_standalone_futures_by_product() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = InstrumentRepository(connection)
+    repository.upsert_instruments(
+        [
+            InstrumentRecord(
+                symbol="DCE.x2512",
+                exchange_id="DCE",
+                product_id="x",
+                instrument_id="x2512",
+                instrument_name=None,
+                ins_class="FUTURE",
+                underlying_symbol=None,
+                option_class=None,
+                strike_price=None,
+                expire_datetime=None,
+                price_tick=None,
+                volume_multiple=None,
+                expired=False,
+                active=True,
+                inactive_reason=None,
+                last_seen_at="2026-05-08T00:00:00+00:00",
+                raw_payload_json="{}",
+            )
+        ]
+    )
+    repository.upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C100",),
+            put_symbols=("DCE.a2601P100",),
+            last_seen_at="2026-05-08T00:00:00+00:00",
+        )
+    )
+
+    symbols = select_quote_symbols(connection, contract_month_limit=1)
+
+    assert symbols == [
+        "DCE.x2512",
+        "DCE.a2601",
+        "DCE.a2601C100",
+        "DCE.a2601P100",
+    ]
 
 
 def test_stream_quotes_writes_initial_snapshot_only_when_unchanged() -> None:
@@ -161,6 +367,7 @@ def test_stream_quotes_writes_initial_snapshot_only_when_unchanged() -> None:
     assert progress_events[-1]["subscribed_objects"] == 6
     assert progress_events[-1]["total_objects"] == 6
     assert progress_events[-1]["near_expiry_months"] == 2
+    assert progress_events[-1]["contract_months"] == "2"
     assert progress_events[-1]["near_expiry_subscribed"] == 6
     assert progress_events[-1]["near_expiry_total"] == 6
     assert progress_events[-1]["quote_started_at"] is not None

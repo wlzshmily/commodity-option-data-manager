@@ -88,6 +88,12 @@ For local WebUI use, credentials may also be saved through Settings. On WSL/Linu
 
 Set `ODM_SECRET_KEY_FILE` to place that key somewhere else. Keep the key file private and do not commit it.
 
+New Codex sessions can reuse saved WebUI credentials as long as they run as
+the same WSL/Linux user and use the same Fernet key file. A different Linux
+user, a regenerated key file, or a different `ODM_SECRET_KEY_FILE` path cannot
+decrypt existing `fernet:` secrets; in that case re-save the password from the
+WebUI Settings page or point the runtime back to the original key file.
+
 ## Start The WebUI
 
 ```bash
@@ -98,6 +104,35 @@ Open from Windows:
 
 ```text
 http://127.0.0.1:8765/
+```
+
+## Local Server Control
+
+Use the project script for routine WebUI lifecycle operations instead of
+manually starting and killing processes. The script stops realtime Quote and
+metrics workers before restarting the WebUI, which prevents stale worker
+processes from holding the SQLite runtime database.
+
+```bash
+scripts/odm-server.sh status
+scripts/odm-server.sh start
+scripts/odm-server.sh stop
+scripts/odm-server.sh restart
+```
+
+The script honors these environment variables when needed:
+
+```bash
+ODM_WEB_HOST=127.0.0.1
+ODM_WEB_PORT=8765
+ODM_DATABASE_PATH=data/option-data-current.sqlite3
+```
+
+Logs are written under `data/` by default:
+
+```text
+data/webui-8765.out.log
+data/webui-8765.err.log
 ```
 
 ## Verification

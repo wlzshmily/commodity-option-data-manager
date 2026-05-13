@@ -53,6 +53,34 @@ def test_realtime_health_detects_stale_wait_update_after_market_opens() -> None:
     assert health["tone"] == "bad"
 
 
+def test_realtime_health_does_not_alert_before_subscription_setup_finishes() -> None:
+    connection = sqlite3.connect(":memory:")
+    _insert_future_quote(
+        connection,
+        source_datetime="2026-05-11T21:08:00+08:00",
+        received_at="2026-05-11T21:08:05+08:00",
+    )
+
+    health = build_realtime_health(
+        connection,
+        running=True,
+        progress={
+            "status": "running",
+            "active_stage": "kline",
+            "updated_at": "2026-05-11T21:09:55+08:00",
+            "subscribed_objects": 100,
+            "total_objects": 200,
+            "last_wait_update_at": None,
+            "last_quote_write_at": None,
+        },
+        now=datetime.fromisoformat("2026-05-11T21:10:00+08:00"),
+    )
+
+    assert health["status"] == "subscribing"
+    assert health["label"] == "订阅建立中"
+    assert health["tone"] == "warn"
+
+
 def test_realtime_health_stays_quiet_after_close() -> None:
     connection = sqlite3.connect(":memory:")
     _insert_future_quote(

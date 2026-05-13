@@ -11,10 +11,11 @@
 - Release plan: `docs/release/release-plan.md`
 - WSL2 Ubuntu operations: `docs/operations/wsl2-ubuntu.md`
 - Linux server deployment: `docs/operations/linux-server-deployment.md`
+- Local server lifecycle script: `scripts/odm-server.sh`
 
 ## Current Active Plan
 
-Release-readiness pass is complete for the local production release covering five commodity option exchanges, including WebUI/API controls for realtime Quote/Kline stream workers and runtime subscription-object progress.
+Release-readiness pass is complete for the local production release covering five commodity option exchanges, including WebUI/API controls for realtime Quote/Kline stream workers, runtime subscription-object progress, current-realtime-slice display semantics, near-contract remaining-day filtering, enum-driven realtime state, and WEBUI-021 overview lifecycle consistency.
 
 ## Draft Follow-Up Specs
 

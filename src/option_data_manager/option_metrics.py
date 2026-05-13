@@ -33,6 +33,17 @@ OPTION_SOURCE_METRICS_CURRENT_MIGRATION = Migration(
     ),
 )
 
+OPTION_SOURCE_METRICS_READ_MODEL_INDEX_MIGRATION = Migration(
+    401,
+    "add option_source_metrics read model indexes",
+    (
+        """
+        CREATE INDEX IF NOT EXISTS idx_option_source_metrics_received_at
+        ON option_source_metrics_current(received_at)
+        """,
+    ),
+)
+
 
 GREEK_FIELDS = ("delta", "gamma", "theta", "vega", "rho")
 DEFAULT_SOURCE_METHOD = "query_option_greeks+OPTION_IMPV"
@@ -60,7 +71,13 @@ class OptionMetricsRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         connection.row_factory = sqlite3.Row
         self._connection = connection
-        apply_migrations(connection, (OPTION_SOURCE_METRICS_CURRENT_MIGRATION,))
+        apply_migrations(
+            connection,
+            (
+                OPTION_SOURCE_METRICS_CURRENT_MIGRATION,
+                OPTION_SOURCE_METRICS_READ_MODEL_INDEX_MIGRATION,
+            ),
+        )
 
     def upsert_metrics(self, record: OptionMetricsRecord) -> None:
         """Insert or replace the current metrics slice for one option symbol."""

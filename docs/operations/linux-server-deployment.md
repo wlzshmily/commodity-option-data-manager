@@ -363,6 +363,19 @@ After a successful stop, only `odm-webui` should remain:
 ps -eo pid,ppid,user,etime,cmd | grep -E 'quote_stream|metrics_worker|odm-webui' | grep -v grep
 ```
 
+For non-systemd local or WSL runs from the repository checkout, prefer the
+bundled lifecycle script:
+
+```bash
+scripts/odm-server.sh status
+scripts/odm-server.sh restart
+scripts/odm-server.sh stop
+```
+
+It asks the API to stop realtime workers first, writes stale worker stop-files,
+then falls back to terminating `quote_stream`, `metrics_worker`, and `odm-webui`
+processes before starting a clean WebUI process.
+
 Use SSH tunneling for private access without opening a public port:
 
 ```bash

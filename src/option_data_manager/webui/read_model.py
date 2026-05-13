@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time
+from enum import StrEnum
 import re
 import sqlite3
 from typing import Any
@@ -13,8 +14,29 @@ from option_data_manager.collection_state import CollectionStateRepository
 from option_data_manager.instruments import InstrumentRepository
 from option_data_manager.klines import KlineRepository
 from option_data_manager.option_metrics import OptionMetricsRepository
+from option_data_manager.quote_streamer import selected_underlying_contract_symbols
 from option_data_manager.quotes import QuoteRepository
 from option_data_manager.service_state import ServiceLogRepository
+
+
+class SubscriptionLifecycleStatus(StrEnum):
+    """Stable lifecycle states for realtime subscription display."""
+
+    PENDING = "pending"
+    SUBSCRIBING = "subscribing"
+    SUBSCRIBED = "subscribed"
+
+
+@dataclass(frozen=True)
+class _UnderlyingScopeSql:
+    option_filter_sql: str
+    option_params: tuple[Any, ...]
+    instrument_option_filter_sql: str
+    instrument_option_params: tuple[Any, ...]
+    quote_scope_filter_sql: str
+    quote_scope_params: tuple[Any, ...]
+    instrument_quote_scope_filter_sql: str
+    instrument_quote_scope_params: tuple[Any, ...]
 
 
 @dataclass(frozen=True)
@@ -32,11 +54,52 @@ class WebuiReadModel:
         *,
         limit: int = 80,
         prefer_parallel_collection: bool = False,
+        current_quote_after: str | None = None,
+        require_current_quote: bool = False,
+        subscription_scope_enabled: bool = False,
+        subscription_contract_month_limit: int | None = None,
+        subscription_min_days_to_expiry: int = 1,
+        subscription_lifecycle_status: SubscriptionLifecycleStatus | str | None = None,
+        subscription_fast_totals: bool = False,
     ) -> dict[str, Any]:
         """Return acquisition health summarized by underlying contract."""
 
-        rows = _underlying_rows(self.connection, limit=limit)
-        totals = _overview_totals(self.connection)
+        current_unavailable = require_current_quote and not current_quote_after
+        subscription_symbols = (
+            selected_underlying_contract_symbols(
+                self.connection,
+                contract_month_limit=subscription_contract_month_limit,
+                min_days_to_expiry=subscription_min_days_to_expiry,
+            )
+            if subscription_scope_enabled and not current_unavailable
+            else None
+        )
+        rows = (
+            []
+            if current_unavailable
+            else _underlying_rows(
+                self.connection,
+                limit=limit,
+                current_quote_after=current_quote_after,
+                require_current_quote_rows=not subscription_scope_enabled,
+                allowed_underlying_symbols=subscription_symbols,
+                subscription_status_enabled=subscription_scope_enabled,
+                subscription_lifecycle_status=subscription_lifecycle_status,
+            )
+        )
+        totals = (
+            _empty_current_totals(self.connection)
+            if current_unavailable
+            else _subscription_fast_totals(
+                self.connection,
+                allowed_underlying_symbols=subscription_symbols,
+            )
+            if subscription_fast_totals and subscription_symbols is not None
+            else _overview_totals(
+                self.connection,
+                allowed_underlying_symbols=subscription_symbols,
+            )
+        )
         collection = (
             _preferred_collection_progress(self.connection)
             if prefer_parallel_collection
@@ -45,7 +108,9 @@ class WebuiReadModel:
         return {
             "summary": {
                 **totals,
-                "latest_update": _latest_update(self.connection),
+                "latest_update": None
+                if current_unavailable
+                else _latest_update(self.connection),
                 "quote_coverage": _ratio(
                     totals["option_quote_rows"],
                     totals["active_options"],
@@ -62,7 +127,13 @@ class WebuiReadModel:
             },
             "collection": collection,
             "collection_groups": _collection_groups(self.connection),
-            "exchanges": _exchange_rows(self.connection),
+            "exchanges": []
+            if current_unavailable
+            or (subscription_fast_totals and subscription_symbols is not None)
+            else _exchange_rows(
+                self.connection,
+                allowed_underlying_symbols=subscription_symbols,
+            ),
             "underlyings": rows,
         }
 
@@ -71,6 +142,7 @@ class WebuiReadModel:
         *,
         underlying_symbol: str | None = None,
         include_selectors: bool = True,
+        realtime_started_at: str | None = None,
     ) -> dict[str, Any]:
         """Return one underlying option chain aligned by strike price."""
 
@@ -83,8 +155,21 @@ class WebuiReadModel:
                 "atm_strike": None,
                 "maxima": _empty_maxima(),
             }
-        underlying = _underlying_summary(self.connection, selected)
-        option_rows = _option_rows(self.connection, selected)
+        underlying = _underlying_summary(
+            self.connection,
+            selected,
+            realtime_started_at=realtime_started_at,
+        )
+        option_rows = _option_rows(
+            self.connection,
+            selected,
+            realtime_started_at=realtime_started_at,
+        )
+        _apply_realtime_chain_status(
+            underlying,
+            option_rows,
+            realtime_started_at=realtime_started_at,
+        )
         strike_rows = _strike_rows(option_rows)
         atm_strike = _atm_strike(strike_rows, underlying.get("last_price"))
         return {
@@ -138,14 +223,55 @@ def _ensure_tables(connection: sqlite3.Connection) -> None:
     ServiceLogRepository(connection)
 
 
-def _overview_totals(connection: sqlite3.Connection) -> dict[str, int]:
+def _underlying_scope_sql(
+    allowed_underlying_symbols: set[str] | None,
+) -> _UnderlyingScopeSql:
+    symbols = tuple(sorted(allowed_underlying_symbols or ()))
+    if not symbols:
+        return _UnderlyingScopeSql(
+            option_filter_sql="",
+            option_params=(),
+            instrument_option_filter_sql="",
+            instrument_option_params=(),
+            quote_scope_filter_sql="",
+            quote_scope_params=(),
+            instrument_quote_scope_filter_sql="",
+            instrument_quote_scope_params=(),
+        )
+    placeholders = ", ".join("?" for _ in symbols)
+    quote_filter = (
+        f"AND (symbol IN ({placeholders}) OR underlying_symbol IN ({placeholders}))"
+    )
+    instrument_quote_filter = (
+        f"AND (i.symbol IN ({placeholders}) OR i.underlying_symbol IN ({placeholders}))"
+    )
+    return _UnderlyingScopeSql(
+        option_filter_sql=f"AND underlying_symbol IN ({placeholders})",
+        option_params=symbols,
+        instrument_option_filter_sql=f"AND i.underlying_symbol IN ({placeholders})",
+        instrument_option_params=symbols,
+        quote_scope_filter_sql=quote_filter,
+        quote_scope_params=(*symbols, *symbols),
+        instrument_quote_scope_filter_sql=instrument_quote_filter,
+        instrument_quote_scope_params=(*symbols, *symbols),
+    )
+
+
+def _overview_totals(
+    connection: sqlite3.Connection,
+    *,
+    allowed_underlying_symbols: set[str] | None = None,
+) -> dict[str, int]:
+    scope = _underlying_scope_sql(allowed_underlying_symbols)
     active_options = _scalar(
         connection,
-        """
+        f"""
         SELECT COUNT(*)
         FROM instruments
         WHERE active = 1 AND option_class IN ('CALL', 'PUT')
+          {scope.option_filter_sql}
         """,
+        scope.option_params,
     )
     option_quote_rows = _scalar(
         connection,
@@ -154,7 +280,191 @@ def _overview_totals(connection: sqlite3.Connection) -> dict[str, int]:
         FROM instruments i
         JOIN quote_current q ON q.symbol = i.symbol
         WHERE i.active = 1 AND i.option_class IN ('CALL', 'PUT')
+          {scope.instrument_option_filter_sql}
           AND {_quote_has_market_data_sql("q")}
+        """,
+        scope.instrument_option_params,
+    )
+    active_quote_symbols = _scalar(
+        connection,
+        f"""
+        SELECT COUNT(*)
+        FROM instruments
+        WHERE active = 1
+          AND (ins_class = 'FUTURE' OR option_class IN ('CALL', 'PUT'))
+          {scope.quote_scope_filter_sql}
+        """,
+        scope.quote_scope_params,
+    )
+    quote_symbol_rows = _scalar(
+        connection,
+        f"""
+        SELECT COUNT(*)
+        FROM instruments i
+        JOIN quote_current q ON q.symbol = i.symbol
+        WHERE i.active = 1
+          AND (i.ins_class = 'FUTURE' OR i.option_class IN ('CALL', 'PUT'))
+          {scope.instrument_quote_scope_filter_sql}
+        """,
+        scope.instrument_quote_scope_params,
+    )
+    quote_symbol_market_rows = _scalar(
+        connection,
+        f"""
+        SELECT COUNT(*)
+        FROM instruments i
+        JOIN quote_current q ON q.symbol = i.symbol
+        WHERE i.active = 1
+          AND (i.ins_class = 'FUTURE' OR i.option_class IN ('CALL', 'PUT'))
+          {scope.instrument_quote_scope_filter_sql}
+          AND {_quote_has_market_data_sql("q")}
+        """,
+        scope.instrument_quote_scope_params,
+    )
+    option_kline_symbols = _scalar(
+        connection,
+        f"""
+        SELECT COUNT(DISTINCT k.symbol)
+        FROM instruments i
+        JOIN kline_20d_current k ON k.symbol = i.symbol
+        WHERE i.active = 1 AND i.option_class IN ('CALL', 'PUT')
+          {scope.instrument_option_filter_sql}
+        """,
+        scope.instrument_option_params,
+    )
+    rows_with_greeks = _scalar(
+        connection,
+        f"""
+        SELECT COUNT(*)
+        FROM instruments i
+        JOIN option_source_metrics_current m ON m.symbol = i.symbol
+        WHERE i.active = 1
+          AND i.option_class IN ('CALL', 'PUT')
+          {scope.instrument_option_filter_sql}
+          AND (
+            m.delta IS NOT NULL OR m.gamma IS NOT NULL OR m.theta IS NOT NULL
+            OR m.vega IS NOT NULL OR m.rho IS NOT NULL
+          )
+        """,
+        scope.instrument_option_params,
+    )
+    return {
+        "active_underlyings": _scalar(
+            connection,
+            f"""
+            SELECT COUNT(DISTINCT underlying_symbol)
+            FROM instruments
+            WHERE active = 1 AND option_class IN ('CALL', 'PUT')
+              {scope.option_filter_sql}
+            """,
+            scope.option_params,
+        ),
+        "active_options": active_options,
+        "active_quote_symbols": active_quote_symbols,
+        "option_quote_rows": option_quote_rows,
+        "quote_symbol_rows": quote_symbol_rows,
+        "quote_symbol_market_rows": quote_symbol_market_rows,
+        "option_kline_symbols": option_kline_symbols,
+        "metrics_rows": _scalar(
+            connection,
+            f"""
+            SELECT COUNT(*)
+            FROM instruments i
+            JOIN option_source_metrics_current m ON m.symbol = i.symbol
+            WHERE i.active = 1 AND i.option_class IN ('CALL', 'PUT')
+              {scope.instrument_option_filter_sql}
+            """,
+            scope.instrument_option_params,
+        ),
+        "rows_with_greeks": rows_with_greeks,
+        "rows_with_iv": _scalar(
+            connection,
+            f"""
+            SELECT COUNT(*)
+            FROM instruments i
+            JOIN option_source_metrics_current m ON m.symbol = i.symbol
+            WHERE i.active = 1
+              AND i.option_class IN ('CALL', 'PUT')
+              {scope.instrument_option_filter_sql}
+              AND m.iv IS NOT NULL
+            """,
+            scope.instrument_option_params,
+        ),
+        "acquisition_errors": _scalar(connection, "SELECT COUNT(*) FROM acquisition_errors"),
+        "acquisition_runs": _scalar(connection, "SELECT COUNT(*) FROM acquisition_runs"),
+        "latest_quote_update": _latest_quote_update(connection),
+    }
+
+
+def _subscription_fast_totals(
+    connection: sqlite3.Connection,
+    *,
+    allowed_underlying_symbols: set[str],
+) -> dict[str, int]:
+    scope = _underlying_scope_sql(allowed_underlying_symbols)
+    active_options = _scalar(
+        connection,
+        f"""
+        SELECT COUNT(*)
+        FROM instruments
+        WHERE active = 1 AND option_class IN ('CALL', 'PUT')
+          {scope.option_filter_sql}
+        """,
+        scope.option_params,
+    )
+    active_underlyings = _scalar(
+        connection,
+        f"""
+        SELECT COUNT(DISTINCT underlying_symbol)
+        FROM instruments
+        WHERE active = 1 AND option_class IN ('CALL', 'PUT')
+          {scope.option_filter_sql}
+        """,
+        scope.option_params,
+    )
+    active_quote_symbols = _scalar(
+        connection,
+        f"""
+        SELECT COUNT(*)
+        FROM instruments
+        WHERE active = 1
+          AND (ins_class = 'FUTURE' OR option_class IN ('CALL', 'PUT'))
+          {scope.quote_scope_filter_sql}
+        """,
+        scope.quote_scope_params,
+    )
+    return {
+        "active_underlyings": active_underlyings,
+        "active_options": active_options,
+        "active_quote_symbols": active_quote_symbols,
+        "option_quote_rows": 0,
+        "quote_symbol_rows": 0,
+        "quote_symbol_market_rows": 0,
+        "option_kline_symbols": 0,
+        "metrics_rows": 0,
+        "rows_with_greeks": 0,
+        "rows_with_iv": 0,
+        "acquisition_errors": _scalar(connection, "SELECT COUNT(*) FROM acquisition_errors"),
+        "acquisition_runs": _scalar(connection, "SELECT COUNT(*) FROM acquisition_runs"),
+        "latest_quote_update": _latest_quote_update(connection),
+    }
+
+
+def _empty_current_totals(connection: sqlite3.Connection) -> dict[str, int]:
+    active_options = _scalar(
+        connection,
+        """
+        SELECT COUNT(*)
+        FROM instruments
+        WHERE active = 1 AND option_class IN ('CALL', 'PUT')
+        """,
+    )
+    active_underlyings = _scalar(
+        connection,
+        """
+        SELECT COUNT(DISTINCT underlying_symbol)
+        FROM instruments
+        WHERE active = 1 AND option_class IN ('CALL', 'PUT')
         """,
     )
     active_quote_symbols = _scalar(
@@ -166,89 +476,20 @@ def _overview_totals(connection: sqlite3.Connection) -> dict[str, int]:
           AND (ins_class = 'FUTURE' OR option_class IN ('CALL', 'PUT'))
         """,
     )
-    quote_symbol_rows = _scalar(
-        connection,
-        """
-        SELECT COUNT(*)
-        FROM instruments i
-        JOIN quote_current q ON q.symbol = i.symbol
-        WHERE i.active = 1
-          AND (i.ins_class = 'FUTURE' OR i.option_class IN ('CALL', 'PUT'))
-        """,
-    )
-    quote_symbol_market_rows = _scalar(
-        connection,
-        f"""
-        SELECT COUNT(*)
-        FROM instruments i
-        JOIN quote_current q ON q.symbol = i.symbol
-        WHERE i.active = 1
-          AND (i.ins_class = 'FUTURE' OR i.option_class IN ('CALL', 'PUT'))
-          AND {_quote_has_market_data_sql("q")}
-        """,
-    )
-    option_kline_symbols = _scalar(
-        connection,
-        """
-        SELECT COUNT(DISTINCT k.symbol)
-        FROM instruments i
-        JOIN kline_20d_current k ON k.symbol = i.symbol
-        WHERE i.active = 1 AND i.option_class IN ('CALL', 'PUT')
-        """,
-    )
-    rows_with_greeks = _scalar(
-        connection,
-        """
-        SELECT COUNT(*)
-        FROM instruments i
-        JOIN option_source_metrics_current m ON m.symbol = i.symbol
-        WHERE i.active = 1
-          AND i.option_class IN ('CALL', 'PUT')
-          AND (
-            m.delta IS NOT NULL OR m.gamma IS NOT NULL OR m.theta IS NOT NULL
-            OR m.vega IS NOT NULL OR m.rho IS NOT NULL
-          )
-        """,
-    )
     return {
-        "active_underlyings": _scalar(
-            connection,
-            """
-            SELECT COUNT(DISTINCT underlying_symbol)
-            FROM instruments
-            WHERE active = 1 AND option_class IN ('CALL', 'PUT')
-            """,
-        ),
+        "active_underlyings": active_underlyings,
         "active_options": active_options,
         "active_quote_symbols": active_quote_symbols,
-        "option_quote_rows": option_quote_rows,
-        "quote_symbol_rows": quote_symbol_rows,
-        "quote_symbol_market_rows": quote_symbol_market_rows,
-        "option_kline_symbols": option_kline_symbols,
-        "metrics_rows": _scalar(
-            connection,
-            """
-            SELECT COUNT(*)
-            FROM instruments i
-            JOIN option_source_metrics_current m ON m.symbol = i.symbol
-            WHERE i.active = 1 AND i.option_class IN ('CALL', 'PUT')
-            """,
-        ),
-        "rows_with_greeks": rows_with_greeks,
-        "rows_with_iv": _scalar(
-            connection,
-            """
-            SELECT COUNT(*)
-            FROM instruments i
-            JOIN option_source_metrics_current m ON m.symbol = i.symbol
-            WHERE i.active = 1
-              AND i.option_class IN ('CALL', 'PUT')
-              AND m.iv IS NOT NULL
-            """,
-        ),
+        "option_quote_rows": 0,
+        "quote_symbol_rows": 0,
+        "quote_symbol_market_rows": 0,
+        "option_kline_symbols": 0,
+        "metrics_rows": 0,
+        "rows_with_greeks": 0,
+        "rows_with_iv": 0,
         "acquisition_errors": _scalar(connection, "SELECT COUNT(*) FROM acquisition_errors"),
         "acquisition_runs": _scalar(connection, "SELECT COUNT(*) FROM acquisition_runs"),
-        "latest_quote_update": _latest_quote_update(connection),
+        "latest_quote_update": None,
     }
 
 
@@ -446,7 +687,39 @@ def _collection_failures_for_predicate(
     return [_row_dict(row) for row in rows]
 
 
-def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict[str, Any]]:
+def _underlying_rows(
+    connection: sqlite3.Connection,
+    *,
+    limit: int,
+    current_quote_after: str | None = None,
+    require_current_quote_rows: bool = True,
+    allowed_underlying_symbols: set[str] | None = None,
+    subscription_status_enabled: bool = False,
+    subscription_lifecycle_status: SubscriptionLifecycleStatus | str | None = None,
+) -> list[dict[str, Any]]:
+    if allowed_underlying_symbols is not None and not allowed_underlying_symbols:
+        return []
+    allowed_symbols = sorted(allowed_underlying_symbols or [])
+    allowed_placeholders = ", ".join("?" for _ in allowed_symbols)
+    option_underlying_filter = (
+        f"AND o.underlying_symbol IN ({allowed_placeholders})"
+        if allowed_symbols
+        else ""
+    )
+    coverage_underlying_filter = (
+        f"AND i.underlying_symbol IN ({allowed_placeholders})"
+        if allowed_symbols
+        else ""
+    )
+    underlying_quote_filter = (
+        f"WHERE q.symbol IN ({allowed_placeholders})" if allowed_symbols else ""
+    )
+    where_parts: list[str] = []
+    where_params: list[Any] = []
+    if require_current_quote_rows:
+        where_parts.append("(? IS NULL OR COALESCE(c.current_quote_count, 0) > 0)")
+        where_params.append(current_quote_after)
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     rows = connection.execute(
         f"""
         WITH option_counts AS (
@@ -464,6 +737,7 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
             FROM instruments o
             LEFT JOIN quote_current oq ON oq.symbol = o.symbol
             WHERE o.active = 1 AND o.option_class IN ('CALL', 'PUT')
+              {option_underlying_filter}
             GROUP BY o.underlying_symbol, o.exchange_id, o.product_id
         ),
         coverage AS (
@@ -472,28 +746,42 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
                 COUNT(DISTINCT CASE
                     WHEN {_quote_has_market_data_sql("q")} THEN q.symbol
                 END) AS quote_count,
+                COUNT(DISTINCT CASE
+                    WHEN (? IS NULL OR q.received_at >= ?) THEN q.symbol
+                END) AS current_quote_count,
                 COUNT(DISTINCT m.symbol) AS metrics_count,
                 COUNT(DISTINCT CASE WHEN m.iv IS NOT NULL THEN m.symbol END) AS iv_count,
                 COUNT(DISTINCT k.symbol) AS kline_count,
                 MAX(COALESCE(q.received_at, m.received_at, k.received_at)) AS latest_update,
                 MAX(CASE
-                    WHEN {_quote_has_market_data_sql("q")} THEN q.source_datetime
+                    WHEN (? IS NULL OR q.received_at >= ?)
+                     AND {_quote_has_market_data_sql("q")} THEN q.source_datetime
                 END) AS latest_quote_time,
+                MAX(CASE
+                    WHEN (? IS NULL OR q.received_at >= ?) THEN q.received_at
+                END) AS latest_current_quote_received_at,
                 MAX(k.bar_datetime) AS latest_kline_time
             FROM instruments i
             LEFT JOIN quote_current q ON q.symbol = i.symbol
             LEFT JOIN option_source_metrics_current m ON m.symbol = i.symbol
             LEFT JOIN kline_20d_current k ON k.symbol = i.symbol
             WHERE i.active = 1 AND i.option_class IN ('CALL', 'PUT')
+              {coverage_underlying_filter}
             GROUP BY i.underlying_symbol
         ),
         underlying_quote AS (
             SELECT
                 q.symbol,
-                CASE WHEN {_quote_has_market_data_sql("q")} THEN q.source_datetime END AS source_datetime,
-                q.received_at,
+                CASE
+                    WHEN (? IS NULL OR q.received_at >= ?)
+                     AND {_quote_has_market_data_sql("q")} THEN q.source_datetime
+                END AS source_datetime,
+                CASE
+                    WHEN (? IS NULL OR q.received_at >= ?) THEN q.received_at
+                END AS received_at,
                 q.last_price
             FROM quote_current q
+            {underlying_quote_filter}
         )
         SELECT
             oc.underlying_symbol,
@@ -507,13 +795,16 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
             oc.option_count,
             oc.expire_datetime,
             COALESCE(c.quote_count, 0) AS quote_count,
+            COALESCE(c.current_quote_count, 0) AS current_quote_count,
             COALESCE(c.metrics_count, 0) AS metrics_count,
             COALESCE(c.iv_count, 0) AS iv_count,
             COALESCE(c.kline_count, 0) AS kline_count,
             c.latest_update,
             c.latest_quote_time,
+            c.latest_current_quote_received_at,
             c.latest_kline_time,
             uq.source_datetime AS book_time,
+            uq.received_at AS underlying_quote_received_at,
             uq.last_price AS underlying_last,
             future.expire_datetime AS future_expire_datetime,
             future.delivery_year,
@@ -522,20 +813,49 @@ def _underlying_rows(connection: sqlite3.Connection, *, limit: int) -> list[dict
         LEFT JOIN coverage c ON c.underlying_symbol = oc.underlying_symbol
         LEFT JOIN underlying_quote uq ON uq.symbol = oc.underlying_symbol
         LEFT JOIN instruments future ON future.symbol = oc.underlying_symbol
+        {where_sql}
         ORDER BY
-            CASE WHEN COALESCE(c.quote_count, 0) > 0 THEN 0 ELSE 1 END,
-            c.latest_update DESC,
             oc.exchange_id,
             oc.product_id,
+            COALESCE(future.delivery_year, 9999),
+            COALESCE(future.delivery_month, 99),
             oc.underlying_symbol
         LIMIT ?
         """,
-        (limit,),
+        (
+            *allowed_symbols,
+            current_quote_after,
+            current_quote_after,
+            current_quote_after,
+            current_quote_after,
+            current_quote_after,
+            current_quote_after,
+            *allowed_symbols,
+            current_quote_after,
+            current_quote_after,
+            current_quote_after,
+            current_quote_after,
+            *allowed_symbols,
+            *where_params,
+            limit,
+        ),
     ).fetchall()
-    return [_format_underlying_row(row) for row in rows]
+    return [
+        _format_underlying_row(
+            row,
+            subscription_status_enabled=subscription_status_enabled,
+            subscription_lifecycle_status=subscription_lifecycle_status,
+        )
+        for row in rows
+    ]
 
 
-def _format_underlying_row(row: sqlite3.Row) -> dict[str, Any]:
+def _format_underlying_row(
+    row: sqlite3.Row,
+    *,
+    subscription_status_enabled: bool = False,
+    subscription_lifecycle_status: SubscriptionLifecycleStatus | str | None = None,
+) -> dict[str, Any]:
     data = _row_dict(row)
     option_count = int(data["option_count"])
     data["expiry_month"] = _expiry_month(str(data["underlying_symbol"]))
@@ -555,6 +875,10 @@ def _format_underlying_row(row: sqlite3.Row) -> dict[str, Any]:
     )
     data["days_to_expiry"] = data["days_to_option_expire_datetime"]
     data["quote_coverage"] = _ratio(int(data["quote_count"]), option_count)
+    data["current_quote_coverage"] = _ratio(
+        int(data.get("current_quote_count") or 0),
+        option_count,
+    )
     data["metrics_coverage"] = _ratio(int(data["metrics_count"]), option_count)
     data["iv_coverage"] = _ratio(int(data["iv_count"]), option_count)
     data["kline_coverage"] = _ratio(int(data["kline_count"]), option_count)
@@ -563,17 +887,31 @@ def _format_underlying_row(row: sqlite3.Row) -> dict[str, Any]:
         data.get("latest_kline_time"),
         reference_datetime=data.get("display_market_time") or data.get("latest_update"),
     )
-    data["status"] = _status_from_counts(data, option_count)
+    data["status"] = (
+        _subscription_status_from_counts(
+            data,
+            option_count,
+            lifecycle_status=subscription_lifecycle_status,
+        )
+        if subscription_status_enabled
+        else _status_from_counts(data, option_count)
+    )
     return data
 
 
-def _exchange_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+def _exchange_rows(
+    connection: sqlite3.Connection,
+    *,
+    allowed_underlying_symbols: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    scope = _underlying_scope_sql(allowed_underlying_symbols)
     rows = connection.execute(
         f"""
         WITH options AS (
             SELECT *
             FROM instruments
             WHERE active = 1 AND option_class IN ('CALL', 'PUT')
+              {scope.option_filter_sql}
         )
         SELECT
             o.exchange_id,
@@ -588,7 +926,8 @@ def _exchange_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         LEFT JOIN option_source_metrics_current m ON m.symbol = o.symbol
         GROUP BY o.exchange_id
         ORDER BY o.exchange_id
-        """
+        """,
+        scope.option_params,
     ).fetchall()
     return [
         {
@@ -600,7 +939,12 @@ def _exchange_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     ]
 
 
-def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str, Any]:
+def _underlying_summary(
+    connection: sqlite3.Connection,
+    symbol: str,
+    *,
+    realtime_started_at: str | None = None,
+) -> dict[str, Any]:
     row = connection.execute(
         f"""
         SELECT
@@ -625,7 +969,17 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
             q.open_interest,
             k.last_kline_bar_datetime,
             k.last_kline_close_price,
-            k.last_kline_volume
+            k.last_kline_volume,
+            CASE
+                WHEN ? IS NOT NULL AND q.received_at >= ? THEN 1
+                ELSE 0
+            END AS realtime_quote_fresh,
+            CASE
+                WHEN ? IS NOT NULL AND q.received_at >= ? THEN q.source_datetime
+            END AS realtime_source_datetime,
+            CASE
+                WHEN ? IS NOT NULL AND q.received_at >= ? THEN q.received_at
+            END AS realtime_received_at
         FROM instruments i
         LEFT JOIN quote_current q ON q.symbol = i.symbol
         LEFT JOIN (
@@ -653,7 +1007,17 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
         ) k ON k.symbol = i.symbol
         WHERE i.symbol = ?
         """,
-        (symbol, symbol, symbol),
+        (
+            realtime_started_at,
+            realtime_started_at,
+            realtime_started_at,
+            realtime_started_at,
+            realtime_started_at,
+            realtime_started_at,
+            symbol,
+            symbol,
+            symbol,
+        ),
     ).fetchone()
     if row is None:
         return {"symbol": symbol, "missing": True}
@@ -688,7 +1052,12 @@ def _underlying_summary(connection: sqlite3.Connection, symbol: str) -> dict[str
     return data
 
 
-def _option_rows(connection: sqlite3.Connection, underlying_symbol: str) -> list[dict[str, Any]]:
+def _option_rows(
+    connection: sqlite3.Connection,
+    underlying_symbol: str,
+    *,
+    realtime_started_at: str | None = None,
+) -> list[dict[str, Any]]:
     rows = connection.execute(
         f"""
         SELECT
@@ -720,7 +1089,17 @@ def _option_rows(connection: sqlite3.Connection, underlying_symbol: str) -> list
             m.iv,
             m.source_method,
             m.received_at AS metrics_received_at,
-            CASE WHEN k.symbol IS NULL THEN 0 ELSE 1 END AS has_kline
+            CASE WHEN k.symbol IS NULL THEN 0 ELSE 1 END AS has_kline,
+            CASE
+                WHEN ? IS NOT NULL AND q.received_at >= ? THEN 1
+                ELSE 0
+            END AS realtime_quote_fresh,
+            CASE
+                WHEN ? IS NOT NULL AND q.received_at >= ? THEN q.source_datetime
+            END AS realtime_source_datetime,
+            CASE
+                WHEN ? IS NOT NULL AND q.received_at >= ? THEN q.received_at
+            END AS realtime_received_at
         FROM instruments i
         LEFT JOIN quote_current q ON q.symbol = i.symbol
         LEFT JOIN option_source_metrics_current m ON m.symbol = i.symbol
@@ -735,7 +1114,15 @@ def _option_rows(connection: sqlite3.Connection, underlying_symbol: str) -> list
           AND i.option_class IN ('CALL', 'PUT')
         ORDER BY i.strike_price DESC, i.option_class, i.symbol
         """,
-        (underlying_symbol,),
+        (
+            realtime_started_at,
+            realtime_started_at,
+            realtime_started_at,
+            realtime_started_at,
+            realtime_started_at,
+            realtime_started_at,
+            underlying_symbol,
+        ),
     ).fetchall()
     return [_format_option_row(row) for row in rows]
 
@@ -754,6 +1141,39 @@ def _format_option_row(row: sqlite3.Row) -> dict[str, Any]:
         data.get("last_exercise_datetime")
     )
     return data
+
+
+def _apply_realtime_chain_status(
+    underlying: dict[str, Any],
+    option_rows: list[dict[str, Any]],
+    *,
+    realtime_started_at: str | None,
+) -> None:
+    if not realtime_started_at or underlying.get("missing"):
+        underlying["realtime_status"] = "未订阅"
+        underlying["realtime_subscribed"] = False
+        underlying["realtime_started_at"] = realtime_started_at
+        underlying["realtime_latest_quote_received_at"] = None
+        underlying["realtime_latest_source_datetime"] = None
+        return
+
+    fresh_rows: list[dict[str, Any]] = []
+    if underlying.get("realtime_quote_fresh"):
+        fresh_rows.append(underlying)
+    fresh_rows.extend(row for row in option_rows if row.get("realtime_quote_fresh"))
+    latest_received = _max_text(row.get("realtime_received_at") for row in fresh_rows)
+    latest_source = _max_text(row.get("realtime_source_datetime") for row in fresh_rows)
+    is_fresh = latest_received is not None
+    underlying["realtime_status"] = "正常" if is_fresh else "未订阅"
+    underlying["realtime_subscribed"] = is_fresh
+    underlying["realtime_started_at"] = realtime_started_at
+    underlying["realtime_latest_quote_received_at"] = latest_received
+    underlying["realtime_latest_source_datetime"] = latest_source
+
+
+def _max_text(values: Any) -> str | None:
+    texts = [str(value) for value in values if value is not None and str(value)]
+    return max(texts) if texts else None
 
 
 def _quote_has_market_data_sql(alias: str) -> str:
@@ -1018,6 +1438,42 @@ def _status_from_counts(data: dict[str, Any], option_count: int) -> str:
     return "未采集"
 
 
+def _subscription_status_from_counts(
+    data: dict[str, Any],
+    option_count: int,
+    *,
+    lifecycle_status: SubscriptionLifecycleStatus | str | None = None,
+) -> str:
+    if option_count <= 0:
+        return "无合约"
+    lifecycle = _coerce_subscription_lifecycle_status(lifecycle_status)
+    if lifecycle == SubscriptionLifecycleStatus.SUBSCRIBED:
+        return "已订阅"
+    if lifecycle == SubscriptionLifecycleStatus.SUBSCRIBING:
+        return "订阅中"
+    if lifecycle == SubscriptionLifecycleStatus.PENDING:
+        return "待订阅"
+    current_quote_count = int(data.get("current_quote_count") or 0)
+    if current_quote_count >= option_count:
+        return "已订阅"
+    if current_quote_count > 0:
+        return "订阅中"
+    return "待订阅"
+
+
+def _coerce_subscription_lifecycle_status(
+    value: SubscriptionLifecycleStatus | str | None,
+) -> SubscriptionLifecycleStatus | None:
+    if value is None:
+        return None
+    if isinstance(value, SubscriptionLifecycleStatus):
+        return value
+    try:
+        return SubscriptionLifecycleStatus(str(value))
+    except ValueError:
+        return None
+
+
 def _expiry_month(symbol: str) -> str | None:
     instrument_id = symbol.split(".", 1)[-1]
     match = re.search(r"([0-9]{3,4})", instrument_id)
@@ -1035,8 +1491,12 @@ def _ratio(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 4)
 
 
-def _scalar(connection: sqlite3.Connection, sql: str) -> int:
-    row = connection.execute(sql).fetchone()
+def _scalar(
+    connection: sqlite3.Connection,
+    sql: str,
+    params: tuple[Any, ...] = (),
+) -> int:
+    row = connection.execute(sql, params).fetchone()
     return int(row[0] or 0)
 
 

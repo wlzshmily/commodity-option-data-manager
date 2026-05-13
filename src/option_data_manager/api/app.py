@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from enum import StrEnum
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ from option_data_manager.api_keys import ApiKeyRecord, ApiKeyRepository
 from option_data_manager.collection_state import CollectionStateRepository
 from option_data_manager.klines import KlineRepository
 from option_data_manager.option_metrics import OptionMetricsRepository
+from option_data_manager.quote_streamer import expected_subscription_counts
 from option_data_manager.quotes import QuoteRepository
 from option_data_manager.realtime_health import build_realtime_health
 from option_data_manager.settings import (
@@ -34,6 +36,7 @@ from option_data_manager.settings import (
 )
 from option_data_manager.source_quality import SourceQualityRepository
 from option_data_manager.service_state import ServiceLogRepository, ServiceStateRepository
+from option_data_manager.sqlite_runtime import configure_sqlite_runtime
 from option_data_manager.tqsdk_connection import create_tqsdk_api_with_retries
 from option_data_manager.webui.read_model import (
     WebuiReadModel,
@@ -56,6 +59,9 @@ QUOTE_STREAM_MAX_SYMBOLS_KEY = "quote_stream.max_symbols"
 QUOTE_STREAM_KLINE_DATA_LENGTH_KEY = "quote_stream.kline_data_length"
 QUOTE_STREAM_PRIORITIZE_NEAR_EXPIRY_KEY = "quote_stream.prioritize_near_expiry"
 QUOTE_STREAM_NEAR_EXPIRY_MONTHS_KEY = "quote_stream.near_expiry_months"
+QUOTE_STREAM_CONTRACT_MONTHS_KEY = "quote_stream.contract_months"
+QUOTE_STREAM_MIN_DAYS_TO_EXPIRY_KEY = "quote_stream.min_days_to_expiry"
+CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS_KEY = "contract_manager.refresh_interval_seconds"
 METRICS_MIN_INTERVAL_SECONDS_KEY = "metrics.min_interval_seconds"
 METRICS_UNDERLYING_CHAIN_INTERVAL_SECONDS_KEY = "metrics.underlying_chain_interval_seconds"
 DEFAULT_QUOTE_STREAM_WORKERS = "1"
@@ -64,7 +70,19 @@ DEFAULT_QUOTE_STREAM_KLINE_BATCH_SIZE = "1"
 DEFAULT_QUOTE_STREAM_KLINE_DATA_LENGTH = "3"
 DEFAULT_QUOTE_STREAM_PRIORITIZE_NEAR_EXPIRY = "true"
 DEFAULT_QUOTE_STREAM_NEAR_EXPIRY_MONTHS = "2"
+DEFAULT_QUOTE_STREAM_CONTRACT_MONTHS = "2"
+DEFAULT_QUOTE_STREAM_MIN_DAYS_TO_EXPIRY = "1"
+DEFAULT_CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS = "3600"
 DEFAULT_METRICS_MIN_INTERVAL_SECONDS = "30"
+
+
+class QuoteStreamState(StrEnum):
+    """Stable states for the realtime quote-stream lifecycle."""
+
+    BLOCKED = "blocked"
+    STARTING = "starting"
+    RUNNING = "running"
+    STOPPED = "stopped"
 
 
 class TqsdkCredentialUpdate(BaseModel):
@@ -128,12 +146,30 @@ class RefreshResponse(BaseModel):
     message: str
 
 
+class ContractManagerResponse(BaseModel):
+    """Current contract manager status."""
+
+    status: str
+    running: bool
+    healthy: bool
+    refresh_running: bool
+    message: str | None
+    active_option_count: int
+    refresh_interval_seconds: int
+    started_at: str | None = None
+    stopped_at: str | None = None
+    last_heartbeat_at: str | None = None
+    last_success_at: str | None = None
+    last_error_at: str | None = None
+
+
 class QuoteStreamStartRequest(BaseModel):
     """Optional runtime overrides for quote stream workers."""
 
     workers: int | None = None
     quote_shard_size: int | None = None
     kline_batch_size: int | None = None
+    contract_months: str | None = None
     max_symbols: int | None = None
     discover: bool = False
 
@@ -151,6 +187,11 @@ class QuoteStreamResponse(BaseModel):
     finished_at: str | None
     progress: dict[str, Any] | None = None
     health: dict[str, Any] | None = None
+    active_option_count: int | None = None
+    contract_discovery_running: bool = False
+    contract_list_ready: bool = False
+    contract_months: str | None = None
+    min_days_to_expiry: int | None = None
 
 
 def create_app(
@@ -162,8 +203,9 @@ def create_app(
     """Create the unified local API application."""
 
     connection.row_factory = sqlite3.Row
-    _ensure_runtime_tables(connection, protector=protector)
-    settings = SettingsRepository(connection, protector or _default_protector())
+    secret_protector = protector or _default_protector()
+    _ensure_runtime_tables(connection, protector=secret_protector)
+    settings = SettingsRepository(connection, secret_protector)
     api_keys = ApiKeyRepository(connection)
     service_state = ServiceStateRepository(connection)
     service_logs = ServiceLogRepository(connection)
@@ -171,8 +213,27 @@ def create_app(
     refresh_lock = threading.Lock()
     refresh_worker: dict[str, threading.Thread | None] = {"thread": None}
     quote_stream_lock = threading.Lock()
+    contract_manager_lock = threading.Lock()
+    contract_manager_stop_event = threading.Event()
+    settings_write_lock = threading.Lock()
+    quote_stream_start_worker: dict[str, threading.Thread | None] = {"thread": None}
+    contract_manager_worker: dict[str, threading.Thread | None] = {"thread": None}
     quote_stream_processes: dict[str, list[Any]] = {"processes": []}
     metrics_worker_processes: dict[str, list[Any]] = {"processes": []}
+    service_state.set_value("quote_stream.contract_discovery_running", "false")
+    service_state.set_value("quote_stream.contract_list_ready", "false")
+    service_state.set_value("quote_stream.status", QuoteStreamState.BLOCKED.value)
+    service_state.set_value(
+        "quote_stream.message",
+        "合约管理器未运行，实时订阅无法启动。",
+    )
+    if (service_state.get_value("contract_manager.running") or "false") == "true":
+        service_state.set_value("contract_manager.running", "false")
+        service_state.set_value("contract_manager.refresh_running", "false")
+        service_state.set_value(
+            "contract_manager.message",
+            "本地服务重启后，合约管理器未自动接管。",
+        )
     if (service_state.get_value("collection.refresh_running") or "false") == "true":
         service_state.set_value("collection.refresh_running", "false")
         service_state.set_value(
@@ -181,6 +242,7 @@ def create_app(
         )
     if (service_state.get_value("quote_stream.running") or "false") == "true":
         service_state.set_value("quote_stream.running", "false")
+        service_state.set_value("quote_stream.status", QuoteStreamState.STOPPED.value)
         service_state.set_value(
             "quote_stream.message",
             "本地服务重启后，实时订阅 worker 未自动接管。",
@@ -196,6 +258,7 @@ def create_app(
     app.state.service_state = service_state
     app.state.quote_stream_processes = quote_stream_processes
     app.state.metrics_worker_processes = metrics_worker_processes
+    app.state.contract_manager_worker = contract_manager_worker
 
     @app.middleware("http")
     async def record_metrics(request: Request, call_next: Any) -> Any:
@@ -375,6 +438,126 @@ def create_app(
             )
         )
 
+    @app.get("/api/contract-manager", response_model=ContractManagerResponse)
+    def contract_manager_status(
+        _: ApiKeyRecord | None = Depends(require_auth),
+    ) -> ContractManagerResponse:
+        return ContractManagerResponse(
+            **_contract_manager_status(
+                service_state,
+                contract_manager_worker,
+                connection=connection,
+                settings=settings,
+            )
+        )
+
+    @app.post("/api/contract-manager/start", response_model=ContractManagerResponse)
+    def start_contract_manager(
+        _: ApiKeyRecord | None = Depends(require_auth),
+    ) -> ContractManagerResponse:
+        with contract_manager_lock:
+            worker = contract_manager_worker.get("thread")
+            if worker is not None and worker.is_alive():
+                return ContractManagerResponse(
+                    **_contract_manager_status(
+                        service_state,
+                        contract_manager_worker,
+                        connection=connection,
+                        settings=settings,
+                    )
+                )
+            account = settings.get_value(TQSDK_ACCOUNT_KEY)
+            password, password_error = _safe_get_secret(settings, TQSDK_PASSWORD_KEY)
+            if password_error is not None:
+                message = "TQSDK 凭据无法在当前 WSL 用户下读取，请在设置页重新保存密码。"
+                service_state.set_value("contract_manager.message", message)
+                service_state.set_value("contract_manager.running", "false")
+                return ContractManagerResponse(
+                    **_contract_manager_status(
+                        service_state,
+                        contract_manager_worker,
+                        connection=connection,
+                        settings=settings,
+                    )
+                )
+            if not account or not password:
+                message = "TQSDK 凭据尚未配置，无法启动合约管理器。"
+                service_state.set_value("contract_manager.message", message)
+                service_state.set_value("contract_manager.running", "false")
+                return ContractManagerResponse(
+                    **_contract_manager_status(
+                        service_state,
+                        contract_manager_worker,
+                        connection=connection,
+                        settings=settings,
+                    )
+                )
+            refresh_interval_seconds = _positive_int_setting(
+                settings.get_value(CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS_KEY),
+                int(DEFAULT_CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS),
+            )
+            contract_manager_stop_event.clear()
+            service_state.set_value("contract_manager.running", "true")
+            service_state.set_value("contract_manager.refresh_running", "true")
+            service_state.set_value("contract_manager.started_at", datetime.now(UTC).isoformat())
+            service_state.set_value("contract_manager.stopped_at", None)
+            service_state.set_value("contract_manager.message", "合约管理器正在刷新合约列表。")
+            service_state.set_value("quote_stream.contract_list_ready", "false")
+            service_logs.append(
+                level="info",
+                category="contract_manager",
+                message="合约管理器已启动。",
+                context={"refresh_interval_seconds": refresh_interval_seconds},
+            )
+            worker = threading.Thread(
+                target=_run_contract_manager,
+                kwargs={
+                    "connection": connection,
+                    "account": account,
+                    "password": password,
+                    "service_state": service_state,
+                    "service_logs": service_logs,
+                    "stop_event": contract_manager_stop_event,
+                    "refresh_interval_seconds": refresh_interval_seconds,
+                },
+                daemon=True,
+            )
+            contract_manager_worker["thread"] = worker
+            worker.start()
+            return ContractManagerResponse(
+                **_contract_manager_status(
+                    service_state,
+                    contract_manager_worker,
+                    connection=connection,
+                    settings=settings,
+                )
+            )
+
+    @app.post("/api/contract-manager/stop", response_model=ContractManagerResponse)
+    def stop_contract_manager(
+        _: ApiKeyRecord | None = Depends(require_auth),
+    ) -> ContractManagerResponse:
+        with contract_manager_lock:
+            contract_manager_stop_event.set()
+            worker = contract_manager_worker.get("thread")
+            if worker is None or not worker.is_alive():
+                stopped_at = datetime.now(UTC).isoformat()
+                service_state.set_value("contract_manager.running", "false")
+                service_state.set_value("contract_manager.refresh_running", "false")
+                service_state.set_value("contract_manager.stopped_at", stopped_at)
+                service_state.set_value("contract_manager.message", "合约管理器已停止。")
+                service_state.set_value("quote_stream.contract_list_ready", "false")
+            else:
+                service_state.set_value("contract_manager.message", "合约管理器正在停止。")
+            return ContractManagerResponse(
+                **_contract_manager_status(
+                    service_state,
+                    contract_manager_worker,
+                    connection=connection,
+                    settings=settings,
+                )
+            )
+
     @app.post("/api/quote-stream/start", response_model=QuoteStreamResponse)
     def start_quote_stream(
         payload: QuoteStreamStartRequest | None = None,
@@ -382,6 +565,15 @@ def create_app(
     ) -> QuoteStreamResponse:
         request = payload or QuoteStreamStartRequest()
         with quote_stream_lock:
+            starting_worker = quote_stream_start_worker.get("thread")
+            if starting_worker is not None and starting_worker.is_alive():
+                return QuoteStreamResponse(
+                    **_quote_stream_status(
+                        service_state,
+                        quote_stream_processes,
+                        connection=connection,
+                    )
+                )
             status = _quote_stream_status(
                 service_state,
                 quote_stream_processes,
@@ -390,15 +582,36 @@ def create_app(
             if status["running"]:
                 return QuoteStreamResponse(**status)
             account = settings.get_value(TQSDK_ACCOUNT_KEY)
-            password = settings.get_secret(TQSDK_PASSWORD_KEY)
+            password, password_error = _safe_get_secret(settings, TQSDK_PASSWORD_KEY)
+            if password_error is not None:
+                service_state.set_value("quote_stream.status", QuoteStreamState.BLOCKED.value)
+                service_state.set_value("quote_stream.running", "false")
+                service_logs.append(
+                    level="warning",
+                    category="quote_stream",
+                    message="实时订阅启动被阻止：TQSDK 凭据无法读取。",
+                    context={"error_type": type(password_error).__name__},
+                )
+                return QuoteStreamResponse(
+                    status=QuoteStreamState.BLOCKED.value,
+                    running=False,
+                    message="TQSDK 凭据无法在当前 WSL 用户下读取，请在设置页重新保存密码。",
+                    worker_count=0,
+                    pids=[],
+                    report_dir=None,
+                    started_at=None,
+                    finished_at=None,
+                )
             if not account or not password:
+                service_state.set_value("quote_stream.status", QuoteStreamState.BLOCKED.value)
+                service_state.set_value("quote_stream.running", "false")
                 service_logs.append(
                     level="warning",
                     category="quote_stream",
                     message="实时订阅启动被阻止：TQSDK 凭据缺失。",
                 )
                 return QuoteStreamResponse(
-                    status="blocked",
+                    status=QuoteStreamState.BLOCKED.value,
                     running=False,
                     message="TQSDK 凭据尚未配置。",
                     worker_count=0,
@@ -440,6 +653,16 @@ def create_app(
                 settings.get_value(QUOTE_STREAM_NEAR_EXPIRY_MONTHS_KEY),
                 int(DEFAULT_QUOTE_STREAM_NEAR_EXPIRY_MONTHS),
             )
+            contract_months = _contract_months_setting(
+                request.contract_months
+                if request.contract_months is not None
+                else settings.get_value(QUOTE_STREAM_CONTRACT_MONTHS_KEY),
+                DEFAULT_QUOTE_STREAM_CONTRACT_MONTHS,
+            )
+            min_days_to_expiry = _non_negative_int_setting(
+                settings.get_value(QUOTE_STREAM_MIN_DAYS_TO_EXPIRY_KEY),
+                int(DEFAULT_QUOTE_STREAM_MIN_DAYS_TO_EXPIRY),
+            )
             underlying_chain_interval_seconds = _positive_int_setting(
                 settings.get_value(METRICS_UNDERLYING_CHAIN_INTERVAL_SECONDS_KEY),
                 int(DEFAULT_METRICS_MIN_INTERVAL_SECONDS),
@@ -461,93 +684,232 @@ def create_app(
                     status_code=400,
                     detail="max_symbols must be positive when provided.",
                 )
-            universe_ready, universe_message, discovery_ran = (
-                _ensure_quote_stream_universe(
-                    connection,
-                    account=account,
-                    password=password,
-                    force_discovery=request.discover,
-                    service_state=service_state,
-                    service_logs=service_logs,
-                )
+            active_options = _active_option_count(connection)
+            manager_status = _contract_manager_status(
+                service_state,
+                contract_manager_worker,
+                connection=connection,
+                settings=settings,
             )
-            if not universe_ready:
-                return QuoteStreamResponse(
-                    status="blocked",
-                    running=False,
-                    message=universe_message,
-                    worker_count=0,
-                    pids=[],
-                    report_dir=None,
-                    started_at=None,
-                    finished_at=None,
+            if active_options < 1 or not manager_status["healthy"]:
+                message = "合约管理器未正常运行，无法启动实时订阅。请先启动合约管理器并等待合约列表刷新成功。"
+                service_state.set_value("quote_stream.status", QuoteStreamState.BLOCKED.value)
+                service_state.set_value("quote_stream.running", "false")
+                service_state.set_value("quote_stream.message", message)
+                service_state.set_value("quote_stream.pids", "[]")
+                service_logs.append(
+                    level="warning",
+                    category="quote_stream",
+                    message="实时订阅启动被阻止：合约管理器未就绪。",
                 )
+                return QuoteStreamResponse(
+                    status=QuoteStreamState.BLOCKED.value,
+                    running=False,
+                    message=message,
+                    worker_count=worker_count,
+                    pids=[],
+                    report_dir=_safe_get_service_value(service_state, "quote_stream.report_dir"),
+                    started_at=_safe_get_service_value(service_state, "quote_stream.started_at"),
+                    finished_at=_safe_get_service_value(service_state, "quote_stream.finished_at"),
+                    progress=_empty_quote_stream_progress(running=False),
+                    health=build_realtime_health(connection, running=False, progress={}),
+                    active_option_count=active_options,
+                    contract_discovery_running=False,
+                    contract_list_ready=bool(manager_status["healthy"]),
+                )
+            started_at = datetime.now(UTC).isoformat()
             report_dir = Path("docs/qa/live-evidence/quote-stream-runtime")
             report_dir.mkdir(parents=True, exist_ok=True)
-            processes = _start_quote_stream_processes(
-                database_path=database_path or DEFAULT_DATABASE_PATH,
-                report_dir=report_dir,
-                worker_count=worker_count,
-                quote_shard_size=quote_shard_size,
-                kline_batch_size=kline_batch_size,
-                kline_data_length=kline_data_length,
-                prioritize_near_expiry=prioritize_near_expiry,
-                near_expiry_months=near_expiry_months,
-                max_symbols=max_symbols,
-                discover=False,
-                metrics_dirty_min_interval_seconds=metrics_min_interval_seconds,
-                underlying_chain_dirty_interval_seconds=underlying_chain_interval_seconds,
-            )
-            metrics_processes = _start_metrics_worker_processes(
-                database_path=database_path or DEFAULT_DATABASE_PATH,
-                report_dir=report_dir,
-                min_interval_seconds=metrics_min_interval_seconds,
-            )
-            started_at = datetime.now(UTC).isoformat()
-            quote_stream_processes["processes"] = processes
-            metrics_worker_processes["processes"] = metrics_processes
-            service_state.set_value("quote_stream.running", "true")
+            service_state.set_value("quote_stream.status", QuoteStreamState.STARTING.value)
+            service_state.set_value("quote_stream.running", "false")
             service_state.set_value("quote_stream.started_at", started_at)
             service_state.set_value("quote_stream.finished_at", None)
             service_state.set_value("quote_stream.worker_count", str(worker_count))
+            service_state.set_value("quote_stream.contract_months", contract_months)
             service_state.set_value(
-                "quote_stream.pids",
-                json.dumps([int(process.pid) for process in processes]),
+                "quote_stream.min_days_to_expiry",
+                str(min_days_to_expiry),
             )
+            service_state.set_value(
+                "quote_stream.max_symbols",
+                str(max_symbols) if max_symbols is not None else None,
+            )
+            _store_quote_stream_expected_counts(service_state, None)
+            service_state.set_value("quote_stream.pids", "[]")
             service_state.set_value("quote_stream.report_dir", str(report_dir))
-            start_message = (
-                "已初始化合约列表并启动实时订阅 worker。"
-                if discovery_ran
-                else "实时订阅 worker 已启动。"
-            )
-            service_state.set_value("quote_stream.message", start_message)
-            service_state.set_value("metrics_worker.running", "true")
-            service_state.set_value("metrics_worker.started_at", started_at)
-            service_state.set_value("metrics_worker.finished_at", None)
             service_state.set_value(
-                "metrics_worker.pids",
-                json.dumps([int(process.pid) for process in metrics_processes]),
+                "quote_stream.message",
+                "正在启动实时订阅 worker。",
             )
-            service_state.set_value("metrics_worker.report_dir", str(report_dir))
-            service_state.set_value("metrics_worker.message", "指标刷新 worker 已启动。")
             service_logs.append(
                 level="info",
                 category="quote_stream",
-                message=start_message,
+                message="实时订阅后台启动已开始。",
                 context={
                     "worker_count": worker_count,
                     "quote_shard_size": quote_shard_size,
                     "kline_data_length": kline_data_length,
                     "prioritize_near_expiry": prioritize_near_expiry,
                     "near_expiry_months": near_expiry_months,
+                    "contract_months": contract_months,
+                    "min_days_to_expiry": min_days_to_expiry,
                     "max_symbols_configured": max_symbols is not None,
-                    "discover_requested": request.discover,
-                    "discovery_ran": discovery_ran,
+                    "discover_requested": False,
                     "report_dir": str(report_dir),
                     "metrics_min_interval_seconds": metrics_min_interval_seconds,
                     "underlying_chain_interval_seconds": underlying_chain_interval_seconds,
                 },
             )
+            worker = threading.Thread(
+                target=_run_quote_stream_start,
+                kwargs={
+                    "connection": connection,
+                    "account": account,
+                    "password": password,
+                    "force_discovery": False,
+                    "service_state": service_state,
+                    "service_logs": service_logs,
+                    "quote_stream_processes": quote_stream_processes,
+                    "metrics_worker_processes": metrics_worker_processes,
+                    "database_path": database_path or DEFAULT_DATABASE_PATH,
+                    "report_dir": report_dir,
+                    "worker_count": worker_count,
+                    "quote_shard_size": quote_shard_size,
+                    "kline_batch_size": kline_batch_size,
+                    "kline_data_length": kline_data_length,
+                    "prioritize_near_expiry": prioritize_near_expiry,
+                    "near_expiry_months": near_expiry_months,
+                    "contract_months": contract_months,
+                    "min_days_to_expiry": min_days_to_expiry,
+                    "max_symbols": max_symbols,
+                    "metrics_dirty_min_interval_seconds": metrics_min_interval_seconds,
+                    "underlying_chain_dirty_interval_seconds": underlying_chain_interval_seconds,
+                    "quote_stream_lock": quote_stream_lock,
+                },
+                daemon=True,
+            )
+            quote_stream_start_worker["thread"] = worker
+            worker.start()
+            return QuoteStreamResponse(
+                status=QuoteStreamState.STARTING.value,
+                running=False,
+                message="正在启动实时订阅 worker。",
+                worker_count=worker_count,
+                pids=[],
+                report_dir=str(report_dir),
+                started_at=started_at,
+                finished_at=None,
+                progress={
+                    **_empty_quote_stream_progress(running=False),
+                    "status": "starting",
+                    "contract_months": contract_months,
+                    "min_days_to_expiry": min_days_to_expiry,
+                },
+                health=build_realtime_health(connection, running=False, progress={}),
+                active_option_count=active_options,
+                contract_discovery_running=False,
+                contract_list_ready=bool(manager_status["healthy"]),
+                contract_months=contract_months,
+                min_days_to_expiry=min_days_to_expiry,
+            )
+
+    @app.post("/api/quote-stream/discover-contracts", response_model=QuoteStreamResponse)
+    def discover_quote_stream_contracts(
+        _: ApiKeyRecord | None = Depends(require_auth),
+    ) -> QuoteStreamResponse:
+        with contract_manager_lock:
+            manager_worker = contract_manager_worker.get("thread")
+            if manager_worker is not None and manager_worker.is_alive():
+                return QuoteStreamResponse(
+                    **_quote_stream_status(
+                        service_state,
+                        quote_stream_processes,
+                        connection=connection,
+                    )
+                )
+            if _quote_stream_status(
+                service_state,
+                quote_stream_processes,
+                connection=connection,
+            )["running"]:
+                return QuoteStreamResponse(
+                    **_quote_stream_status(
+                        service_state,
+                        quote_stream_processes,
+                        connection=connection,
+                    )
+                )
+            account = settings.get_value(TQSDK_ACCOUNT_KEY)
+            password, password_error = _safe_get_secret(settings, TQSDK_PASSWORD_KEY)
+            if password_error is not None:
+                message = "TQSDK 凭据无法在当前 WSL 用户下读取，请在设置页重新保存密码。"
+                service_state.set_value("contract_manager.message", message)
+                return QuoteStreamResponse(
+                    status=QuoteStreamState.BLOCKED.value,
+                    running=False,
+                    message=message,
+                    worker_count=0,
+                    pids=[],
+                    report_dir=_safe_get_service_value(service_state, "quote_stream.report_dir"),
+                    started_at=_safe_get_service_value(service_state, "quote_stream.started_at"),
+                    finished_at=_safe_get_service_value(service_state, "quote_stream.finished_at"),
+                    progress=_empty_quote_stream_progress(running=False),
+                    health=build_realtime_health(connection, running=False, progress={}),
+                    active_option_count=_active_option_count(connection),
+                    contract_discovery_running=False,
+                )
+            if not account or not password:
+                message = "TQSDK 凭据尚未配置，无法启动合约管理器。"
+                service_state.set_value("contract_manager.message", message)
+                return QuoteStreamResponse(
+                    status=QuoteStreamState.BLOCKED.value,
+                    running=False,
+                    message=message,
+                    worker_count=0,
+                    pids=[],
+                    report_dir=_safe_get_service_value(service_state, "quote_stream.report_dir"),
+                    started_at=_safe_get_service_value(service_state, "quote_stream.started_at"),
+                    finished_at=_safe_get_service_value(service_state, "quote_stream.finished_at"),
+                    progress=_empty_quote_stream_progress(running=False),
+                    health=build_realtime_health(connection, running=False, progress={}),
+                    active_option_count=_active_option_count(connection),
+                    contract_discovery_running=False,
+                )
+            refresh_interval_seconds = _positive_int_setting(
+                settings.get_value(CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS_KEY),
+                int(DEFAULT_CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS),
+            )
+            contract_manager_stop_event.clear()
+            service_state.set_value("contract_manager.running", "true")
+            service_state.set_value("contract_manager.refresh_running", "true")
+            service_state.set_value("contract_manager.started_at", datetime.now(UTC).isoformat())
+            service_state.set_value("contract_manager.stopped_at", None)
+            service_state.set_value("contract_manager.message", "合约管理器正在刷新合约列表。")
+            service_state.set_value("quote_stream.contract_discovery_running", "true")
+            service_state.set_value("quote_stream.contract_list_ready", "false")
+            service_state.set_value("quote_stream.running", "false")
+            service_state.set_value("quote_stream.status", QuoteStreamState.STOPPED.value)
+            service_state.set_value("quote_stream.message", "合约管理器正在刷新合约列表。")
+            service_logs.append(
+                level="info",
+                category="contract_manager",
+                message="合约管理器已启动。",
+            )
+            worker = threading.Thread(
+                target=_run_contract_manager,
+                kwargs={
+                    "connection": connection,
+                    "account": account,
+                    "password": password,
+                    "service_state": service_state,
+                    "service_logs": service_logs,
+                    "stop_event": contract_manager_stop_event,
+                    "refresh_interval_seconds": refresh_interval_seconds,
+                },
+                daemon=True,
+            )
+            contract_manager_worker["thread"] = worker
+            worker.start()
             return QuoteStreamResponse(
                 **_quote_stream_status(
                     service_state,
@@ -610,6 +972,11 @@ def create_app(
             quote_stream_processes["processes"] = []
             metrics_worker_processes["processes"] = []
             _safe_set_service_value(service_state, "quote_stream.running", "false")
+            _safe_set_service_value(
+                service_state,
+                "quote_stream.status",
+                QuoteStreamState.STOPPED.value,
+            )
             _safe_set_service_value(service_state, "quote_stream.finished_at", finished_at)
             _safe_set_service_value(service_state, "quote_stream.pids", "[]")
             _safe_set_service_value(service_state, "metrics_worker.running", "false")
@@ -764,10 +1131,11 @@ def create_app(
     @app.get("/api/settings")
     def get_settings(_: ApiKeyRecord | None = Depends(require_auth)) -> dict[str, Any]:
         account = settings.get_value(TQSDK_ACCOUNT_KEY)
+        password, password_error = _safe_get_secret(settings, TQSDK_PASSWORD_KEY)
         return {
             "tqsdk": {
                 "account": account,
-                "password_configured": settings.get_secret(TQSDK_PASSWORD_KEY) is not None,
+                "password_configured": password is not None,
             },
             "api": {
                 "bind": settings.get_value(API_BIND_KEY) or "127.0.0.1",
@@ -787,6 +1155,18 @@ def create_app(
                 "kline_backfill": (settings.get_value("collection.kline_backfill") or "true") == "true",
                 "inactive_handling": settings.get_value("collection.inactive_handling") or "mark_inactive",
                 "sqlite_path": database_path or DEFAULT_DATABASE_PATH,
+            },
+            "contract_manager": {
+                "refresh_interval_seconds": _positive_int_setting(
+                    settings.get_value(CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS_KEY),
+                    int(DEFAULT_CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS),
+                ),
+                "status": _contract_manager_status(
+                    service_state,
+                    contract_manager_worker,
+                    connection=connection,
+                    settings=settings,
+                ),
             },
             "quote_stream": {
                 "workers": _positive_int_setting(
@@ -815,6 +1195,14 @@ def create_app(
                 "near_expiry_months": _positive_int_setting(
                     settings.get_value(QUOTE_STREAM_NEAR_EXPIRY_MONTHS_KEY),
                     int(DEFAULT_QUOTE_STREAM_NEAR_EXPIRY_MONTHS),
+                ),
+                "contract_months": _contract_months_setting(
+                    settings.get_value(QUOTE_STREAM_CONTRACT_MONTHS_KEY),
+                    DEFAULT_QUOTE_STREAM_CONTRACT_MONTHS,
+                ),
+                "min_days_to_expiry": _non_negative_int_setting(
+                    settings.get_value(QUOTE_STREAM_MIN_DAYS_TO_EXPIRY_KEY),
+                    int(DEFAULT_QUOTE_STREAM_MIN_DAYS_TO_EXPIRY),
                 ),
                 "status": _quote_stream_status(
                     service_state,
@@ -845,9 +1233,20 @@ def create_app(
             raise HTTPException(status_code=400, detail="TQSDK account must not be empty.")
         if not payload.password:
             raise HTTPException(status_code=400, detail="TQSDK password must not be empty.")
-        settings.set_value(TQSDK_ACCOUNT_KEY, account)
-        settings.set_secret(TQSDK_PASSWORD_KEY, payload.password)
-        service_logs.append(
+        with settings_write_lock:
+            writer, writer_connection = _settings_writer(
+                settings,
+                database_path=database_path,
+                protector=secret_protector,
+            )
+            try:
+                writer.set_value(TQSDK_ACCOUNT_KEY, account)
+                writer.set_secret(TQSDK_PASSWORD_KEY, payload.password)
+            finally:
+                if writer_connection is not None:
+                    writer_connection.close()
+        _safe_append_service_log(
+            service_logs,
             level="info",
             category="settings",
             message="TQSDK credentials updated.",
@@ -858,7 +1257,18 @@ def create_app(
     @app.post("/api/settings/test-tqsdk-connection")
     def test_tqsdk_connection(_: ApiKeyRecord | None = Depends(require_auth)) -> dict[str, Any]:
         account = settings.get_value(TQSDK_ACCOUNT_KEY)
-        password = settings.get_secret(TQSDK_PASSWORD_KEY)
+        password, password_error = _safe_get_secret(settings, TQSDK_PASSWORD_KEY)
+        if password_error is not None:
+            service_logs.append(
+                level="warning",
+                category="settings",
+                message="TQSDK connection test blocked because credentials cannot be read.",
+                context={"error_type": type(password_error).__name__},
+            )
+            return {
+                "status": "blocked",
+                "message": "TQSDK credentials cannot be read in this WSL runtime; please save the password again.",
+            }
         if not account or not password:
             service_logs.append(
                 level="warning",
@@ -905,8 +1315,19 @@ def create_app(
     ) -> dict[str, Any]:
         if key in {TQSDK_PASSWORD_KEY, "password", "secret"}:
             raise HTTPException(status_code=400, detail="Use the credential endpoint for secrets.")
-        settings.set_value(key, payload.value)
-        service_logs.append(
+        with settings_write_lock:
+            writer, writer_connection = _settings_writer(
+                settings,
+                database_path=database_path,
+                protector=secret_protector,
+            )
+            try:
+                writer.set_value(key, payload.value)
+            finally:
+                if writer_connection is not None:
+                    writer_connection.close()
+        _safe_append_service_log(
+            service_logs,
             level="info",
             category="settings",
             message="Runtime setting updated.",
@@ -986,6 +1407,7 @@ def create_app_from_database() -> FastAPI:
     database_path = os.environ.get("ODM_DATABASE_PATH", DEFAULT_DATABASE_PATH)
     Path(database_path).parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path, check_same_thread=False)
+    configure_sqlite_runtime(connection, enable_wal=True)
     return create_app(connection, database_path=database_path)
 
 
@@ -994,6 +1416,7 @@ def main() -> None:
 
     database_path = os.environ.get("ODM_DATABASE_PATH", DEFAULT_DATABASE_PATH)
     connection = sqlite3.connect(database_path)
+    configure_sqlite_runtime(connection)
     settings = SettingsRepository(connection, _default_protector())
     host = os.environ.get("ODM_API_HOST", settings.get_value(API_BIND_KEY) or "127.0.0.1")
     port = int(os.environ.get("ODM_API_PORT", settings.get_value(API_PORT_KEY) or "8770"))
@@ -1047,6 +1470,29 @@ def _api_key_response(record: ApiKeyRecord) -> ApiKeyResponse:
     return ApiKeyResponse(**record.__dict__)
 
 
+def _safe_get_secret(
+    settings: SettingsRepository,
+    key: str,
+) -> tuple[str | None, Exception | None]:
+    try:
+        return (settings.get_secret(key), None)
+    except (ValueError, OSError) as exc:
+        return (None, exc)
+
+
+def _settings_writer(
+    fallback_settings: SettingsRepository,
+    *,
+    database_path: str | None,
+    protector: Any,
+) -> tuple[SettingsRepository, sqlite3.Connection | None]:
+    if not database_path or database_path == ":memory:":
+        return (fallback_settings, None)
+    connection = sqlite3.connect(database_path, timeout=30)
+    configure_sqlite_runtime(connection)
+    return (SettingsRepository(connection, protector), connection)
+
+
 def _collection_args(
     *,
     database_path: str,
@@ -1077,10 +1523,23 @@ def _ensure_quote_stream_universe(
     force_discovery: bool,
     service_state: ServiceStateRepository,
     service_logs: ServiceLogRepository,
+    log_category: str = "quote_stream",
+    update_quote_stream_message: bool = True,
 ) -> tuple[bool, str, bool]:
     """Ensure realtime subscriptions have an active contract universe."""
 
     existing_active_options = _active_option_count(connection)
+    if existing_active_options > 0 and not force_discovery:
+        message = f"使用已有合约列表启动实时订阅，当前 {existing_active_options} 个可订阅期权合约。"
+        if update_quote_stream_message:
+            service_state.set_value("quote_stream.message", message)
+        service_logs.append(
+            level="info",
+            category=log_category,
+            message="实时订阅使用已有合约列表启动。",
+            context={"active_options": existing_active_options},
+        )
+        return (True, message, False)
     reason = (
         "手动刷新合约列表"
         if force_discovery
@@ -1088,10 +1547,11 @@ def _ensure_quote_stream_universe(
         if existing_active_options > 0
         else "首次启动前初始化合约列表"
     )
-    service_state.set_value("quote_stream.message", f"实时订阅启动前正在{reason}。")
+    if update_quote_stream_message:
+        service_state.set_value("quote_stream.message", f"实时订阅启动前正在{reason}。")
     service_logs.append(
         level="info",
-        category="quote_stream",
+        category=log_category,
         message="实时订阅启动前初始化合约列表。",
         context={"force_discovery": force_discovery},
     )
@@ -1101,10 +1561,11 @@ def _ensure_quote_stream_universe(
         discovery = _discover_and_persist_market(api, connection)
     except Exception as exc:
         message = f"实时订阅启动前合约初始化失败：{type(exc).__name__}: {exc}"
-        service_state.set_value("quote_stream.message", message)
+        if update_quote_stream_message:
+            service_state.set_value("quote_stream.message", message)
         service_logs.append(
             level="error",
-            category="quote_stream",
+            category=log_category,
             message="实时订阅启动前合约初始化失败。",
             context={"error_type": type(exc).__name__},
         )
@@ -1117,10 +1578,11 @@ def _ensure_quote_stream_universe(
     active_options = _active_option_count(connection)
     if active_options < 1:
         message = "实时订阅启动前未发现可订阅期权合约，请检查 TQSDK 合约查询权限或交易所数据。"
-        service_state.set_value("quote_stream.message", message)
+        if update_quote_stream_message:
+            service_state.set_value("quote_stream.message", message)
         service_logs.append(
             level="warning",
-            category="quote_stream",
+            category=log_category,
             message="实时订阅启动前未发现可订阅期权合约。",
             context={
                 "discovery_returned": discovery is not None,
@@ -1132,7 +1594,7 @@ def _ensure_quote_stream_universe(
         return (False, message, True)
     service_logs.append(
         level="info",
-        category="quote_stream",
+        category=log_category,
         message="实时订阅启动前合约列表初始化完成。",
         context={
             "active_options": active_options,
@@ -1145,6 +1607,255 @@ def _ensure_quote_stream_universe(
         },
     )
     return (True, f"已初始化 {active_options} 个可订阅期权合约。", True)
+
+
+def _run_quote_stream_start(
+    *,
+    connection: sqlite3.Connection,
+    account: str,
+    password: str,
+    force_discovery: bool,
+    service_state: ServiceStateRepository,
+    service_logs: ServiceLogRepository,
+    quote_stream_processes: dict[str, list[Any]],
+    metrics_worker_processes: dict[str, list[Any]],
+    database_path: str,
+    report_dir: Path,
+    worker_count: int,
+    quote_shard_size: int,
+    kline_batch_size: int,
+    kline_data_length: int,
+    prioritize_near_expiry: bool,
+    near_expiry_months: int,
+    contract_months: str,
+    min_days_to_expiry: int,
+    max_symbols: int | None,
+    metrics_dirty_min_interval_seconds: int,
+    underlying_chain_dirty_interval_seconds: int,
+    quote_stream_lock: threading.Lock,
+) -> None:
+    try:
+        universe_ready, universe_message, discovery_ran = _ensure_quote_stream_universe(
+            connection,
+            account=account,
+            password=password,
+            force_discovery=force_discovery,
+            service_state=service_state,
+            service_logs=service_logs,
+        )
+        if not universe_ready:
+            with quote_stream_lock:
+                _store_quote_stream_expected_counts(service_state, None)
+                _safe_set_service_value(
+                    service_state,
+                    "quote_stream.status",
+                    QuoteStreamState.BLOCKED.value,
+                )
+                _safe_set_service_value(service_state, "quote_stream.running", "false")
+                _safe_set_service_value(
+                    service_state,
+                    "quote_stream.finished_at",
+                    datetime.now(UTC).isoformat(),
+                )
+                _safe_set_service_value(service_state, "quote_stream.message", universe_message)
+                _safe_set_service_value(service_state, "quote_stream.pids", "[]")
+            return
+        processes = _start_quote_stream_processes(
+            database_path=database_path,
+            report_dir=report_dir,
+            worker_count=worker_count,
+            quote_shard_size=quote_shard_size,
+            kline_batch_size=kline_batch_size,
+            kline_data_length=kline_data_length,
+            prioritize_near_expiry=prioritize_near_expiry,
+            near_expiry_months=near_expiry_months,
+            contract_months=contract_months,
+            min_days_to_expiry=min_days_to_expiry,
+            max_symbols=max_symbols,
+            discover=False,
+            metrics_dirty_min_interval_seconds=metrics_dirty_min_interval_seconds,
+            underlying_chain_dirty_interval_seconds=underlying_chain_dirty_interval_seconds,
+        )
+        metrics_processes = _start_metrics_worker_processes(
+            database_path=database_path,
+            report_dir=report_dir,
+            min_interval_seconds=metrics_dirty_min_interval_seconds,
+        )
+    except Exception as exc:
+        message = f"实时订阅后台启动失败：{type(exc).__name__}: {exc}"
+        with quote_stream_lock:
+            _store_quote_stream_expected_counts(service_state, None)
+            _safe_set_service_value(
+                service_state,
+                "quote_stream.status",
+                QuoteStreamState.BLOCKED.value,
+            )
+            _safe_set_service_value(service_state, "quote_stream.running", "false")
+            _safe_set_service_value(
+                service_state,
+                "quote_stream.finished_at",
+                datetime.now(UTC).isoformat(),
+            )
+            _safe_set_service_value(service_state, "quote_stream.message", message)
+            _safe_set_service_value(service_state, "quote_stream.pids", "[]")
+        _safe_append_service_log(
+            service_logs,
+            level="error",
+            category="quote_stream",
+            message="实时订阅后台启动失败。",
+            context={"error_type": type(exc).__name__},
+        )
+        return
+    started_at = datetime.now(UTC).isoformat()
+    start_message = (
+        "已初始化合约列表并启动实时订阅 worker。"
+        if discovery_ran
+        else "实时订阅 worker 已启动。"
+    )
+    with quote_stream_lock:
+        quote_stream_processes["processes"] = processes
+        metrics_worker_processes["processes"] = metrics_processes
+        _safe_set_service_value(
+            service_state,
+            "quote_stream.status",
+            QuoteStreamState.RUNNING.value,
+        )
+        _safe_set_service_value(service_state, "quote_stream.running", "true")
+        _safe_set_service_value(service_state, "quote_stream.started_at", started_at)
+        _safe_set_service_value(service_state, "quote_stream.finished_at", None)
+        _safe_set_service_value(service_state, "quote_stream.worker_count", str(worker_count))
+        _safe_set_service_value(service_state, "quote_stream.contract_months", contract_months)
+        _safe_set_service_value(
+            service_state,
+            "quote_stream.min_days_to_expiry",
+            str(min_days_to_expiry),
+        )
+        _safe_set_service_value(
+            service_state,
+            "quote_stream.max_symbols",
+            str(max_symbols) if max_symbols is not None else None,
+        )
+        _safe_set_service_value(
+            service_state,
+            "quote_stream.pids",
+            json.dumps([int(process.pid) for process in processes]),
+        )
+        _safe_set_service_value(service_state, "quote_stream.report_dir", str(report_dir))
+        _safe_set_service_value(service_state, "quote_stream.message", start_message)
+        _safe_set_service_value(service_state, "metrics_worker.running", "true")
+        _safe_set_service_value(service_state, "metrics_worker.started_at", started_at)
+        _safe_set_service_value(service_state, "metrics_worker.finished_at", None)
+        _safe_set_service_value(
+            service_state,
+            "metrics_worker.pids",
+            json.dumps([int(process.pid) for process in metrics_processes]),
+        )
+        _safe_set_service_value(service_state, "metrics_worker.report_dir", str(report_dir))
+        _safe_set_service_value(service_state, "metrics_worker.message", "指标刷新 worker 已启动。")
+    _safe_append_service_log(
+        service_logs,
+        level="info",
+        category="quote_stream",
+        message=start_message,
+        context={
+            "worker_count": worker_count,
+            "quote_shard_size": quote_shard_size,
+            "kline_data_length": kline_data_length,
+            "prioritize_near_expiry": prioritize_near_expiry,
+            "near_expiry_months": near_expiry_months,
+            "contract_months": contract_months,
+            "min_days_to_expiry": min_days_to_expiry,
+            "max_symbols_configured": max_symbols is not None,
+            "discover_requested": force_discovery,
+            "discovery_ran": discovery_ran,
+            "report_dir": str(report_dir),
+            "metrics_min_interval_seconds": metrics_dirty_min_interval_seconds,
+            "underlying_chain_interval_seconds": underlying_chain_dirty_interval_seconds,
+        },
+    )
+
+
+def _run_contract_manager(
+    *,
+    connection: sqlite3.Connection,
+    account: str,
+    password: str,
+    service_state: ServiceStateRepository,
+    service_logs: ServiceLogRepository,
+    stop_event: threading.Event,
+    refresh_interval_seconds: int,
+) -> None:
+    while not stop_event.is_set():
+        now = datetime.now(UTC).isoformat()
+        service_state.set_value("contract_manager.running", "true")
+        service_state.set_value("contract_manager.refresh_running", "true")
+        service_state.set_value("contract_manager.last_heartbeat_at", now)
+        service_state.set_value("contract_manager.message", "合约管理器正在刷新合约列表。")
+        service_state.set_value("quote_stream.contract_discovery_running", "true")
+        try:
+            universe_ready, universe_message, _discovery_ran = _ensure_quote_stream_universe(
+                connection,
+                account=account,
+                password=password,
+                force_discovery=True,
+                service_state=service_state,
+                service_logs=service_logs,
+                log_category="contract_manager",
+                update_quote_stream_message=False,
+            )
+            active_options = _active_option_count(connection)
+            success = universe_ready and active_options > 0
+            message = (
+                f"合约管理器正常运行，当前 {active_options} 个可订阅期权合约。"
+                if success
+                else universe_message
+            )
+            finished_at = datetime.now(UTC).isoformat()
+            service_state.set_value("contract_manager.refresh_running", "false")
+            service_state.set_value("contract_manager.last_heartbeat_at", finished_at)
+            service_state.set_value("contract_manager.message", message)
+            service_state.set_value("quote_stream.contract_discovery_running", "false")
+            service_state.set_value("quote_stream.contract_list_ready", "true" if success else "false")
+            service_state.set_value("quote_stream.message", message)
+            service_state.set_value(
+                "quote_stream.contract_list_ready_at",
+                finished_at if success else None,
+            )
+            if success:
+                service_state.set_value("contract_manager.last_success_at", finished_at)
+            else:
+                service_state.set_value("contract_manager.last_error_at", finished_at)
+            service_logs.append(
+                level="info" if success else "warning",
+                category="contract_manager",
+                message="合约管理器刷新完成。" if success else "合约管理器刷新未完成。",
+                context={"active_options": active_options},
+            )
+        except Exception as exc:
+            failed_at = datetime.now(UTC).isoformat()
+            message = f"合约管理器刷新失败：{type(exc).__name__}: {exc}"
+            service_state.set_value("contract_manager.refresh_running", "false")
+            service_state.set_value("contract_manager.last_heartbeat_at", failed_at)
+            service_state.set_value("contract_manager.last_error_at", failed_at)
+            service_state.set_value("contract_manager.message", message)
+            service_state.set_value("quote_stream.contract_discovery_running", "false")
+            service_state.set_value("quote_stream.contract_list_ready", "false")
+            service_state.set_value("quote_stream.message", message)
+            service_logs.append(
+                level="error",
+                category="contract_manager",
+                message="合约管理器刷新失败。",
+                context={"error_type": type(exc).__name__},
+            )
+        if stop_event.wait(max(1, refresh_interval_seconds)):
+            break
+    stopped_at = datetime.now(UTC).isoformat()
+    service_state.set_value("contract_manager.running", "false")
+    service_state.set_value("contract_manager.refresh_running", "false")
+    service_state.set_value("contract_manager.stopped_at", stopped_at)
+    service_state.set_value("contract_manager.message", "合约管理器已停止。")
+    service_state.set_value("quote_stream.contract_discovery_running", "false")
+    service_state.set_value("quote_stream.contract_list_ready", "false")
 
 
 def _active_option_count(connection: sqlite3.Connection) -> int:
@@ -1174,6 +1885,8 @@ def _start_quote_stream_processes(
     kline_data_length: int,
     prioritize_near_expiry: bool,
     near_expiry_months: int,
+    contract_months: str,
+    min_days_to_expiry: int,
     max_symbols: int | None,
     discover: bool,
     metrics_dirty_min_interval_seconds: int,
@@ -1210,6 +1923,10 @@ def _start_quote_stream_processes(
             str(kline_data_length),
             "--near-expiry-months",
             str(near_expiry_months),
+            "--contract-months",
+            contract_months,
+            "--min-days-to-expiry",
+            str(min_days_to_expiry),
             "--metrics-dirty-min-interval-seconds",
             str(metrics_dirty_min_interval_seconds),
             "--underlying-chain-dirty-interval-seconds",
@@ -1295,6 +2012,62 @@ def _request_quote_stream_stop_files(service_state: ServiceStateRepository) -> N
         path.write_text("stop requested\n", encoding="utf-8")
 
 
+def _contract_manager_status(
+    service_state: ServiceStateRepository,
+    worker_ref: dict[str, threading.Thread | None],
+    *,
+    connection: sqlite3.Connection | None,
+    settings: SettingsRepository,
+) -> dict[str, Any]:
+    thread = worker_ref.get("thread")
+    thread_alive = thread is not None and thread.is_alive()
+    persisted_running = _bool_service_state(service_state, "contract_manager.running")
+    if persisted_running and not thread_alive:
+        _safe_set_service_value(service_state, "contract_manager.running", "false")
+        _safe_set_service_value(service_state, "contract_manager.refresh_running", "false")
+        _safe_set_service_value(
+            service_state,
+            "contract_manager.message",
+            "本地服务重启后，合约管理器未自动接管。",
+        )
+        persisted_running = False
+    running = bool(thread_alive and persisted_running)
+    refresh_running = running and _bool_service_state(
+        service_state,
+        "contract_manager.refresh_running",
+    )
+    active_option_count = _active_option_count(connection) if connection is not None else 0
+    last_success_at = _safe_get_service_value(service_state, "contract_manager.last_success_at")
+    healthy = bool(running and active_option_count > 0 and last_success_at)
+    status = (
+        "refreshing"
+        if refresh_running
+        else "running"
+        if healthy
+        else "starting"
+        if running
+        else "stopped"
+    )
+    return {
+        "status": status,
+        "running": running,
+        "healthy": healthy,
+        "refresh_running": refresh_running,
+        "message": _safe_get_service_value(service_state, "contract_manager.message")
+        or ("合约管理器正常运行。" if running else "合约管理器未运行。"),
+        "active_option_count": active_option_count,
+        "refresh_interval_seconds": _positive_int_setting(
+            settings.get_value(CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS_KEY),
+            int(DEFAULT_CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS),
+        ),
+        "started_at": _safe_get_service_value(service_state, "contract_manager.started_at"),
+        "stopped_at": _safe_get_service_value(service_state, "contract_manager.stopped_at"),
+        "last_heartbeat_at": _safe_get_service_value(service_state, "contract_manager.last_heartbeat_at"),
+        "last_success_at": last_success_at,
+        "last_error_at": _safe_get_service_value(service_state, "contract_manager.last_error_at"),
+    }
+
+
 def _quote_stream_status(
     service_state: ServiceStateRepository,
     process_table: dict[str, list[Any]],
@@ -1311,9 +2084,15 @@ def _quote_stream_status(
     ]
     live_pids = attached_pids or live_persisted_pids
     running = bool(live_pids)
+    stored_status = _quote_stream_state(service_state)
     persisted_running = _safe_get_service_value(service_state, "quote_stream.running")
     if running:
         if (persisted_running or "false") != "true":
+            _safe_set_service_value(
+                service_state,
+                "quote_stream.status",
+                QuoteStreamState.RUNNING.value,
+            )
             _safe_set_service_value(service_state, "quote_stream.running", "true")
             _safe_set_service_value(
                 service_state,
@@ -1322,6 +2101,12 @@ def _quote_stream_status(
             )
     elif processes or (persisted_running or "false") == "true":
         process_table["processes"] = []
+        stored_status = QuoteStreamState.STOPPED
+        _safe_set_service_value(
+            service_state,
+            "quote_stream.status",
+            QuoteStreamState.STOPPED.value,
+        )
         _safe_set_service_value(service_state, "quote_stream.running", "false")
         _safe_set_service_value(
             service_state,
@@ -1333,24 +2118,55 @@ def _quote_stream_status(
             "quote_stream.message",
             "实时订阅 worker 已退出。",
         )
+    elif stored_status == QuoteStreamState.RUNNING:
+        stored_status = QuoteStreamState.STOPPED
+        _safe_set_service_value(
+            service_state,
+            "quote_stream.status",
+            QuoteStreamState.STOPPED.value,
+        )
     worker_count = _int_or_none(
         _safe_get_service_value(service_state, "quote_stream.worker_count")
     ) or (
         len(live_pids) if live_pids else len(persisted_pids)
     )
-    status = "running" if running else "stopped"
+    status = QuoteStreamState.RUNNING if running else stored_status
     report_dir = _safe_get_service_value(service_state, "quote_stream.report_dir")
     progress = _quote_stream_progress(
         report_dir,
         running=running,
     )
+    contract_months = _safe_get_service_value(
+        service_state,
+        "quote_stream.contract_months",
+    )
+    min_days_to_expiry = _int_or_none(
+        _safe_get_service_value(service_state, "quote_stream.min_days_to_expiry")
+    )
+    if (
+        (running or status == QuoteStreamState.STARTING)
+        and int(progress.get("worker_reports") or 0) == 0
+    ):
+        progress = _progress_with_cached_expected_counts(
+            progress,
+            service_state=service_state,
+        )
     health = build_realtime_health(
         connection,
         running=running,
         progress=progress,
     )
+    active_option_count = _active_option_count(connection) if connection is not None else None
+    contract_discovery_running = (
+        _safe_get_service_value(service_state, "quote_stream.contract_discovery_running")
+        or "false"
+    ) == "true"
+    contract_list_ready = _bool_service_state(
+        service_state,
+        "quote_stream.contract_list_ready",
+    )
     return {
-        "status": status,
+        "status": status.value,
         "running": running,
         "message": _safe_get_service_value(service_state, "quote_stream.message")
         or ("实时订阅 worker 仍在运行。" if running else "实时订阅未运行。"),
@@ -1361,6 +2177,11 @@ def _quote_stream_status(
         "finished_at": _safe_get_service_value(service_state, "quote_stream.finished_at"),
         "progress": progress,
         "health": health,
+        "active_option_count": active_option_count,
+        "contract_discovery_running": contract_discovery_running,
+        "contract_list_ready": contract_list_ready,
+        "contract_months": contract_months,
+        "min_days_to_expiry": min_days_to_expiry,
     }
 
 
@@ -1377,6 +2198,96 @@ def _safe_get_service_value(
         raise
 
 
+def _quote_stream_state(service_state: ServiceStateRepository) -> QuoteStreamState:
+    value = _safe_get_service_value(service_state, "quote_stream.status")
+    try:
+        return QuoteStreamState(value or QuoteStreamState.STOPPED.value)
+    except ValueError:
+        return QuoteStreamState.STOPPED
+
+
+def _calculate_expected_subscription_counts(
+    connection: sqlite3.Connection,
+    *,
+    worker_count: int,
+    contract_months: str | None,
+    min_days_to_expiry: int | None,
+    max_symbols: int | None,
+) -> dict[str, int]:
+    contract_month_limit = None
+    if (contract_months or "").strip().lower() != "all":
+        contract_month_limit = _positive_int_setting(
+            contract_months,
+            int(DEFAULT_QUOTE_STREAM_CONTRACT_MONTHS),
+        )
+    return expected_subscription_counts(
+        connection,
+        worker_count=max(worker_count, 1),
+        max_symbols=max_symbols,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=(
+            min_days_to_expiry
+            if min_days_to_expiry is not None
+            else int(DEFAULT_QUOTE_STREAM_MIN_DAYS_TO_EXPIRY)
+        ),
+    )
+
+
+def _store_quote_stream_expected_counts(
+    service_state: ServiceStateRepository,
+    counts: dict[str, int] | None,
+) -> None:
+    for key in ("quote_total", "kline_total", "total_objects"):
+        _safe_set_service_value(
+            service_state,
+            f"quote_stream.expected_{key}",
+            str(counts[key]) if counts is not None else None,
+        )
+
+
+def _progress_with_cached_expected_counts(
+    progress: dict[str, Any],
+    *,
+    service_state: ServiceStateRepository,
+) -> dict[str, Any]:
+    quote_total = _int_or_none(
+        _safe_get_service_value(service_state, "quote_stream.expected_quote_total")
+    )
+    kline_total = _int_or_none(
+        _safe_get_service_value(service_state, "quote_stream.expected_kline_total")
+    )
+    if quote_total is None and kline_total is None:
+        return progress
+    enriched = dict(progress)
+    enriched["quote_total"] = max(int(enriched.get("quote_total") or 0), quote_total or 0)
+    enriched["kline_total"] = max(int(enriched.get("kline_total") or 0), kline_total or 0)
+    enriched["total_objects"] = enriched["quote_total"] + enriched["kline_total"]
+    enriched["subscribed_objects"] = (
+        int(enriched.get("quote_subscribed") or 0)
+        + int(enriched.get("kline_subscribed") or 0)
+    )
+    enriched["completion_ratio"] = (
+        enriched["subscribed_objects"] / enriched["total_objects"]
+        if enriched["total_objects"]
+        else 0.0
+    )
+    enriched["contract_months"] = _safe_get_service_value(
+        service_state,
+        "quote_stream.contract_months",
+    ) or enriched.get("contract_months")
+    enriched["min_days_to_expiry"] = (
+        _int_or_none(
+            _safe_get_service_value(service_state, "quote_stream.min_days_to_expiry")
+        )
+        or int(DEFAULT_QUOTE_STREAM_MIN_DAYS_TO_EXPIRY)
+    )
+    return enriched
+
+
+def _bool_service_state(service_state: ServiceStateRepository, key: str) -> bool:
+    return (_safe_get_service_value(service_state, key) or "false").lower() == "true"
+
+
 def _safe_set_service_value(
     service_state: ServiceStateRepository,
     key: str,
@@ -1384,8 +2295,8 @@ def _safe_set_service_value(
 ) -> bool:
     try:
         service_state.set_value(key, value)
-    except sqlite3.OperationalError as exc:
-        if _is_sqlite_busy(exc):
+    except (sqlite3.OperationalError, SystemError) as exc:
+        if _is_sqlite_retryable(exc):
             return False
         raise
     return True
@@ -1406,8 +2317,8 @@ def _safe_append_service_log(
             message=message,
             context=context,
         )
-    except sqlite3.OperationalError as exc:
-        if _is_sqlite_busy(exc):
+    except (sqlite3.OperationalError, SystemError) as exc:
+        if _is_sqlite_retryable(exc):
             return False
         raise
     return True
@@ -1428,8 +2339,8 @@ def _safe_record_request(
             status_code=status_code,
             latency_ms=latency_ms,
         )
-    except sqlite3.OperationalError as exc:
-        if _is_sqlite_busy(exc):
+    except (sqlite3.OperationalError, SystemError) as exc:
+        if _is_sqlite_retryable(exc):
             return False
         raise
     return True
@@ -1438,6 +2349,17 @@ def _safe_record_request(
 def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
     message = str(exc).lower()
     return "database is locked" in message or "database is busy" in message
+
+
+def _is_sqlite_retryable(exc: sqlite3.OperationalError | SystemError) -> bool:
+    if isinstance(exc, SystemError):
+        message = str(exc).lower()
+        return (
+            "sqlite3.connection" in message
+            or "commit" in message
+            or "error return without exception set" in message
+        )
+    return _is_sqlite_busy(exc)
 
 
 def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str, Any]:
@@ -1480,6 +2402,7 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str
     near_expiry_months = max(
         _int_value(row.get("near_expiry_months")) for row in progress_rows
     )
+    contract_months = _aggregate_contract_months(progress_rows)
     subscribed_objects = quote_subscribed + kline_subscribed
     total_objects = quote_total + kline_total
     statuses = {str(row.get("status") or "") for row in progress_rows}
@@ -1555,6 +2478,7 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str
         "near_expiry_kline_total": near_expiry_kline_total,
         "near_expiry_subscribed": near_expiry_subscribed,
         "near_expiry_total": near_expiry_total,
+        "contract_months": contract_months,
         "subscribed_objects": subscribed_objects,
         "total_objects": total_objects,
         "completion_ratio": subscribed_objects / total_objects
@@ -1699,6 +2623,7 @@ def _progress_from_report(payload: dict[str, Any]) -> dict[str, Any] | None:
         "kline_subscribed": kline_subscribed,
         "kline_total": kline_total,
         "near_expiry_months": _int_value(result.get("near_expiry_months")),
+        "contract_months": _contract_months_from_result(result),
         "near_expiry_quote_subscribed": near_expiry_quote_subscribed,
         "near_expiry_quote_total": near_expiry_quote_total,
         "near_expiry_kline_subscribed": near_expiry_kline_subscribed,
@@ -1741,6 +2666,31 @@ def _aggregate_tqsdk_connection_status(rows: list[dict[str, Any]]) -> str:
     return "unknown"
 
 
+def _aggregate_contract_months(rows: list[dict[str, Any]]) -> str | None:
+    values = {
+        str(row.get("contract_months")).strip().lower()
+        for row in rows
+        if row.get("contract_months") is not None
+    }
+    if not values:
+        return None
+    if "all" in values:
+        return "all"
+    parsed = sorted(_int_value(value) for value in values if _int_value(value) > 0)
+    return str(parsed[-1]) if parsed else None
+
+
+def _contract_months_from_result(result: dict[str, Any]) -> str | None:
+    value = result.get("contract_months")
+    if value is not None:
+        return str(value).strip().lower()
+    limit = result.get("contract_month_limit")
+    if limit is None:
+        return "all"
+    parsed = _int_value(limit)
+    return str(parsed) if parsed > 0 else None
+
+
 def _empty_quote_stream_progress(*, running: bool) -> dict[str, Any]:
     return {
         "status": "running" if running else "stopped",
@@ -1756,6 +2706,7 @@ def _empty_quote_stream_progress(*, running: bool) -> dict[str, Any]:
         "near_expiry_kline_total": 0,
         "near_expiry_subscribed": 0,
         "near_expiry_total": 0,
+        "contract_months": None,
         "subscribed_objects": 0,
         "total_objects": 0,
         "completion_ratio": 0.0,
@@ -2030,10 +2981,25 @@ def _positive_int_setting(value: str | None, default: int) -> int:
     return default if parsed is None else parsed
 
 
+def _non_negative_int_setting(value: str | None, default: int) -> int:
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _bool_setting(value: str | None, default: bool) -> bool:
     if value is None or str(value).strip() == "":
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _contract_months_setting(value: str | None, default: str) -> str:
+    raw = str(value if value is not None else default).strip().lower()
+    return raw if raw in {"1", "2", "3", "all"} else default
 
 
 def _optional_positive_int(value: str | None) -> int | None:
@@ -2055,6 +3021,7 @@ def _run_refresh_until_complete(
     from option_data_manager.cli.collect_market import main as collect_main
 
     state_connection = sqlite3.connect(database_path, check_same_thread=False)
+    configure_sqlite_runtime(state_connection)
     state_connection.row_factory = sqlite3.Row
     state = ServiceStateRepository(state_connection)
     logs = ServiceLogRepository(state_connection)

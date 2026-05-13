@@ -40,6 +40,17 @@ KLINE_20D_CURRENT_MIGRATION = Migration(
     ),
 )
 
+KLINE_20D_CURRENT_READ_MODEL_INDEX_MIGRATION = Migration(
+    301,
+    "add kline_20d_current read model indexes",
+    (
+        """
+        CREATE INDEX IF NOT EXISTS idx_kline_20d_current_received_at
+        ON kline_20d_current(received_at)
+        """,
+    ),
+)
+
 
 KLINE_BASE_FIELDS = (
     "datetime",
@@ -89,7 +100,13 @@ class KlineRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         connection.row_factory = sqlite3.Row
         self._connection = connection
-        apply_migrations(connection, (KLINE_20D_CURRENT_MIGRATION,))
+        apply_migrations(
+            connection,
+            (
+                KLINE_20D_CURRENT_MIGRATION,
+                KLINE_20D_CURRENT_READ_MODEL_INDEX_MIGRATION,
+            ),
+        )
 
     def replace_symbol_klines(self, symbol: str, records: Iterable[KlineRecord]) -> None:
         """Replace the current K-line slice for one symbol."""

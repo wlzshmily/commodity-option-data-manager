@@ -75,3 +75,20 @@
   - `uv run pytest -s tests/test_quote_streamer.py tests/test_api_app.py tests/test_realtime_health.py -q`: 29 passed.
   - `uv run python -m compileall -q src tests`: passed.
   - `uv run pytest -s -q`: 77 passed.
+- 2026-05-12 WEBUI-015 current realtime slice semantics:
+  - Overview read-model tests cover filtering out historical cached Quote rows when they predate the current realtime run, sorting underlyings by exchange/product/delivery month, and marking T型报价 as `未订阅` until the selected chain has fresh realtime Quote rows.
+  - `uv run pytest -s -q tests/test_webui_read_model.py`: 11 passed.
+  - `uv run pytest -s -q tests/test_api_app.py tests/test_webui_read_model.py`: 27 passed.
+  - First full-suite run exposed a transient race in an existing contract-discovery test; isolated rerun passed, then final full WSL run passed with `uv run pytest -s -q`: 90 passed.
+  - `uv run python -m compileall -q src tests`: passed.
+  - `bash scripts/agentic-sdlc/check-agentic-sdlc.sh`: passed.
+  - `uv run python scripts/smoke-local-app.py --database data/tmp-smoke/webui-015-smoke.sqlite3`: passed.
+  - Local real-DB WebUI server on `http://127.0.0.1:8765` returned 200 for `/`, `/api/webui/overview`, and `/api/webui/tquote`.
+- 2026-05-12 WEBUI-016 near-contract remaining-day filter:
+  - Regression test covers product-level nearest-contract scope after expiry filtering: with `DCE.pt2606` expiring today and default `min_days_to_expiry=1`, `contract_month_limit=2` selects `DCE.pt2608` and `DCE.pt2610`.
+  - API tests verify `quote_stream.min_days_to_expiry` defaults to `1`, can be saved as a runtime setting, and is passed to `odm-quote-stream --min-days-to-expiry`.
+  - `uv run python -m pytest -s -q tests/test_quote_streamer.py tests/test_api_app.py`: 31 passed.
+  - `uv run python -m compileall -q src tests option_data_manager`: passed.
+  - `uv run python -m pytest -s -q`: 91 passed.
+  - `bash scripts/agentic-sdlc/check-agentic-sdlc.sh`: passed.
+  - `uv run python scripts/smoke-local-app.py --database data/tmp-smoke/webui-016-smoke.sqlite3`: passed.

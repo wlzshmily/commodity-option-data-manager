@@ -42,6 +42,10 @@
   - Quote-only realtime startup was rejected: daily K-lines can update during the trading session, so `/api/quote-stream/start` must subscribe Kline objects as well as Quote objects.
   - The 3-day optimization reduces each Kline serial's history window but does not reduce required object count. API-started realtime workers pass configurable `--kline-data-length` (default 3) and no longer pass `--no-klines`.
   - IV calculation remains protected by the metrics worker cache-splice path: fetch 3 fresh daily bars, merge with local 20-day cache, and fall back to 20-day fetch when cache is incomplete.
+- 2026-05-11 realtime subscription scope:
+  - Server-side pressure on the public test runtime makes full active option-universe subscription too expensive as the default operating mode.
+  - Realtime subscription now defaults to the nearest 2 option expiry months through `quote_stream.contract_months=2`, with settings choices `1`, `2`, `3`, and `all`.
+  - The scope filters both Quote and Kline subscription objects, and dynamic contract reconciliation uses the same filter so long-running workers do not drift back to full-market subscriptions unless the operator selects `all`.
 - Implemented commands from the tuning results:
   - `odm-collect-parallel` for process-level full-market catch-up using disjoint underlying ranges and independent TQSDK API instances.
   - `odm-quote-stream` for long-lived Quote and Kline subscription shards.

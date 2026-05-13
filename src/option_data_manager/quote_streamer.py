@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 import re
 import sqlite3
 import time
@@ -23,6 +23,8 @@ DEFAULT_KLINE_DATA_LENGTH = 20
 DEFAULT_METRICS_DIRTY_MIN_INTERVAL_SECONDS = 30
 DEFAULT_UNDERLYING_CHAIN_DIRTY_INTERVAL_SECONDS = 30
 DEFAULT_NEAR_EXPIRY_MONTHS = 2
+DEFAULT_CONTRACT_MONTH_LIMIT = 2
+DEFAULT_MIN_DAYS_TO_EXPIRY = 1
 DEFAULT_CONTRACT_REFRESH_INTERVAL_SECONDS = 30 * 60
 _FAR_EXPIRY_KEY = (9999, 99)
 _MONTH_PATTERN = re.compile(r"(\d{3,4})")
@@ -43,6 +45,8 @@ class QuoteStreamResult:
     quote_shard_size: int
     kline_data_length: int
     near_expiry_months: int
+    contract_month_limit: int | None
+    min_days_to_expiry: int
     near_expiry_quote_count: int
     near_expiry_kline_count: int
     cycles: int
@@ -89,6 +93,8 @@ def stream_quotes(
     include_klines: bool = True,
     prioritize_near_expiry: bool = True,
     near_expiry_months: int = DEFAULT_NEAR_EXPIRY_MONTHS,
+    contract_month_limit: int | None = DEFAULT_CONTRACT_MONTH_LIMIT,
+    min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     stop_requested: Callable[[], bool] | None = None,
     tq_notify_factory: Callable[[Any], Any] | None = None,
@@ -123,6 +129,10 @@ def stream_quotes(
         raise ValueError("wait_deadline_seconds must be positive.")
     if near_expiry_months < 1:
         raise ValueError("near_expiry_months must be positive.")
+    if contract_month_limit is not None and contract_month_limit < 1:
+        raise ValueError("contract_month_limit must be positive when provided.")
+    if min_days_to_expiry < 0:
+        raise ValueError("min_days_to_expiry must be non-negative.")
     if (
         contract_refresh_interval_seconds is not None
         and contract_refresh_interval_seconds <= 0
@@ -152,6 +162,7 @@ def stream_quotes(
         near_expiry_quote_total=0,
         near_expiry_kline_subscribed=0,
         near_expiry_kline_total=0,
+        contract_month_limit=contract_month_limit,
         tq_notify_state=tqsdk_notify_state,
     )
     symbols = select_quote_symbols(
@@ -162,6 +173,8 @@ def stream_quotes(
         include_futures=include_futures,
         include_options=include_options,
         prioritize_near_expiry=prioritize_near_expiry,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
     )
     if not symbols:
         raise ValueError("No active quote symbols are available for this worker shard.")
@@ -172,6 +185,8 @@ def stream_quotes(
             worker_count=worker_count,
             max_symbols=max_symbols,
             prioritize_near_expiry=prioritize_near_expiry,
+            contract_month_limit=contract_month_limit,
+            min_days_to_expiry=min_days_to_expiry,
         )
         if include_options and include_klines
         else []
@@ -186,6 +201,8 @@ def stream_quotes(
             include_options=include_options,
             prioritize_near_expiry=prioritize_near_expiry,
             near_expiry_months=near_expiry_months,
+            contract_month_limit=contract_month_limit,
+            min_days_to_expiry=min_days_to_expiry,
         )
         if prioritize_near_expiry
         else 0
@@ -198,6 +215,8 @@ def stream_quotes(
             max_symbols=max_symbols,
             prioritize_near_expiry=prioritize_near_expiry,
             near_expiry_months=near_expiry_months,
+            contract_month_limit=contract_month_limit,
+            min_days_to_expiry=min_days_to_expiry,
         )
         if include_options and include_klines and prioritize_near_expiry
         else 0
@@ -228,6 +247,7 @@ def stream_quotes(
         near_expiry_quote_total=near_quote_total,
         near_expiry_kline_subscribed=0,
         near_expiry_kline_total=near_kline_total,
+        contract_month_limit=contract_month_limit,
         tq_notify_state=tqsdk_notify_state,
     )
     for index in range(0, len(symbols), quote_shard_size):
@@ -255,6 +275,7 @@ def stream_quotes(
             near_expiry_quote_total=near_quote_total,
             near_expiry_kline_subscribed=0,
             near_expiry_kline_total=near_kline_total,
+            contract_month_limit=contract_month_limit,
             tq_notify_state=tqsdk_notify_state,
         )
     quote_finished_at = datetime.now(UTC).isoformat()
@@ -295,6 +316,7 @@ def stream_quotes(
                 near_expiry_quote_total=near_quote_total,
                 near_expiry_kline_subscribed=min(len(kline_refs), near_kline_total),
                 near_expiry_kline_total=near_kline_total,
+                contract_month_limit=contract_month_limit,
                 tq_notify_state=tqsdk_notify_state,
             )
     _emit_progress(
@@ -315,6 +337,7 @@ def stream_quotes(
         near_expiry_quote_total=near_quote_total,
         near_expiry_kline_subscribed=min(len(kline_refs), near_kline_total),
         near_expiry_kline_total=near_kline_total,
+        contract_month_limit=contract_month_limit,
         tq_notify_state=tqsdk_notify_state,
     )
     deadline_at = time.monotonic() + duration_seconds if duration_seconds else None
@@ -379,6 +402,8 @@ def stream_quotes(
                 include_klines=include_klines,
                 prioritize_near_expiry=prioritize_near_expiry,
                 near_expiry_months=near_expiry_months,
+                contract_month_limit=contract_month_limit,
+                min_days_to_expiry=min_days_to_expiry,
                 quote_shard_size=quote_shard_size,
                 kline_batch_size=kline_batch_size,
                 kline_data_length=kline_data_length,
@@ -463,6 +488,7 @@ def stream_quotes(
                     near_kline_total,
                 ),
                 near_expiry_kline_total=near_kline_total,
+                contract_month_limit=contract_month_limit,
                 cycle_count=cycle_count,
                 wait_update_count=wait_update_count,
                 quotes_written=quotes_written,
@@ -491,6 +517,8 @@ def stream_quotes(
         quote_shard_size=quote_shard_size,
         kline_data_length=kline_data_length,
         near_expiry_months=near_expiry_months,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
         near_expiry_quote_count=near_quote_total,
         near_expiry_kline_count=near_kline_total,
         cycles=cycle_count,
@@ -527,6 +555,8 @@ def select_quote_symbols(
     include_futures: bool = True,
     include_options: bool = True,
     prioritize_near_expiry: bool = True,
+    contract_month_limit: int | None = DEFAULT_CONTRACT_MONTH_LIMIT,
+    min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
 ) -> list[str]:
     """Return a deterministic disjoint symbol shard for one quote worker."""
 
@@ -542,6 +572,8 @@ def select_quote_symbols(
         connection,
         class_predicates=class_predicates,
         prioritize_near_expiry=prioritize_near_expiry,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
     )
     symbols = [
         str(row["symbol"])
@@ -560,6 +592,8 @@ def select_kline_symbols(
     worker_count: int = 1,
     max_symbols: int | None = None,
     prioritize_near_expiry: bool = True,
+    contract_month_limit: int | None = DEFAULT_CONTRACT_MONTH_LIMIT,
+    min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
 ) -> list[str]:
     """Return de-duplicated single-symbol realtime kline subscriptions."""
 
@@ -567,6 +601,8 @@ def select_kline_symbols(
     rows = _kline_subscription_rows(
         connection,
         prioritize_near_expiry=prioritize_near_expiry,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
     )
     symbols = [str(row["symbol"]) for row in rows]
     shard = symbols[worker_index::worker_count]
@@ -585,6 +621,8 @@ def count_near_expiry_quote_symbols(
     include_options: bool = True,
     prioritize_near_expiry: bool = True,
     near_expiry_months: int = DEFAULT_NEAR_EXPIRY_MONTHS,
+    contract_month_limit: int | None = DEFAULT_CONTRACT_MONTH_LIMIT,
+    min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
 ) -> int:
     """Count this shard's objects before the first N expiry-month boundary."""
 
@@ -600,6 +638,8 @@ def count_near_expiry_quote_symbols(
         connection,
         class_predicates=class_predicates,
         prioritize_near_expiry=prioritize_near_expiry,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
     )
     return _near_expiry_count_for_shard(
         rows,
@@ -607,6 +647,7 @@ def count_near_expiry_quote_symbols(
         worker_count=worker_count,
         max_symbols=max_symbols,
         near_expiry_months=near_expiry_months,
+        min_days_to_expiry=min_days_to_expiry,
     )
 
 
@@ -618,6 +659,8 @@ def count_near_expiry_kline_symbols(
     max_symbols: int | None = None,
     prioritize_near_expiry: bool = True,
     near_expiry_months: int = DEFAULT_NEAR_EXPIRY_MONTHS,
+    contract_month_limit: int | None = DEFAULT_CONTRACT_MONTH_LIMIT,
+    min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
 ) -> int:
     """Count this shard's Kline objects before the first N expiry-month boundary."""
 
@@ -625,6 +668,8 @@ def count_near_expiry_kline_symbols(
     rows = _kline_subscription_rows(
         connection,
         prioritize_near_expiry=prioritize_near_expiry,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
     )
     return _near_expiry_count_for_shard(
         rows,
@@ -632,7 +677,74 @@ def count_near_expiry_kline_symbols(
         worker_count=worker_count,
         max_symbols=max_symbols,
         near_expiry_months=near_expiry_months,
+        min_days_to_expiry=min_days_to_expiry,
     )
+
+
+def selected_underlying_contract_symbols(
+    connection: sqlite3.Connection,
+    *,
+    contract_month_limit: int | None = DEFAULT_CONTRACT_MONTH_LIMIT,
+    min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
+    prioritize_near_expiry: bool = True,
+) -> set[str]:
+    """Return underlying contracts covered by the realtime subscription scope."""
+
+    rows = _quote_subscription_rows(
+        connection,
+        class_predicates=["option_class IN ('CALL', 'PUT')"],
+        prioritize_near_expiry=prioritize_near_expiry,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
+    )
+    return {
+        _underlying_contract_symbol(row)
+        for row in rows
+        if _underlying_contract_symbol(row)
+    }
+
+
+def expected_subscription_counts(
+    connection: sqlite3.Connection,
+    *,
+    worker_count: int = 1,
+    max_symbols: int | None = None,
+    contract_month_limit: int | None = DEFAULT_CONTRACT_MONTH_LIMIT,
+    min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
+    prioritize_near_expiry: bool = True,
+) -> dict[str, int]:
+    """Return expected full-scope subscription object counts from SQLite."""
+
+    quote_total = 0
+    kline_total = 0
+    for worker_index in range(max(worker_count, 1)):
+        quote_total += len(
+            select_quote_symbols(
+                connection,
+                worker_index=worker_index,
+                worker_count=max(worker_count, 1),
+                max_symbols=max_symbols,
+                prioritize_near_expiry=prioritize_near_expiry,
+                contract_month_limit=contract_month_limit,
+                min_days_to_expiry=min_days_to_expiry,
+            )
+        )
+        kline_total += len(
+            select_kline_symbols(
+                connection,
+                worker_index=worker_index,
+                worker_count=max(worker_count, 1),
+                max_symbols=max_symbols,
+                prioritize_near_expiry=prioritize_near_expiry,
+                contract_month_limit=contract_month_limit,
+                min_days_to_expiry=min_days_to_expiry,
+            )
+        )
+    return {
+        "quote_total": quote_total,
+        "kline_total": kline_total,
+        "total_objects": quote_total + kline_total,
+    }
 
 
 def _batches(symbols: list[str], batch_size: int) -> list[list[str]]:
@@ -731,6 +843,8 @@ def _reconcile_subscriptions(
     include_klines: bool,
     prioritize_near_expiry: bool,
     near_expiry_months: int,
+    contract_month_limit: int | None,
+    min_days_to_expiry: int,
     quote_shard_size: int,
     kline_batch_size: int,
     kline_data_length: int,
@@ -743,6 +857,8 @@ def _reconcile_subscriptions(
         include_futures=include_futures,
         include_options=include_options,
         prioritize_near_expiry=prioritize_near_expiry,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
     )
     kline_symbols = (
         select_kline_symbols(
@@ -751,6 +867,8 @@ def _reconcile_subscriptions(
             worker_count=worker_count,
             max_symbols=max_symbols,
             prioritize_near_expiry=prioritize_near_expiry,
+            contract_month_limit=contract_month_limit,
+            min_days_to_expiry=min_days_to_expiry,
         )
         if include_options and include_klines
         else []
@@ -797,6 +915,8 @@ def _reconcile_subscriptions(
             include_options=include_options,
             prioritize_near_expiry=prioritize_near_expiry,
             near_expiry_months=near_expiry_months,
+            contract_month_limit=contract_month_limit,
+            min_days_to_expiry=min_days_to_expiry,
         )
         if prioritize_near_expiry
         else 0
@@ -809,6 +929,8 @@ def _reconcile_subscriptions(
             max_symbols=max_symbols,
             prioritize_near_expiry=prioritize_near_expiry,
             near_expiry_months=near_expiry_months,
+            contract_month_limit=contract_month_limit,
+            min_days_to_expiry=min_days_to_expiry,
         )
         if include_options and include_klines and prioritize_near_expiry
         else 0
@@ -831,56 +953,154 @@ def _quote_subscription_rows(
     *,
     class_predicates: list[str],
     prioritize_near_expiry: bool,
+    contract_month_limit: int | None,
+    min_days_to_expiry: int,
 ) -> list[dict[str, Any]]:
-    cursor = connection.execute(
+    predicate_sql = " OR ".join(
+        predicate.replace("ins_class", "i.ins_class").replace(
+            "option_class",
+            "i.option_class",
+        )
+        for predicate in class_predicates
+    )
+    quote_current_available = _table_exists(connection, "quote_current")
+    quote_join_sql = (
+        """
+        LEFT JOIN quote_current iq ON iq.symbol = i.symbol
+        LEFT JOIN quote_current fq ON fq.symbol = COALESCE(i.underlying_symbol, i.symbol)
+        """
+        if quote_current_available
+        else ""
+    )
+    quote_expire_rest_sql = (
+        "CAST(json_extract(iq.raw_payload_json, '$.expire_rest_days') AS INTEGER)"
+        if quote_current_available
+        else "NULL"
+    )
+    quote_expire_datetime_sql = (
+        "NULLIF(json_extract(iq.raw_payload_json, '$.expire_datetime'), '')"
+        if quote_current_available
+        else "NULL"
+    )
+    future_quote_expire_rest_sql = (
+        "CAST(json_extract(fq.raw_payload_json, '$.expire_rest_days') AS INTEGER)"
+        if quote_current_available
+        else "NULL"
+    )
+    future_quote_expire_datetime_sql = (
+        "NULLIF(json_extract(fq.raw_payload_json, '$.expire_datetime'), '')"
+        if quote_current_available
+        else "NULL"
+    )
+    cursor = _execute_read_with_retry(
+        connection,
         f"""
         SELECT
-            symbol,
-            exchange_id,
-            product_id,
-            instrument_id,
-            ins_class,
-            option_class,
-            underlying_symbol,
-            expire_datetime,
-            delivery_year,
-            delivery_month,
-            exercise_year,
-            exercise_month
-        FROM instruments
-        WHERE active = 1
-          AND ({' OR '.join(class_predicates)})
+            i.symbol,
+            i.exchange_id,
+            i.product_id,
+            i.instrument_id,
+            i.ins_class,
+            i.option_class,
+            i.underlying_symbol,
+            i.delivery_year,
+            i.delivery_month,
+            i.exercise_year,
+            i.exercise_month,
+            COALESCE(
+                CAST(json_extract(i.raw_payload_json, '$.expire_rest_days') AS INTEGER),
+                {quote_expire_rest_sql}
+            ) AS expire_rest_days,
+            COALESCE(NULLIF(i.expire_datetime, ''), {quote_expire_datetime_sql}) AS expire_datetime,
+            COALESCE(NULLIF(future.expire_datetime, ''), {future_quote_expire_datetime_sql}) AS underlying_expire_datetime,
+            COALESCE(
+                CAST(json_extract(future.raw_payload_json, '$.expire_rest_days') AS INTEGER),
+                {future_quote_expire_rest_sql}
+            ) AS underlying_expire_rest_days
+        FROM instruments i
+        LEFT JOIN instruments future ON future.symbol = i.underlying_symbol
+        {quote_join_sql}
+        WHERE i.active = 1
+          AND ({predicate_sql})
         """
     )
     rows = _dict_rows(cursor)
-    return _sort_subscription_rows(rows, prioritize_near_expiry=prioritize_near_expiry)
+    rows = _sort_subscription_rows(rows, prioritize_near_expiry=prioritize_near_expiry)
+    return _limit_rows_by_expiry_months(
+        rows,
+        contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
+    )
 
 
 def _kline_subscription_rows(
     connection: sqlite3.Connection,
     *,
     prioritize_near_expiry: bool,
+    contract_month_limit: int | None,
+    min_days_to_expiry: int,
 ) -> list[dict[str, Any]]:
-    cursor = connection.execute(
+    quote_current_available = _table_exists(connection, "quote_current")
+    quote_join_sql = (
         """
+        LEFT JOIN quote_current iq ON iq.symbol = i.symbol
+        LEFT JOIN quote_current fq ON fq.symbol = i.underlying_symbol
+        """
+        if quote_current_available
+        else ""
+    )
+    quote_expire_rest_sql = (
+        "CAST(json_extract(iq.raw_payload_json, '$.expire_rest_days') AS INTEGER)"
+        if quote_current_available
+        else "NULL"
+    )
+    quote_expire_datetime_sql = (
+        "NULLIF(json_extract(iq.raw_payload_json, '$.expire_datetime'), '')"
+        if quote_current_available
+        else "NULL"
+    )
+    future_quote_expire_rest_sql = (
+        "CAST(json_extract(fq.raw_payload_json, '$.expire_rest_days') AS INTEGER)"
+        if quote_current_available
+        else "NULL"
+    )
+    future_quote_expire_datetime_sql = (
+        "NULLIF(json_extract(fq.raw_payload_json, '$.expire_datetime'), '')"
+        if quote_current_available
+        else "NULL"
+    )
+    cursor = _execute_read_with_retry(
+        connection,
+        f"""
         SELECT
-            symbol,
-            exchange_id,
-            product_id,
-            instrument_id,
-            ins_class,
-            option_class,
-            underlying_symbol,
-            expire_datetime,
-            delivery_year,
-            delivery_month,
-            exercise_year,
-            exercise_month
-        FROM instruments
-        WHERE active = 1
-          AND option_class IN ('CALL', 'PUT')
-          AND underlying_symbol IS NOT NULL
-          AND TRIM(underlying_symbol) <> ''
+            i.symbol,
+            i.exchange_id,
+            i.product_id,
+            i.instrument_id,
+            i.ins_class,
+            i.option_class,
+            i.underlying_symbol,
+            i.delivery_year,
+            i.delivery_month,
+            i.exercise_year,
+            i.exercise_month,
+            COALESCE(
+                CAST(json_extract(i.raw_payload_json, '$.expire_rest_days') AS INTEGER),
+                {quote_expire_rest_sql}
+            ) AS expire_rest_days,
+            COALESCE(NULLIF(i.expire_datetime, ''), {quote_expire_datetime_sql}) AS expire_datetime,
+            COALESCE(NULLIF(future.expire_datetime, ''), {future_quote_expire_datetime_sql}) AS underlying_expire_datetime,
+            COALESCE(
+                CAST(json_extract(future.raw_payload_json, '$.expire_rest_days') AS INTEGER),
+                {future_quote_expire_rest_sql}
+            ) AS underlying_expire_rest_days
+        FROM instruments i
+        LEFT JOIN instruments future ON future.symbol = i.underlying_symbol
+        {quote_join_sql}
+        WHERE i.active = 1
+          AND i.option_class IN ('CALL', 'PUT')
+          AND i.underlying_symbol IS NOT NULL
+          AND TRIM(i.underlying_symbol) <> ''
         """
     )
     option_rows = _dict_rows(cursor)
@@ -901,7 +1121,12 @@ def _kline_subscription_rows(
         if option_symbol and option_symbol not in seen_symbols:
             rows.append(row)
             seen_symbols.add(option_symbol)
-    return _sort_subscription_rows(rows, prioritize_near_expiry=prioritize_near_expiry)
+    rows = _sort_subscription_rows(rows, prioritize_near_expiry=prioritize_near_expiry)
+    return _limit_rows_by_expiry_months(
+        rows,
+        contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
+    )
 
 
 def _dict_rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
@@ -914,6 +1139,37 @@ def _dict_rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
         else:
             result.append({column: row[index] for index, column in enumerate(columns)})
     return result
+
+
+def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = _execute_read_with_retry(
+        connection,
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        """,
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _execute_read_with_retry(
+    connection: sqlite3.Connection,
+    sql: str,
+    parameters: tuple[Any, ...] = (),
+    *,
+    attempts: int = 6,
+    delay_seconds: float = 2.0,
+) -> sqlite3.Cursor:
+    for attempt in range(attempts):
+        try:
+            return connection.execute(sql, parameters)
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or attempt == attempts - 1:
+                raise
+            time.sleep(delay_seconds)
+    raise RuntimeError("unreachable sqlite retry state")
 
 
 def _sort_subscription_rows(
@@ -933,8 +1189,138 @@ def _sort_subscription_rows(
     )
 
 
+def _limit_rows_by_expiry_months(
+    rows: list[dict[str, Any]],
+    contract_month_limit: int | None,
+    *,
+    min_days_to_expiry: int,
+) -> list[dict[str, Any]]:
+    if contract_month_limit is None:
+        if min_days_to_expiry <= 0:
+            return rows
+        valid_contracts = _valid_underlying_contracts(
+            rows,
+            min_days_to_expiry=min_days_to_expiry,
+        )
+        if not valid_contracts:
+            return []
+        return [
+            row
+            for row in rows
+            if _underlying_contract_scope_key(row) in valid_contracts
+        ]
+    if contract_month_limit < 1:
+        return []
+    allowed_contracts = _allowed_underlying_contracts(
+        rows,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
+    )
+    if not allowed_contracts:
+        return []
+    return [
+        row
+        for row in rows
+        if _underlying_contract_scope_key(row) in allowed_contracts
+    ]
+
+
+def _allowed_underlying_contracts(
+    rows: list[dict[str, Any]],
+    *,
+    contract_month_limit: int,
+    min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
+) -> set[tuple[str, str, str]]:
+    candidates_by_group: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+    for scope_key, row in _valid_underlying_contract_rows(
+        rows,
+        min_days_to_expiry=min_days_to_expiry,
+    ).items():
+        exchange_id, product_id, contract_symbol = scope_key
+        candidates_by_group.setdefault((exchange_id, product_id), {}).setdefault(
+            contract_symbol,
+            row,
+        )
+    allowed: set[tuple[str, str, str]] = set()
+    for (exchange_id, product_id), contract_rows in candidates_by_group.items():
+        selected = sorted(
+            contract_rows.items(),
+            key=lambda item: _underlying_contract_sort_key(item[1]),
+        )[:contract_month_limit]
+        for contract_symbol, _row in selected:
+            allowed.add((exchange_id, product_id, contract_symbol))
+    return allowed
+
+
+def _valid_underlying_contracts(
+    rows: list[dict[str, Any]],
+    *,
+    min_days_to_expiry: int,
+) -> set[tuple[str, str, str]]:
+    return set(
+        _valid_underlying_contract_rows(
+            rows,
+            min_days_to_expiry=min_days_to_expiry,
+        )
+    )
+
+
+def _valid_underlying_contract_rows(
+    rows: list[dict[str, Any]],
+    *,
+    min_days_to_expiry: int,
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    option_rows = [row for row in rows if row.get("option_class") in {"CALL", "PUT"}]
+    option_groups = {
+        (str(row.get("exchange_id") or ""), str(row.get("product_id") or ""))
+        for row in option_rows
+    }
+    candidate_rows = option_rows + [
+        row
+        for row in rows
+        if row.get("option_class") not in {"CALL", "PUT"}
+        and (
+            str(row.get("exchange_id") or ""),
+            str(row.get("product_id") or ""),
+        )
+        not in option_groups
+    ]
+    rows_by_contract: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in candidate_rows:
+        contract_symbol = _underlying_contract_symbol(row)
+        if not contract_symbol:
+            continue
+        group_key = (
+            str(row.get("exchange_id") or ""),
+            str(row.get("product_id") or ""),
+        )
+        rows_by_contract.setdefault((*group_key, contract_symbol), []).append(row)
+    candidates: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for scope_key, contract_rows in rows_by_contract.items():
+        remaining_values = [
+            remaining_days
+            for remaining_days in (
+                _contract_remaining_days(row) for row in contract_rows
+            )
+            if remaining_days is not None
+        ]
+        if remaining_values and min(remaining_values) < min_days_to_expiry:
+            continue
+        candidates[scope_key] = sorted(
+            contract_rows,
+            key=_subscription_sort_key,
+        )[0]
+    return candidates
+
+
+def _contract_months_progress_value(contract_month_limit: int | None) -> str:
+    return "all" if contract_month_limit is None else str(contract_month_limit)
+
+
 def _subscription_sort_key(row: dict[str, Any]) -> tuple[object, ...]:
     return (
+        _underlying_contract_sort_key(row),
+        0 if row.get("option_class") not in {"CALL", "PUT"} else 1,
         _expiry_key(row),
         str(row["exchange_id"] or ""),
         str(row["product_id"] or ""),
@@ -950,24 +1336,90 @@ def _near_expiry_count_for_shard(
     worker_count: int,
     max_symbols: int | None,
     near_expiry_months: int,
+    min_days_to_expiry: int,
 ) -> int:
     if near_expiry_months < 1:
         return 0
-    month_keys: list[tuple[int, int]] = []
-    for row in rows:
-        key = _expiry_key(row)
-        if key == _FAR_EXPIRY_KEY or key in month_keys:
-            continue
-        month_keys.append(key)
-        if len(month_keys) >= near_expiry_months:
-            break
-    if not month_keys:
+    allowed_contracts = _allowed_underlying_contracts(
+        rows,
+        contract_month_limit=near_expiry_months,
+        min_days_to_expiry=min_days_to_expiry,
+    )
+    if not allowed_contracts:
         return 0
-    near_keys = set(month_keys)
     shard = rows[worker_index::worker_count]
     if max_symbols is not None:
         shard = shard[:max_symbols]
-    return sum(1 for row in shard if _expiry_key(row) in near_keys)
+    return sum(
+        1 for row in shard if _underlying_contract_scope_key(row) in allowed_contracts
+    )
+
+
+def _underlying_contract_scope_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(row.get("exchange_id") or ""),
+        str(row.get("product_id") or ""),
+        _underlying_contract_symbol(row),
+    )
+
+
+def _underlying_contract_symbol(row: dict[str, Any]) -> str:
+    underlying_symbol = str(row.get("underlying_symbol") or "").strip()
+    if underlying_symbol:
+        return underlying_symbol
+    return str(row.get("symbol") or "").strip()
+
+
+def _underlying_contract_sort_key(row: dict[str, Any]) -> tuple[object, ...]:
+    contract_symbol = _underlying_contract_symbol(row)
+    return (
+        _contract_month_key(contract_symbol),
+        str(row.get("exchange_id") or ""),
+        str(row.get("product_id") or ""),
+        contract_symbol,
+    )
+
+
+def _contract_remaining_days(row: dict[str, Any]) -> int | None:
+    values: list[int] = []
+    for key in ("underlying_expire_rest_days", "expire_rest_days"):
+        value = _optional_int_value(row.get(key))
+        if value is not None:
+            values.append(value)
+    for key in ("underlying_expire_datetime", "expire_datetime"):
+        parsed = _parse_expiry_date(row.get(key))
+        if parsed is not None:
+            values.append((parsed - date.today()).days)
+    return min(values) if values else None
+
+
+def _parse_expiry_date(value: object) -> date | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        try:
+            return datetime.fromtimestamp(float(text), UTC).date()
+        except (OverflowError, OSError, ValueError):
+            return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized).date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _contract_month_key(symbol: str) -> tuple[int, int]:
+    match = _MONTH_PATTERN.search(symbol)
+    if match:
+        return _month_key_from_digits(match.group(1))
+    return _FAR_EXPIRY_KEY
 
 
 def _expiry_key(row: dict[str, Any]) -> tuple[int, int]:
@@ -987,11 +1439,19 @@ def _expiry_key(row: dict[str, Any]) -> tuple[int, int]:
             pass
     match = _MONTH_PATTERN.search(str(row["instrument_id"] or row["symbol"] or ""))
     if match:
-        digits = match.group(1)
+        return _month_key_from_digits(match.group(1))
+    return _FAR_EXPIRY_KEY
+
+
+def _month_key_from_digits(digits: str) -> tuple[int, int]:
+    if len(digits) == 3:
+        year = 2020 + int(digits[:1])
+        month = int(digits[1:3])
+    else:
         year = 2000 + int(digits[:2])
         month = int(digits[2:4])
-        if 1 <= month <= 12:
-            return (year, month)
+    if 1 <= month <= 12:
+        return (year, month)
     return _FAR_EXPIRY_KEY
 
 
@@ -1234,6 +1694,7 @@ def _emit_progress(
     near_expiry_quote_total: int,
     near_expiry_kline_subscribed: int,
     near_expiry_kline_total: int,
+    contract_month_limit: int | None,
     cycle_count: int = 0,
     wait_update_count: int = 0,
     quotes_written: int = 0,
@@ -1277,6 +1738,9 @@ def _emit_progress(
             "near_expiry_kline_total": near_expiry_kline_total,
             "near_expiry_subscribed": near_expiry_subscribed,
             "near_expiry_total": near_expiry_total,
+            "contract_months": _contract_months_progress_value(
+                contract_month_limit
+            ),
             "subscribed_objects": subscribed_objects,
             "total_objects": total_objects,
             "cycle_count": cycle_count,

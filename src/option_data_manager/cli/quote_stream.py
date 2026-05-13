@@ -21,8 +21,10 @@ from option_data_manager.cli.collect_market import (
 )
 from option_data_manager.quote_streamer import (
     DEFAULT_CONTRACT_REFRESH_INTERVAL_SECONDS,
+    DEFAULT_CONTRACT_MONTH_LIMIT,
     DEFAULT_KLINE_BATCH_SIZE,
     DEFAULT_KLINE_DATA_LENGTH,
+    DEFAULT_MIN_DAYS_TO_EXPIRY,
     DEFAULT_QUOTE_SHARD_SIZE,
     stream_quotes,
 )
@@ -86,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
                 include_klines=args.include_klines,
                 prioritize_near_expiry=args.prioritize_near_expiry,
                 near_expiry_months=args.near_expiry_months,
+                contract_month_limit=args.contract_month_limit,
+                min_days_to_expiry=args.min_days_to_expiry,
                 progress_callback=_progress_writer(
                     report_path,
                     credential_source=credentials.source,
@@ -189,6 +193,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_false",
     )
     parser.add_argument("--near-expiry-months", type=int, default=2)
+    parser.add_argument(
+        "--min-days-to-expiry",
+        type=int,
+        default=DEFAULT_MIN_DAYS_TO_EXPIRY,
+        help="Filter underlying contract months with fewer than this many remaining days.",
+    )
+    parser.add_argument(
+        "--contract-months",
+        choices=("1", "2", "3", "all"),
+        default=str(DEFAULT_CONTRACT_MONTH_LIMIT),
+        help="Subscribe contracts through the first N expiry months, or all months.",
+    )
     parser.add_argument("--futures-only", action="store_true")
     parser.add_argument("--options-only", action="store_true")
     parser.set_defaults(
@@ -200,6 +216,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.futures_only and args.options_only:
         parser.error("--futures-only and --options-only are mutually exclusive.")
+    args.contract_month_limit = (
+        None if args.contract_months == "all" else int(args.contract_months)
+    )
     return args
 
 

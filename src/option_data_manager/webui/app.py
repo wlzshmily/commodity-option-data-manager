@@ -12,10 +12,14 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 import uvicorn
 
-from option_data_manager.api.app import create_app as create_local_api_app
+from option_data_manager.api.app import (
+    QuoteStreamState,
+    create_app as create_local_api_app,
+)
 from option_data_manager.realtime_health import build_realtime_health
 from option_data_manager.service_state import ServiceStateRepository
-from .read_model import WebuiReadModel
+from option_data_manager.sqlite_runtime import configure_sqlite_runtime
+from .read_model import SubscriptionLifecycleStatus, WebuiReadModel
 
 
 DEFAULT_DATABASE_PATH = "data/option-data-current.sqlite3"
@@ -29,7 +33,7 @@ def create_webui_app(
     """Create the local WebUI and its read-only JSON endpoints."""
 
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout=30000")
+    configure_sqlite_runtime(connection, enable_wal=database_path not in (None, ":memory:"))
     read_model = WebuiReadModel(connection)
     service_state = ServiceStateRepository(connection)
     app = FastAPI(title="期权数据管理工具 WebUI")
@@ -41,25 +45,10 @@ def create_webui_app(
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
-        overview = _overview_payload(
-            read_model,
-            service_state=service_state,
-            database_path=database_path,
-            limit=500,
-        )
-        selected = (
-            overview["underlyings"][0]["underlying_symbol"]
-            if overview["underlyings"]
-            else None
-        )
         initial_state = {
-            "overview": overview,
-            "selectedUnderlying": selected,
-            "quote": (
-                read_model.tquote(underlying_symbol=selected, include_selectors=False)
-                if selected
-                else None
-            ),
+            "overview": None,
+            "selectedUnderlying": None,
+            "quote": None,
             "databasePath": database_path,
         }
         return INDEX_HTML.replace(
@@ -80,27 +69,68 @@ def create_webui_app(
 
     @app.get("/api/webui/overview")
     def overview(limit: int = Query(default=80, ge=1, le=500)) -> dict:
-        return {
-            **_overview_payload(
-                read_model,
-                service_state=service_state,
-                database_path=database_path,
-                limit=limit,
-            ),
-        }
+        active_read_model, read_connection = _request_read_model(
+            read_model,
+            database_path=database_path,
+        )
+        try:
+            return {
+                **_overview_payload(
+                    active_read_model,
+                    service_state=service_state,
+                    database_path=database_path,
+                    limit=limit,
+                ),
+            }
+        finally:
+            if read_connection is not None:
+                read_connection.close()
 
     @app.get("/api/webui/tquote")
     def tquote(underlying: str | None = None, selectors: bool = False) -> dict:
-        return read_model.tquote(
-            underlying_symbol=underlying,
-            include_selectors=selectors,
+        active_read_model, read_connection = _request_read_model(
+            read_model,
+            database_path=database_path,
         )
+        try:
+            quote_stream = _quote_stream_payload(
+                service_state,
+                connection=active_read_model.connection,
+            )
+            return active_read_model.tquote(
+                underlying_symbol=underlying,
+                include_selectors=selectors,
+                realtime_started_at=_realtime_started_at(quote_stream),
+            )
+        finally:
+            if read_connection is not None:
+                read_connection.close()
 
     @app.get("/api/webui/runs")
     def runs(limit: int = Query(default=30, ge=1, le=100)) -> dict:
-        return read_model.runs(limit=limit)
+        active_read_model, read_connection = _request_read_model(
+            read_model,
+            database_path=database_path,
+        )
+        try:
+            return active_read_model.runs(limit=limit)
+        finally:
+            if read_connection is not None:
+                read_connection.close()
 
     return app
+
+
+def _request_read_model(
+    fallback_read_model: WebuiReadModel,
+    *,
+    database_path: str | None,
+) -> tuple[WebuiReadModel, sqlite3.Connection | None]:
+    if not database_path or database_path == ":memory:":
+        return (fallback_read_model, None)
+    connection = sqlite3.connect(database_path, timeout=30)
+    configure_sqlite_runtime(connection)
+    return (WebuiReadModel(connection), connection)
 
 
 def _overview_payload(
@@ -110,9 +140,27 @@ def _overview_payload(
     database_path: str | None,
     limit: int,
 ) -> dict:
-    return {
+    quote_stream = _quote_stream_payload(
+        service_state,
+        connection=read_model.connection,
+    )
+    payload = {
         "database_path": database_path,
-        **read_model.overview(limit=limit, prefer_parallel_collection=True),
+        **read_model.overview(
+            limit=limit,
+            prefer_parallel_collection=True,
+            current_quote_after=_realtime_started_at(quote_stream),
+            require_current_quote=True,
+            subscription_scope_enabled=_quote_stream_scope_active(quote_stream),
+            subscription_contract_month_limit=_quote_stream_contract_month_limit(
+                quote_stream
+            ),
+            subscription_min_days_to_expiry=_quote_stream_min_days_to_expiry(
+                quote_stream
+            ),
+            subscription_lifecycle_status=_quote_stream_lifecycle_status(quote_stream),
+            subscription_fast_totals=_quote_stream_scope_active(quote_stream),
+        ),
         "refresh": {
             "running": (
                 service_state.get_value("collection.refresh_running") or "false"
@@ -128,11 +176,151 @@ def _overview_payload(
             "started_at": service_state.get_value("collection.refresh_started_at"),
             "finished_at": service_state.get_value("collection.refresh_finished_at"),
         },
-        "quote_stream": _quote_stream_payload(
-            service_state,
-            connection=read_model.connection,
-        ),
+        "quote_stream": quote_stream,
     }
+    _align_summary_with_quote_stream_progress(payload, quote_stream)
+    return payload
+
+
+def _align_summary_with_quote_stream_progress(payload: dict, quote_stream: dict) -> None:
+    if not _quote_stream_scope_active(quote_stream):
+        return
+    summary = payload.get("summary")
+    progress = quote_stream.get("progress") or {}
+    if not isinstance(summary, dict):
+        return
+    quote_total = int(progress.get("quote_total") or 0)
+    kline_total = int(progress.get("kline_total") or 0)
+    quote_subscribed = int(progress.get("quote_subscribed") or 0)
+    kline_subscribed = int(progress.get("kline_subscribed") or 0)
+    if quote_total > 0:
+        summary["active_options"] = quote_total
+        summary["option_quote_rows"] = min(quote_subscribed, quote_total)
+    if kline_total > 0:
+        summary["option_kline_symbols"] = min(kline_subscribed, kline_total)
+    summary["quote_coverage"] = _ratio_dict_values(
+        summary,
+        numerator_key="option_quote_rows",
+        denominator_key="active_options",
+    )
+    summary["kline_coverage"] = _ratio_dict_values(
+        summary,
+        numerator_key="option_kline_symbols",
+        denominator_key="active_options",
+    )
+
+
+def _ratio_dict_values(
+    data: dict,
+    *,
+    numerator_key: str,
+    denominator_key: str,
+) -> float:
+    denominator = int(data.get(denominator_key) or 0)
+    if denominator <= 0:
+        return 0.0
+    return round(int(data.get(numerator_key) or 0) / denominator, 4)
+
+
+def _realtime_started_at(quote_stream: dict) -> str | None:
+    if not _quote_stream_scope_active(quote_stream):
+        return None
+    progress = quote_stream.get("progress") or {}
+    return (
+        progress.get("started_at")
+        or quote_stream.get("started_at")
+        or progress.get("updated_at")
+    )
+
+
+def _quote_stream_scope_active(quote_stream: dict) -> bool:
+    return bool(quote_stream.get("running")) or (
+        _quote_stream_state_from_value(quote_stream.get("status"), allow_running=True)
+        == QuoteStreamState.STARTING
+    )
+
+
+def _quote_stream_contract_month_limit(quote_stream: dict) -> int | None:
+    progress = quote_stream.get("progress") or {}
+    value = progress.get("contract_months") or quote_stream.get("contract_months")
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text == "all":
+        return None
+    try:
+        parsed = int(text)
+    except ValueError:
+        return 2
+    return parsed if parsed > 0 else None
+
+
+def _quote_stream_min_days_to_expiry(quote_stream: dict) -> int:
+    progress = quote_stream.get("progress") or {}
+    for value in (
+        progress.get("min_days_to_expiry"),
+        quote_stream.get("min_days_to_expiry"),
+    ):
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        return max(parsed, 0)
+    return 1
+
+
+def _quote_stream_lifecycle_status(
+    quote_stream: dict,
+) -> SubscriptionLifecycleStatus | None:
+    if not _quote_stream_scope_active(quote_stream):
+        return None
+    status = _quote_stream_state_from_value(quote_stream.get("status"), allow_running=True)
+    progress = quote_stream.get("progress") or {}
+    quote_total = int(progress.get("quote_total") or 0)
+    kline_total = int(progress.get("kline_total") or 0)
+    quote_subscribed = int(progress.get("quote_subscribed") or 0)
+    kline_subscribed = int(progress.get("kline_subscribed") or 0)
+    if (
+        status == QuoteStreamState.RUNNING
+        and quote_total > 0
+        and kline_total > 0
+        and quote_subscribed >= quote_total
+        and kline_subscribed >= kline_total
+    ):
+        return SubscriptionLifecycleStatus.SUBSCRIBED
+    if status == QuoteStreamState.STARTING:
+        return SubscriptionLifecycleStatus.PENDING
+    return SubscriptionLifecycleStatus.SUBSCRIBING
+
+
+def _progress_with_cached_expected_counts(
+    progress: dict,
+    *,
+    service_state: ServiceStateRepository,
+) -> dict:
+    quote_total = _int_or_none(service_state.get_value("quote_stream.expected_quote_total"))
+    kline_total = _int_or_none(service_state.get_value("quote_stream.expected_kline_total"))
+    if quote_total is None and kline_total is None:
+        return progress
+    enriched = dict(progress)
+    enriched["quote_total"] = max(int(enriched.get("quote_total") or 0), quote_total or 0)
+    enriched["kline_total"] = max(int(enriched.get("kline_total") or 0), kline_total or 0)
+    enriched["total_objects"] = enriched["quote_total"] + enriched["kline_total"]
+    enriched["subscribed_objects"] = (
+        int(enriched.get("quote_subscribed") or 0)
+        + int(enriched.get("kline_subscribed") or 0)
+    )
+    enriched["completion_ratio"] = (
+        enriched["subscribed_objects"] / enriched["total_objects"]
+        if enriched["total_objects"]
+        else 0.0
+    )
+    enriched["contract_months"] = service_state.get_value("quote_stream.contract_months") or enriched.get("contract_months")
+    enriched["min_days_to_expiry"] = _int_or_none(service_state.get_value("quote_stream.min_days_to_expiry")) or 1
+    return enriched
+
 
 
 def _int_or_none(value: str | None) -> int | None:
@@ -177,11 +365,27 @@ def _quote_stream_payload(
         service_state.get_value("quote_stream.report_dir"),
         running=running,
     )
+    contract_months = service_state.get_value("quote_stream.contract_months")
+    min_days_to_expiry = _int_or_none(
+        service_state.get_value("quote_stream.min_days_to_expiry")
+    )
+    worker_count = _int_or_none(service_state.get_value("quote_stream.worker_count")) or len(live_pids)
+    status = _quote_stream_status_value(service_state, running=running)
+    status_state = _quote_stream_state_from_value(status)
+    if connection is not None and (
+        running or status_state == QuoteStreamState.STARTING
+    ) and int(progress.get("worker_reports") or 0) == 0:
+        progress = _progress_with_cached_expected_counts(
+            progress,
+            service_state=service_state,
+        )
     return {
+        "status": status,
         "running": running,
         "message": service_state.get_value("quote_stream.message"),
-        "worker_count": _int_or_none(service_state.get_value("quote_stream.worker_count"))
-        or len(live_pids),
+        "contract_months": contract_months,
+        "min_days_to_expiry": min_days_to_expiry,
+        "worker_count": worker_count,
         "pids": live_pids,
         "report_dir": service_state.get_value("quote_stream.report_dir"),
         "started_at": service_state.get_value("quote_stream.started_at"),
@@ -192,7 +396,58 @@ def _quote_stream_payload(
             running=running,
             progress=progress,
         ),
+        "active_option_count": _active_option_count(connection),
+        "contract_discovery_running": (
+            service_state.get_value("quote_stream.contract_discovery_running") or "false"
+        )
+        == "true",
+        "contract_list_ready": (
+            service_state.get_value("quote_stream.contract_list_ready") or "false"
+        )
+        == "true",
     }
+
+
+def _quote_stream_status_value(
+    service_state: ServiceStateRepository,
+    *,
+    running: bool,
+) -> str:
+    if running:
+        return QuoteStreamState.RUNNING.value
+    return _quote_stream_state_from_value(
+        service_state.get_value("quote_stream.status")
+    ).value
+
+
+def _quote_stream_state_from_value(
+    value: object,
+    *,
+    allow_running: bool = False,
+) -> QuoteStreamState:
+    try:
+        state = QuoteStreamState(str(value))
+    except ValueError:
+        return QuoteStreamState.STOPPED
+    if state == QuoteStreamState.RUNNING and not allow_running:
+        return QuoteStreamState.STOPPED
+    return state
+
+
+def _active_option_count(connection: sqlite3.Connection | None) -> int | None:
+    if connection is None:
+        return None
+    try:
+        row = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM instruments
+            WHERE active = 1 AND option_class IN ('CALL', 'PUT')
+            """
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return int(row[0] or 0) if row is not None else 0
 
 
 def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict:
@@ -233,6 +488,7 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict:
     near_expiry_subscribed = near_expiry_quote_subscribed + near_expiry_kline_subscribed
     near_expiry_total = near_expiry_quote_total + near_expiry_kline_total
     near_expiry_months = max(_int_value(row.get("near_expiry_months")) for row in rows)
+    contract_months = _aggregate_contract_months(rows)
     subscribed_objects = quote_subscribed + kline_subscribed
     total_objects = quote_total + kline_total
     statuses = {str(row.get("status") or "") for row in rows}
@@ -304,6 +560,7 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict:
         "near_expiry_kline_total": near_expiry_kline_total,
         "near_expiry_subscribed": near_expiry_subscribed,
         "near_expiry_total": near_expiry_total,
+        "contract_months": contract_months,
         "subscribed_objects": subscribed_objects,
         "total_objects": total_objects,
         "completion_ratio": subscribed_objects / total_objects
@@ -442,6 +699,7 @@ def _progress_from_report(payload: dict) -> dict | None:
         "kline_subscribed": kline_subscribed,
         "kline_total": kline_total,
         "near_expiry_months": _int_value(result.get("near_expiry_months")),
+        "contract_months": _contract_months_from_result(result),
         "near_expiry_quote_subscribed": near_expiry_quote_subscribed,
         "near_expiry_quote_total": near_expiry_quote_total,
         "near_expiry_kline_subscribed": near_expiry_kline_subscribed,
@@ -480,6 +738,31 @@ def _aggregate_tqsdk_connection_status(rows: list[dict]) -> str:
     return "unknown"
 
 
+def _aggregate_contract_months(rows: list[dict]) -> str | None:
+    values = {
+        str(row.get("contract_months")).strip().lower()
+        for row in rows
+        if row.get("contract_months") is not None
+    }
+    if not values:
+        return None
+    if "all" in values:
+        return "all"
+    parsed = sorted(_int_value(value) for value in values if _int_value(value) > 0)
+    return str(parsed[-1]) if parsed else None
+
+
+def _contract_months_from_result(result: dict) -> str | None:
+    value = result.get("contract_months")
+    if value is not None:
+        return str(value).strip().lower()
+    limit = result.get("contract_month_limit")
+    if limit is None:
+        return "all"
+    parsed = _int_value(limit)
+    return str(parsed) if parsed > 0 else None
+
+
 def _empty_quote_stream_progress(*, running: bool) -> dict:
     return {
         "status": "running" if running else "stopped",
@@ -495,6 +778,7 @@ def _empty_quote_stream_progress(*, running: bool) -> dict:
         "near_expiry_kline_total": 0,
         "near_expiry_subscribed": 0,
         "near_expiry_total": 0,
+        "contract_months": None,
         "subscribed_objects": 0,
         "total_objects": 0,
         "completion_ratio": 0.0,
@@ -705,6 +989,7 @@ def create_app_from_database() -> FastAPI:
     database_path = os.environ.get("ODM_DATABASE_PATH", DEFAULT_DATABASE_PATH)
     Path(database_path).parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path, check_same_thread=False, timeout=30)
+    configure_sqlite_runtime(connection, enable_wal=True)
     return create_webui_app(connection, database_path=database_path)
 
 
@@ -787,7 +1072,7 @@ INDEX_HTML = """<!doctype html>
 
           <section class="panel card">
             <div class="panel-header">
-              <div><span class="panel-title">标的汇总表</span><span class="panel-note">一行一个标的，进入 T型报价查看 CALL/PUT 全链。</span></div>
+              <div><span class="panel-title">标的汇总表</span><span class="panel-note" id="underlying-scope-note">一行一个订阅范围内标的，进入 T型报价查看 CALL/PUT 全链。</span></div>
               <div class="btn-group btn-group-sm" role="group" aria-label="状态筛选">
                 <button class="btn btn-light active" type="button" id="show-all">全部</button>
                 <button class="btn btn-outline-warning" type="button" id="show-issues">只看缺口</button>
@@ -801,7 +1086,7 @@ INDEX_HTML = """<!doctype html>
                 <tbody id="underlying-rows"></tbody>
               </table>
               <div class="empty-state d-none" id="overview-empty">
-                当前 SQLite 运行库还没有合约或行情切片。请先在设置页确认 TQSDK 凭据，然后点击手动刷新或运行 odm-collect。
+                当前实时订阅还没有刷新出本轮行情切片。请先启动合约管理器和实时订阅，或等待订阅完成后刷新。
               </div>
             </div>
           </section>
@@ -814,10 +1099,10 @@ INDEX_HTML = """<!doctype html>
               <p>标的合约 · T型报价 · SQLite 当前切片</p>
             </div>
             <div class="hero-metrics">
-              <div class="metric-card"><span>K线最后时间</span><strong id="quote-book-time">--</strong></div>
+              <div class="metric-card"><span>实时行情时间</span><strong id="quote-book-time">--</strong></div>
               <div class="metric-card"><span>活跃期权</span><strong id="quote-active-options">--</strong></div>
               <div class="metric-card"><span>Greeks/IV 覆盖</span><strong class="good" id="quote-iv-coverage">--</strong></div>
-              <div class="metric-card"><span>20日K线</span><strong class="good" id="quote-kline-status">正常</strong></div>
+              <div class="metric-card"><span>实时状态</span><strong class="warn" id="quote-kline-status">未订阅</strong></div>
             </div>
           </div>
 
@@ -830,7 +1115,7 @@ INDEX_HTML = """<!doctype html>
               <label class="form-label mb-0">到期月</label>
               <select class="form-select form-select-sm" id="expiry-select"></select>
               <span class="expiry-days">剩余到期天数 <strong id="toolbar-expiry-days">--</strong></span>
-              <span class="ms-auto">K线时间 <strong id="toolbar-book-time">--</strong></span>
+              <span class="ms-auto">行情时间 <strong id="toolbar-book-time">--</strong></span>
             </div>
             <div class="quote-table-wrap">
               <table class="table table-sm mb-0 quote-table">
@@ -889,18 +1174,31 @@ INDEX_HTML = """<!doctype html>
             </div>
           </section>
           <section class="panel card">
+            <div class="panel-header"><span class="panel-title">合约管理器</span><span class="panel-note">独立维护本地合约列表；实时订阅只消费它维护好的结果。</span></div>
+            <div class="settings-grid">
+              <label>刷新间隔秒<input class="form-control form-control-sm" id="setting-contract-manager-refresh-interval" type="number" min="60" /></label>
+              <div class="settings-actions contract-manager-actions">
+                <button class="btn btn-sm btn-primary" type="button" id="start-contract-manager">启动合约管理器</button>
+                <button class="btn btn-sm btn-light" type="button" id="stop-contract-manager">停止合约管理器</button>
+              </div>
+            </div>
+            <div class="notice mt-3" id="contract-manager-message">合约管理器状态加载中。</div>
+          </section>
+          <section class="panel card">
             <div class="panel-header"><span class="panel-title">实时 Quote/指标 Worker</span><span class="panel-note">常驻 Quote 订阅分片负责行情刷新；指标 worker 异步刷新 IV/Greeks，不阻塞 Quote 采集。</span></div>
             <div class="settings-grid">
               <label>Worker 数<select class="form-select form-select-sm" id="setting-quote-workers"><option value="1">1 个 worker</option><option value="2">2 个 worker</option><option value="3">3 个 worker</option><option value="4">4 个 worker</option></select></label>
               <label>订阅分片大小<input class="form-control form-control-sm" id="setting-quote-shard-size" type="number" min="1" /></label>
               <label>K线批量大小<input class="form-control form-control-sm" id="setting-kline-batch-size" type="number" min="1" /></label>
               <label>K线窗口天数<input class="form-control form-control-sm" id="setting-kline-data-length" type="number" min="1" /></label>
-              <label>近月数量<input class="form-control form-control-sm" id="setting-near-expiry-months" type="number" min="1" /></label>
+              <label>近月标记数量<input class="form-control form-control-sm" id="setting-near-expiry-months" type="number" min="1" /></label>
+              <label>订阅合约月份<select class="form-select form-select-sm" id="setting-contract-months"><option value="1">1 个</option><option value="2">2 个</option><option value="3">3 个</option><option value="all">全部</option></select></label>
+              <label>最小剩余天数<input class="form-control form-control-sm" id="setting-min-days-to-expiry" type="number" min="0" /></label>
               <label>最大 symbols<input class="form-control form-control-sm" id="setting-quote-max-symbols" type="number" min="1" placeholder="留空为全量" /></label>
               <label>指标最小间隔秒<input class="form-control form-control-sm" id="setting-metrics-min-interval" type="number" min="1" /></label>
               <label>标的全链间隔秒<input class="form-control form-control-sm" id="setting-metrics-chain-interval" type="number" min="1" /></label>
               <label class="checkline"><input class="form-check-input" id="setting-prioritize-near-expiry" type="checkbox" /> 近月优先订阅</label>
-              <div class="settings-actions">
+              <div class="settings-actions quote-stream-actions">
                 <button class="btn btn-sm btn-primary" type="button" id="start-quote-stream">启动实时订阅</button>
                 <button class="btn btn-sm btn-light" type="button" id="stop-quote-stream">停止实时订阅</button>
               </div>
@@ -1120,6 +1418,14 @@ body {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
   align-items: end;
+}
+.quote-stream-actions {
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(160px, 1fr));
+}
+.contract-manager-actions {
+  grid-column: span 3;
+  grid-template-columns: repeat(2, minmax(160px, 1fr));
 }
 .settings-grid button:disabled,
 .settings-grid input:disabled,
@@ -1488,6 +1794,13 @@ WEBUI_JS = r"""
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
+const QuoteStreamStatus = Object.freeze({
+  BLOCKED: "blocked",
+  STARTING: "starting",
+  RUNNING: "running",
+  STOPPED: "stopped",
+});
+
 const state = {
   overview: null,
   quote: null,
@@ -1500,6 +1813,7 @@ const state = {
     estimate: null,
   },
   quoteStreamRefreshBusy: false,
+  overviewRefreshBusy: false,
 };
 
 const exchangeNames = {
@@ -1679,6 +1993,7 @@ function fmtAvgDuration(seconds) {
 }
 
 function fmtStreamStage(progress, running) {
+  if (progress?.refreshingContracts) return "正在刷新合约列表";
   if (!running) return "未运行";
   if (!progress || progress.workerReports === 0) return "初始化";
   if (progress.quoteTotal === 0 && progress.klineTotal === 0) return "初始化";
@@ -1704,30 +2019,23 @@ async function init() {
   bindNavigation();
   bindControls();
   await loadSettings();
-  showPage(location.hash.slice(1) || "overview", { updateHash: false });
+  const initialPage = location.hash.slice(1) || "overview";
+  state.overview = window.__ODM_INITIAL_STATE__?.overview ?? emptyOverview();
+  showPage(initialPage, { updateHash: false });
+  renderOverview();
   if (window.__ODM_INITIAL_STATE__?.overview) {
-    state.overview = window.__ODM_INITIAL_STATE__.overview;
     state.selectedUnderlying = window.__ODM_INITIAL_STATE__.selectedUnderlying;
     state.quote = window.__ODM_INITIAL_STATE__.quote;
     observeStreamProgress(quoteStreamProgress(state.overview.quote_stream));
-    renderOverview();
     renderSelectors();
     if (state.quote) renderQuote({ animate: false });
     await renderRuns();
-  } else {
-    state.overview = await fetchJson("/api/webui/overview?limit=500");
-    observeStreamProgress(quoteStreamProgress(state.overview.quote_stream));
-    renderOverview();
-    const first = state.overview.underlyings[0];
-    if (first) {
-      state.selectedUnderlying = first.underlying_symbol;
-      renderSelectors();
-      await loadQuote(state.selectedUnderlying, { animate: false });
-    }
-    await renderRuns();
+  } else if (initialPage !== "settings") {
+    refreshOverview();
+    renderRuns();
   }
   setInterval(refreshCurrentQuote, 2500);
-  setInterval(refreshOverview, 10000);
+  setInterval(refreshOverview, 30000);
   setInterval(refreshQuoteStreamStatusForOverview, 2500);
   setInterval(() => {
     if (state.overview) renderCollectionProgress();
@@ -1747,6 +2055,58 @@ function showPage(page, options = {}) {
   $$(".page").forEach((node) => node.classList.toggle("active", node.id === id));
   $$(".nav-link[data-page]").forEach((node) => node.classList.toggle("active", node.dataset.page === id));
   if (options.updateHash !== false) history.replaceState(null, "", `#${id}`);
+  if (id === "overview" && !state.overview) refreshOverview();
+  if (id === "runs") renderRuns();
+}
+
+function emptyOverview() {
+  return {
+    summary: {
+      active_options: 0,
+      active_underlyings: 0,
+      active_quote_symbols: 0,
+      option_quote_rows: 0,
+      quote_symbol_rows: 0,
+      quote_symbol_market_rows: 0,
+      option_kline_symbols: 0,
+      metrics_rows: 0,
+      rows_with_greeks: 0,
+      rows_with_iv: 0,
+      acquisition_errors: 0,
+      acquisition_runs: 0,
+      latest_update: null,
+      latest_quote_update: null,
+      quote_coverage: 0,
+      greeks_coverage: 0,
+      iv_coverage: 0,
+      kline_coverage: 0,
+    },
+    collection: {
+      active_batches: 0,
+      success_batches: 0,
+      pending_batches: 0,
+      failed_batches: 0,
+      running_batches: 0,
+      planned_underlyings: 0,
+      completion_ratio: 0,
+      recent_failures: [],
+    },
+    collection_groups: [],
+    exchanges: [],
+    underlyings: [],
+    refresh: { running: false, message: null },
+    quote_stream: {
+      running: false,
+      message: "实时订阅状态加载中。",
+      contract_months: $("#setting-contract-months")?.value ?? "2",
+      worker_count: 0,
+      pids: [],
+      progress: null,
+      active_option_count: null,
+      contract_discovery_running: false,
+      contract_list_ready: false,
+    },
+  };
 }
 
 function bindControls() {
@@ -1771,6 +2131,8 @@ function bindControls() {
   $("#test-credentials").addEventListener("click", testCredentials);
   $("#save-runtime-settings").addEventListener("click", saveRuntimeSettings);
   $("#trigger-refresh").addEventListener("click", triggerRefresh);
+  $("#start-contract-manager").addEventListener("click", startContractManager);
+  $("#stop-contract-manager").addEventListener("click", stopContractManager);
   $("#start-quote-stream").addEventListener("click", startQuoteStream);
   $("#stop-quote-stream").addEventListener("click", stopQuoteStream);
   $("#create-api-key").addEventListener("click", createApiKey);
@@ -1787,15 +2149,19 @@ async function loadSettings() {
     $("#setting-batch-size").value = settings.collection.option_batch_size ?? 20;
     $("#setting-wait-cycles").value = settings.collection.wait_cycles ?? 1;
     $("#setting-max-batches").value = settings.collection.max_batches ?? 100;
+    $("#setting-contract-manager-refresh-interval").value = settings.contract_manager?.refresh_interval_seconds ?? 3600;
     $("#setting-quote-workers").value = settings.quote_stream?.workers ?? 1;
     $("#setting-quote-shard-size").value = settings.quote_stream?.quote_shard_size ?? 1000;
     $("#setting-kline-batch-size").value = settings.quote_stream?.kline_batch_size ?? 1;
     $("#setting-kline-data-length").value = settings.quote_stream?.kline_data_length ?? 3;
     $("#setting-near-expiry-months").value = settings.quote_stream?.near_expiry_months ?? 2;
+    $("#setting-contract-months").value = settings.quote_stream?.contract_months ?? "2";
+    $("#setting-min-days-to-expiry").value = settings.quote_stream?.min_days_to_expiry ?? 1;
     $("#setting-prioritize-near-expiry").checked = settings.quote_stream?.prioritize_near_expiry ?? true;
     $("#setting-quote-max-symbols").value = settings.quote_stream?.max_symbols ?? "";
     $("#setting-metrics-min-interval").value = settings.metrics?.min_interval_seconds ?? 30;
     $("#setting-metrics-chain-interval").value = settings.metrics?.underlying_chain_interval_seconds ?? 30;
+    renderContractManagerStatus(settings.contract_manager?.status);
     renderQuoteStreamStatus(settings.quote_stream?.status);
     setNotice(
       "#settings-message",
@@ -1836,11 +2202,14 @@ async function saveRuntimeSettings() {
     ["collection.option_batch_size", $("#setting-batch-size").value || "20"],
     ["collection.wait_cycles", $("#setting-wait-cycles").value || "1"],
     ["collection.max_batches", $("#setting-max-batches").value || "100"],
+    ["contract_manager.refresh_interval_seconds", $("#setting-contract-manager-refresh-interval").value || "3600"],
     ["quote_stream.workers", $("#setting-quote-workers").value || "1"],
     ["quote_stream.quote_shard_size", $("#setting-quote-shard-size").value || "1000"],
     ["quote_stream.kline_batch_size", $("#setting-kline-batch-size").value || "1"],
     ["quote_stream.kline_data_length", $("#setting-kline-data-length").value || "3"],
     ["quote_stream.near_expiry_months", $("#setting-near-expiry-months").value || "2"],
+    ["quote_stream.contract_months", $("#setting-contract-months").value || "2"],
+    ["quote_stream.min_days_to_expiry", $("#setting-min-days-to-expiry").value || "1"],
     ["quote_stream.prioritize_near_expiry", $("#setting-prioritize-near-expiry").checked ? "true" : "false"],
     ["quote_stream.max_symbols", $("#setting-quote-max-symbols").value || ""],
     ["metrics.min_interval_seconds", $("#setting-metrics-min-interval").value || "30"],
@@ -1860,16 +2229,45 @@ async function triggerRefresh() {
   await refreshOverview();
 }
 
+async function startContractManager() {
+  setContractManagerControls({ running: true, busy: true });
+  setNotice("#contract-manager-message", "正在启动合约管理器并刷新合约列表。", "warn");
+  try {
+    await saveRuntimeSettings();
+    const result = await fetchJsonWithBody("/api/contract-manager/start", "POST", {});
+    renderContractManagerStatus(result);
+    const quoteStatus = await fetchJson("/api/quote-stream");
+    renderQuoteStreamStatus(quoteStatus);
+  } catch (error) {
+    setNotice("#contract-manager-message", `合约管理器启动失败：${error.message}`, "bad");
+    setContractManagerControls({ running: false });
+  }
+}
+
+async function stopContractManager() {
+  setContractManagerControls({ running: true, busy: true });
+  setNotice("#contract-manager-message", "正在停止合约管理器。", "warn");
+  try {
+    const result = await fetchJsonWithBody("/api/contract-manager/stop", "POST", {});
+    renderContractManagerStatus(result);
+    const quoteStatus = await fetchJson("/api/quote-stream");
+    renderQuoteStreamStatus(quoteStatus);
+  } catch (error) {
+    setNotice("#contract-manager-message", `合约管理器停止失败：${error.message}`, "bad");
+    setContractManagerControls({ running: true });
+  }
+}
+
 async function startQuoteStream() {
   setQuoteStreamControls({ running: true, busy: true });
-  setNotice("#quote-stream-message", "正在检查合约列表并启动实时订阅 worker。", "warn");
+  setNotice("#quote-stream-message", "正在启动实时订阅 worker。", "warn");
   try {
     await saveRuntimeSettings();
     const payload = {
       workers: Number($("#setting-quote-workers").value || 1),
       quote_shard_size: Number($("#setting-quote-shard-size").value || 1000),
       kline_batch_size: Number($("#setting-kline-batch-size").value || 1),
-      discover: false,
+      contract_months: $("#setting-contract-months").value || "2",
     };
     const maxSymbols = $("#setting-quote-max-symbols").value;
     if (maxSymbols) payload.max_symbols = Number(maxSymbols);
@@ -1878,7 +2276,7 @@ async function startQuoteStream() {
     await refreshOverview();
   } catch (error) {
     setNotice("#quote-stream-message", `实时订阅启动失败：${error.message}`, "bad");
-    setQuoteStreamControls({ running: false });
+    setQuoteStreamControls({ running: false, contractListReady: false });
   }
 }
 
@@ -1902,21 +2300,88 @@ function renderQuoteStreamStatus(status) {
     return;
   }
   const configuredWorkers = Number($("#setting-quote-workers")?.value || status.worker_count || 1);
-  const stateText = status.running ? "实时订阅运行中" : "实时订阅未运行";
+  const starting = isQuoteStreamStarting(status);
+  const discovering = isContractDiscoveryRunning(status);
+  const hasContracts = status.active_option_count === null || status.active_option_count === undefined || Number(status.active_option_count) > 0;
+  const contractListReady = Boolean(status.contract_list_ready);
+  const stateText = discovering
+    ? "正在拉取合约列表"
+    : starting
+    ? "实时订阅启动中"
+    : status.running
+    ? "实时订阅运行中"
+    : "实时订阅未运行";
   const workerText = status.running
     ? `正在运行 ${fmtNum(status.worker_count || configuredWorkers)} 个独立 worker 进程`
+    : discovering
+    ? "拉取完成后可启动实时订阅"
+    : starting
+    ? `准备启动 ${fmtNum(configuredWorkers)} 个独立 worker 进程`
     : `配置为启动 ${fmtNum(configuredWorkers)} 个独立 worker 进程`;
+  const contractText = hasContracts
+    ? contractListReady
+      ? `合约列表已准备：${fmtNum(status.active_option_count)} 个可订阅期权合约`
+      : `合约管理器未就绪，无法订阅行情。当前本地库已有 ${fmtNum(status.active_option_count)} 个历史合约，请先启动合约管理器。`
+    : "合约管理器尚未刷新出可订阅合约，无法订阅行情。";
   const message = status.message ? `上次状态：${status.message}` : "等待启动。";
   const reports = status.report_dir ? `报告目录：${status.report_dir}` : "";
   const health = status.health ? `网络健康：${status.health.label ?? status.health.status}` : "";
   const notify = fmtTqsdkNotifyHint(status);
-  const tone = status.health?.tone === "bad" ? "bad" : status.running ? "good" : status.status === "blocked" ? "bad" : "warn";
-  setNotice("#quote-stream-message", [stateText, workerText, health, notify, message, reports].filter(Boolean).join(" · "), tone);
-  setQuoteStreamControls({ running: Boolean(status.running) });
+  const tone = status.health?.tone === "bad" ? "bad" : status.running ? "good" : status.status === "blocked" || !hasContracts || !contractListReady ? "bad" : "warn";
+  setNotice("#quote-stream-message", [stateText, workerText, contractText, health, notify, message, reports].filter(Boolean).join(" · "), tone);
+  setQuoteStreamControls({
+    running: Boolean(status.running),
+    busy: starting || discovering,
+    discovering,
+    hasContracts,
+    contractListReady,
+  });
 }
 
-function setQuoteStreamControls({ running, busy = false }) {
-  $("#start-quote-stream").disabled = Boolean(running || busy);
+function renderContractManagerStatus(status) {
+  if (!status) {
+    setNotice("#contract-manager-message", "合约管理器状态暂不可用。", "warn");
+    setContractManagerControls({ running: false });
+    return;
+  }
+  const stateText = status.refresh_running
+    ? "合约管理器刷新中"
+    : status.healthy
+    ? "合约管理器正常"
+    : status.running
+    ? "合约管理器运行中"
+    : "合约管理器未运行";
+  const contractText = `合约列表：${fmtNum(status.active_option_count)} 个可订阅期权合约`;
+  const heartbeat = status.last_heartbeat_at ? `心跳：${fmtDateTime(status.last_heartbeat_at)}` : "";
+  const success = status.last_success_at ? `最近成功：${fmtDateTime(status.last_success_at)}` : "";
+  const interval = `刷新间隔：${fmtNum(status.refresh_interval_seconds)} 秒`;
+  const tone = status.healthy ? "good" : status.running ? "warn" : "bad";
+  setNotice(
+    "#contract-manager-message",
+    [stateText, contractText, interval, heartbeat, success, status.message].filter(Boolean).join(" · "),
+    tone,
+  );
+  setContractManagerControls({ running: Boolean(status.running), busy: Boolean(status.refresh_running) });
+}
+
+function setContractManagerControls({ running, busy = false }) {
+  $("#start-contract-manager").disabled = Boolean(running || busy);
+  $("#stop-contract-manager").disabled = Boolean(!running && !busy);
+  $("#setting-contract-manager-refresh-interval").disabled = Boolean(running || busy);
+}
+
+function isQuoteStreamStarting(quoteStream) {
+  return !quoteStream?.running
+    && !quoteStream?.contract_discovery_running
+    && quoteStream?.status === QuoteStreamStatus.STARTING;
+}
+
+function isContractDiscoveryRunning(quoteStream) {
+  return Boolean(quoteStream?.contract_discovery_running);
+}
+
+function setQuoteStreamControls({ running, busy = false, discovering = false, hasContracts = true, contractListReady = false }) {
+  $("#start-quote-stream").disabled = Boolean(running || busy || discovering || !hasContracts || !contractListReady);
   $("#stop-quote-stream").disabled = Boolean(!running || busy);
   [
     "setting-quote-workers",
@@ -1924,6 +2389,8 @@ function setQuoteStreamControls({ running, busy = false }) {
     "setting-kline-batch-size",
     "setting-kline-data-length",
     "setting-near-expiry-months",
+    "setting-contract-months",
+    "setting-min-days-to-expiry",
     "setting-quote-max-symbols",
     "setting-prioritize-near-expiry",
   ].forEach((id) => {
@@ -2050,6 +2517,7 @@ function fmtCollectionProgress(progress) {
 }
 
 function fmtQuoteStreamValue(quoteStream) {
+  if (isQuoteStreamStarting(quoteStream)) return "启动中";
   if (!quoteStream?.running) return "空闲";
   const workers = Number(quoteStream.worker_count ?? 0);
   return workers > 0 ? `${fmtNum(workers)} worker` : "运行中";
@@ -2142,6 +2610,8 @@ function quoteStreamProgress(quoteStream) {
     nearExpiryQuoteTotal: Number(progress.near_expiry_quote_total ?? 0),
     nearExpiryKlineSubscribed: Number(progress.near_expiry_kline_subscribed ?? 0),
     nearExpiryKlineTotal: Number(progress.near_expiry_kline_total ?? 0),
+    contractMonths: progress.contract_months ?? quoteStream?.contract_months ?? null,
+    refreshingContracts: Boolean(quoteStream?.contract_discovery_running),
     workerReports: Number(progress.worker_reports ?? 0),
     updatedAt: progress.updated_at,
     elapsedSeconds: progress.elapsed_seconds,
@@ -2153,7 +2623,7 @@ function quoteStreamProgress(quoteStream) {
     stageEstimatedRemainingSeconds: progress.stage_estimated_remaining_seconds,
     estimatedRemainingIsTotal: Boolean(progress.estimated_remaining_is_total),
     waitingForKlineEta: Boolean(progress.waiting_for_kline_eta),
-    status: progress.status ?? (quoteStream?.running ? "running" : "stopped"),
+    status: progress.status ?? quoteStream?.status ?? (quoteStream?.running ? QuoteStreamStatus.RUNNING : QuoteStreamStatus.STOPPED),
   };
 }
 
@@ -2237,10 +2707,25 @@ function streamEtaSummary(progress) {
 
 function streamNearExpiryKlineMarker(progress) {
   if (!progress || progress.klineTotal <= 0 || progress.nearExpiryKlineTotal <= 0) return "";
+  if (progress.contractMonths !== "all") return "";
   const markerRatio = Math.min(1, Math.max(0, progress.nearExpiryKlineTotal / progress.klineTotal));
   const months = progress.nearExpiryMonths || 2;
   const title = `近${months}月K线对象 ${fmtNum(progress.nearExpiryKlineSubscribed)} / ${fmtNum(progress.nearExpiryKlineTotal)}`;
   return `<div class="stream-progress-marker" title="${escapeHtml(title)}" style="left: ${escapeHtml((markerRatio * 100).toFixed(2))}%"></div>`;
+}
+
+function streamNearExpirySummary(progress) {
+  if (!progress || progress.contractMonths !== "all") return "";
+  const months = progress.nearExpiryMonths || 2;
+  return ` · 近${fmtNum(months)}月K线对象 ${fmtNum(progress.nearExpiryKlineSubscribed)}/${fmtNum(progress.nearExpiryKlineTotal)} · 近${fmtNum(months)}月Quote ${fmtNum(progress.nearExpiryQuoteSubscribed)}/${fmtNum(progress.nearExpiryQuoteTotal)}`;
+}
+
+function streamContractScopeText(progress) {
+  const value = String(progress?.contractMonths ?? "").trim().toLowerCase();
+  if (value === "all") return "订阅范围：全部合约";
+  const months = Number(value);
+  if (Number.isFinite(months) && months > 0) return `订阅范围：近${fmtNum(months)}个月合约`;
+  return "订阅范围：按当前设置";
 }
 
 function renderCollectionProgress() {
@@ -2287,7 +2772,7 @@ function renderCollectionProgress() {
     ["最近批量分片更新", fmtDateTime(progress.latest_batch_update), progress.latest_batch_update ? "仅批量采集进度" : "暂无更新", ""],
   ];
   const streamProgressHtml = `
-    <div class="progress-card stream-progress-card ${quoteStream.running ? "warn" : ""}">
+    <div class="progress-card stream-progress-card ${quoteStream.running || streamProgress.refreshingContracts ? "warn" : ""}">
       <span>实时订阅对象进度</span>
       <strong>${escapeHtml(streamStage)}</strong>
       <div class="stream-split-grid">
@@ -2313,7 +2798,7 @@ function renderCollectionProgress() {
           </div>
         </div>
       </div>
-      <small>${escapeHtml(fmtNum(streamProgress.workerReports))} worker报告 · 近${escapeHtml(fmtNum(streamProgress.nearExpiryMonths || 2))}月K线对象 ${escapeHtml(fmtNum(streamProgress.nearExpiryKlineSubscribed))}/${escapeHtml(fmtNum(streamProgress.nearExpiryKlineTotal))} · 近${escapeHtml(fmtNum(streamProgress.nearExpiryMonths || 2))}月Quote ${escapeHtml(fmtNum(streamProgress.nearExpiryQuoteSubscribed))}/${escapeHtml(fmtNum(streamProgress.nearExpiryQuoteTotal))} · 订阅总用时 ${escapeHtml(fmtDuration(streamProgress.elapsedSeconds))} · ${escapeHtml(streamEtaSummary(streamProgress))}</small>
+      <small>${escapeHtml(streamContractScopeText(streamProgress))} · ${escapeHtml(fmtNum(streamProgress.workerReports))} worker报告${escapeHtml(streamNearExpirySummary(streamProgress))} · 订阅总用时 ${escapeHtml(fmtDuration(streamProgress.elapsedSeconds))} · ${escapeHtml(streamEtaSummary(streamProgress))}</small>
     </div>
   `;
   $("#collection-progress").innerHTML = streamProgressHtml + cards.map(([label, value, hint, tone]) => `
@@ -2332,7 +2817,7 @@ function renderCollectionProgress() {
 }
 
 function renderExchangeTabs() {
-  const rows = state.overview?.underlyings ?? [];
+  const rows = scopedUnderlyingRows();
   const exchanges = unique(rows.map((row) => row.exchange_id));
   if (!exchanges.includes(state.selectedExchange) && state.selectedExchange !== "ALL") {
     state.selectedExchange = "ALL";
@@ -2360,14 +2845,21 @@ function renderExchangeTabs() {
 }
 
 function renderUnderlyingRows() {
-  const rows = state.overview.underlyings.filter((row) => {
+  const scopeRows = scopedUnderlyingRows();
+  const rows = scopeRows.filter((row) => {
     const exchangeMatch = state.selectedExchange === "ALL" || row.exchange_id === state.selectedExchange;
-    const issueMatch = !state.showIssuesOnly || row.status !== "正常";
+    const issueMatch = !state.showIssuesOnly || !["正常", "已订阅"].includes(row.status);
     return exchangeMatch && issueMatch;
   });
+  const scopeText = streamContractScopeText(quoteStreamProgress(state.overview?.quote_stream));
+  $("#underlying-scope-note").textContent = `${scopeText.replace("订阅范围：", "按")}显示；一行一个标的，进入 T型报价查看 CALL/PUT 全链。`;
   $("#overview-empty").classList.toggle("d-none", rows.length !== 0);
   $("#underlying-rows").innerHTML = rows.map((row) => {
-    const statusClass = row.status === "正常" ? "good" : row.status === "数据缺口" ? "warn" : "bad";
+    const statusClass = ["正常", "已订阅"].includes(row.status)
+      ? "good"
+      : ["数据缺口", "待订阅", "订阅中"].includes(row.status)
+      ? "warn"
+      : "bad";
     return `<tr class="clickable" data-underlying="${escapeHtml(row.underlying_symbol)}">
       <td>${escapeHtml(exchangeNames[row.exchange_id] ?? row.exchange_id)}</td>
       <td>${escapeHtml(productNames[row.product_id] ?? row.product_id)}</td>
@@ -2397,7 +2889,61 @@ function selectorRows() {
     ...row,
     underlying_symbol: row.underlying_symbol ?? row.symbol,
   })) ?? [];
-  return quoteSelectors.length ? quoteSelectors : (state.overview?.underlyings ?? []);
+  return quoteSelectors.length ? quoteSelectors : scopedUnderlyingRows();
+}
+
+function scopedUnderlyingRows() {
+  return filterRowsByContractScope(
+    state.overview?.underlyings ?? [],
+    currentContractScopeValue(),
+  );
+}
+
+function currentContractScopeValue() {
+  return String(
+    state.overview?.quote_stream?.progress?.contract_months
+      ?? state.overview?.quote_stream?.contract_months
+      ?? $("#setting-contract-months")?.value
+      ?? "2",
+  ).trim().toLowerCase();
+}
+
+function filterRowsByContractScope(rows, scopeValue) {
+  if (scopeValue === "all") return rows;
+  const limit = Number(scopeValue);
+  if (!Number.isFinite(limit) || limit < 1) return rows;
+  const grouped = new Map();
+  for (const row of rows) {
+    const groupKey = `${row.exchange_id ?? ""}|${row.product_id ?? ""}`;
+    if (!grouped.has(groupKey)) grouped.set(groupKey, []);
+    grouped.get(groupKey).push(row);
+  }
+  const allowed = new Set();
+  for (const groupRows of grouped.values()) {
+    [...groupRows]
+      .sort((left, right) => compareContractRows(left, right))
+      .slice(0, limit)
+      .forEach((row) => allowed.add(row.underlying_symbol));
+  }
+  return rows.filter((row) => allowed.has(row.underlying_symbol));
+}
+
+function compareContractRows(left, right) {
+  const leftKey = contractMonthKey(left.underlying_symbol ?? left.expiry_month);
+  const rightKey = contractMonthKey(right.underlying_symbol ?? right.expiry_month);
+  if (leftKey[0] !== rightKey[0]) return leftKey[0] - rightKey[0];
+  if (leftKey[1] !== rightKey[1]) return leftKey[1] - rightKey[1];
+  return String(left.underlying_symbol ?? "").localeCompare(String(right.underlying_symbol ?? ""));
+}
+
+function contractMonthKey(symbol) {
+  const match = String(symbol ?? "").match(/(\d{3,4})/);
+  if (!match) return [9999, 99];
+  const digits = match[1];
+  const year = digits.length === 3 ? 2020 + Number(digits.slice(0, 1)) : 2000 + Number(digits.slice(0, 2));
+  const month = digits.length === 3 ? Number(digits.slice(1, 3)) : Number(digits.slice(2, 4));
+  if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) return [9999, 99];
+  return [year, month];
 }
 
 function renderSelectors() {
@@ -2484,14 +3030,18 @@ async function refreshCurrentQuote() {
 }
 
 async function refreshOverview() {
+  if (!$("#overview").classList.contains("active")) return;
+  if (state.overviewRefreshBusy) return;
+  state.overviewRefreshBusy = true;
   try {
     state.overview = await fetchJson("/api/webui/overview?limit=500");
     observeStreamProgress(quoteStreamProgress(state.overview.quote_stream));
+    const scopedRows = scopedUnderlyingRows();
     if (
-      state.selectedUnderlying &&
-      !state.overview.underlyings.some((row) => row.underlying_symbol === state.selectedUnderlying)
+      !state.selectedUnderlying ||
+      !scopedRows.some((row) => row.underlying_symbol === state.selectedUnderlying)
     ) {
-      state.selectedUnderlying = state.overview.underlyings[0]?.underlying_symbol ?? null;
+      state.selectedUnderlying = scopedRows[0]?.underlying_symbol ?? null;
       if (state.selectedUnderlying) {
         await loadQuote(state.selectedUnderlying, { animate: false });
       }
@@ -2500,6 +3050,8 @@ async function refreshOverview() {
     renderSelectors();
   } catch {
     // Keep the existing selector universe visible if the local API is temporarily unavailable.
+  } finally {
+    state.overviewRefreshBusy = false;
   }
 }
 
@@ -2513,6 +3065,8 @@ async function refreshQuoteStreamStatusForOverview() {
     renderCollectionProgress();
     if ($("#settings").classList.contains("active")) {
       renderQuoteStreamStatus(status);
+      const managerStatus = await fetchJson("/api/contract-manager");
+      renderContractManagerStatus(managerStatus);
     }
   } catch {
     // Keep the existing stream status visible until the next overview refresh.
@@ -2529,13 +3083,28 @@ function renderQuote(options = {}) {
   const withIv = data.strikes.reduce((count, row) => count + (row.CALL?.iv ? 1 : 0) + (row.PUT?.iv ? 1 : 0), 0);
   const withKline = data.strikes.reduce((count, row) => count + (row.CALL?.has_kline ? 1 : 0) + (row.PUT?.has_kline ? 1 : 0), 0);
   $("#quote-title").textContent = `${underlying.symbol ?? "T型报价"} ${parts.productName}期货`;
-  const displayTime = underlying.last_kline_display_datetime ?? underlying.source_datetime ?? underlying.received_at;
+  const realtimeFresh = Boolean(underlying.realtime_subscribed);
+  const displayTime = realtimeFresh
+    ? (underlying.realtime_latest_source_datetime ?? underlying.realtime_latest_quote_received_at)
+    : null;
   $("#quote-book-time").textContent = fmtDateTime(displayTime);
   $("#toolbar-book-time").textContent = fmtDateTime(displayTime);
   $("#toolbar-expiry-days").textContent = fmtDaysToExpiry(underlying.days_to_expiry);
   $("#quote-active-options").textContent = fmtNum(activeOptions);
   $("#quote-iv-coverage").textContent = activeOptions ? fmtPct(withIv / activeOptions) : "--";
-  $("#quote-kline-status").textContent = activeOptions && withKline >= activeOptions ? "正常" : "补齐中";
+  const realtimeStatus = realtimeFresh
+    ? activeOptions && withKline >= activeOptions
+      ? "正常"
+      : "K线补齐中"
+    : "未订阅";
+  const realtimeTone = !realtimeFresh
+    ? "warn"
+    : activeOptions && withKline >= activeOptions
+    ? "good"
+    : "warn";
+  $("#quote-kline-status").textContent = realtimeStatus;
+  $("#quote-kline-status").classList.remove("good", "warn", "bad");
+  $("#quote-kline-status").classList.add(realtimeTone);
   $("#quote-head").innerHTML = `<tr class="market-strip">
     <th class="call-title" colspan="9">看涨期权 CALL</th>
     <th class="under-bid"><span class="tag good">买价 ${fmtNum(underlying.bid_price1, 0)}</span></th>

@@ -43,8 +43,30 @@ def build_realtime_health(
 
     current = _local_now(now)
     progress = progress or {}
-    latest_quote = _latest_future_quote(connection) if connection is not None else None
     session = current_trading_session(current)
+    if not running:
+        return {
+            "checked_at": current.isoformat(),
+            "session_active": session is not None,
+            "session_label": session.label if session else None,
+            "latest_market_source_datetime": None,
+            "latest_market_received_at": None,
+            "last_report_at": progress.get("updated_at"),
+            "last_wait_update_at": progress.get("last_wait_update_at"),
+            "last_quote_write_at": progress.get("last_quote_write_at"),
+            "last_tqsdk_notify_at": progress.get("last_tqsdk_notify_at"),
+            "last_tqsdk_notify_code": progress.get("last_tqsdk_notify_code"),
+            "last_tqsdk_notify_level": progress.get("last_tqsdk_notify_level"),
+            "last_tqsdk_notify_content": progress.get("last_tqsdk_notify_content"),
+            "tqsdk_connection_status": progress.get("tqsdk_connection_status"),
+            "last_tqsdk_disconnect_at": progress.get("last_tqsdk_disconnect_at"),
+            "last_tqsdk_restore_at": progress.get("last_tqsdk_restore_at"),
+            "status": "idle",
+            "label": "未运行",
+            "message": "实时订阅未运行。",
+            "tone": "warn",
+        }
+    latest_quote = _latest_future_quote(connection) if connection is not None else None
     base = {
         "checked_at": current.isoformat(),
         "session_active": session is not None,
@@ -66,19 +88,19 @@ def build_realtime_health(
         "last_tqsdk_disconnect_at": progress.get("last_tqsdk_disconnect_at"),
         "last_tqsdk_restore_at": progress.get("last_tqsdk_restore_at"),
     }
-    if not running:
-        return {
-            **base,
-            "status": "idle",
-            "label": "未运行",
-            "message": "实时订阅未运行。",
-            "tone": "warn",
+    subscribed_objects = _int_value(progress.get("subscribed_objects"))
+    total_objects = _int_value(progress.get("total_objects"))
+    active_stage = str(progress.get("active_stage") or "")
+    if (
+        str(progress.get("status") or "") in {
+            "initializing",
+            "subscribing",
+            "quote_subscribing",
+            "kline_subscribing",
         }
-    if str(progress.get("status") or "") in {
-        "initializing",
-        "subscribing",
-        "kline_subscribing",
-    }:
+        or active_stage in {"initializing", "quote", "kline"}
+        or (total_objects > 0 and subscribed_objects < total_objects)
+    ):
         return {
             **base,
             "status": "subscribing",
@@ -311,6 +333,13 @@ def _age_seconds(value: Any, now: datetime) -> float | None:
     if parsed is None:
         return None
     return max(0.0, (now - parsed.astimezone(SHANGHAI_TZ)).total_seconds())
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _parse_datetime(value: Any) -> datetime | None:

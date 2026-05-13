@@ -1,4 +1,5 @@
 import sqlite3
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -9,6 +10,21 @@ from option_data_manager.instruments import (
     normalize_option_chain_discovery,
 )
 from option_data_manager.settings import PlainTextProtector, SettingsRepository
+
+
+class _AliveThread:
+    def is_alive(self) -> bool:
+        return True
+
+
+def _wait_for_quote_stream_running(client: TestClient) -> dict:
+    payload = client.get("/api/quote-stream").json()
+    for _ in range(100):
+        if payload["running"]:
+            return payload
+        time.sleep(0.02)
+        payload = client.get("/api/quote-stream").json()
+    return payload
 
 
 def test_api_status_and_settings_do_not_require_key_by_default() -> None:
@@ -27,6 +43,8 @@ def test_api_status_and_settings_do_not_require_key_by_default() -> None:
     assert settings["quote_stream"]["kline_data_length"] == 3
     assert settings["quote_stream"]["prioritize_near_expiry"] is True
     assert settings["quote_stream"]["near_expiry_months"] == 2
+    assert settings["quote_stream"]["contract_months"] == "2"
+    assert settings["quote_stream"]["min_days_to_expiry"] == 1
 
 
 def test_api_key_required_when_setting_enabled() -> None:
@@ -83,6 +101,24 @@ def test_service_logs_capture_safe_settings_events() -> None:
     assert "super-secret" not in str(logs)
 
 
+def test_settings_save_survives_best_effort_log_commit_failure(monkeypatch) -> None:
+    def fail_append(*args, **kwargs) -> None:
+        raise SystemError(
+            "<method 'commit' of 'sqlite3.Connection' objects> returned NULL "
+            "without setting an exception"
+        )
+
+    monkeypatch.setattr("option_data_manager.api.app.ServiceLogRepository.append", fail_append)
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    client = TestClient(app)
+
+    response = client.put("/api/settings/api.bind", json={"value": "127.0.0.1"})
+
+    assert response.status_code == 200
+    assert client.get("/api/settings").json()["api"]["bind"] == "127.0.0.1"
+
+
 def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
     class FakeProcess:
         _next_pid = 32000
@@ -136,6 +172,11 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
         "/api/settings/tqsdk-credentials",
         json={"account": "demo", "password": "super-secret"},
     )
+    client.put("/api/settings/quote_stream.min_days_to_expiry", json={"value": "2"})
+    app.state.contract_manager_worker["thread"] = _AliveThread()
+    app.state.service_state.set_value("contract_manager.running", "true")
+    app.state.service_state.set_value("contract_manager.last_success_at", "2026-05-11T00:00:00+00:00")
+    app.state.service_state.set_value("quote_stream.contract_list_ready", "true")
 
     started = client.post(
         "/api/quote-stream/start",
@@ -143,16 +184,22 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
             "workers": 2,
             "quote_shard_size": 50,
             "kline_batch_size": 2,
+            "contract_months": "1",
             "max_symbols": 100,
         },
     )
 
     assert started.status_code == 200
     payload = started.json()
+    assert payload["status"] == "starting"
+    assert payload["running"] is False
+    assert payload["message"]
+    payload = _wait_for_quote_stream_running(client)
     assert payload["running"] is True
     assert payload["worker_count"] == 2
     assert len(payload["pids"]) == 2
-    assert discovery_calls == [fake_api]
+    assert payload["progress"]["worker_reports"] == 0
+    assert discovery_calls == []
     assert len(created) == 3
     assert "--worker-index" in created[0].command
     assert "--no-klines" not in created[0].command
@@ -168,6 +215,14 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
     assert created[0].command[
         created[0].command.index("--near-expiry-months") + 1
     ] == "2"
+    assert "--contract-months" in created[0].command
+    assert created[0].command[
+        created[0].command.index("--contract-months") + 1
+    ] == "1"
+    assert "--min-days-to-expiry" in created[0].command
+    assert created[0].command[
+        created[0].command.index("--min-days-to-expiry") + 1
+    ] == "2"
     assert "--no-prioritize-near-expiry" not in created[0].command
     assert "option_data_manager.cli.metrics_worker" in created[2].command
     assert "--min-interval-seconds" in created[2].command
@@ -179,6 +234,34 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch) -> None:
     assert stopped.status_code == 200
     assert stopped.json()["running"] is False
     assert all(process.terminated for process in created)
+
+
+def test_quote_stream_start_blocks_until_contract_list_is_prepared() -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C100",),
+            put_symbols=("DCE.a2601P100",),
+            last_seen_at="2026-05-11T00:00:00+08:00",
+        )
+    )
+    client = TestClient(app)
+    client.put(
+        "/api/settings/tqsdk-credentials",
+        json={"account": "demo", "password": "super-secret"},
+    )
+
+    response = client.post("/api/quote-stream/start", json={"workers": 1})
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["status"] == "blocked"
+    assert payload["running"] is False
+    assert payload["active_option_count"] == 2
+    assert payload["contract_list_ready"] is False
+    assert "合约管理器未正常运行" in payload["message"]
 
 
 def test_quote_stream_stop_is_best_effort_when_state_db_is_locked(monkeypatch) -> None:
@@ -245,7 +328,23 @@ def test_quote_stream_status_ignores_stale_state_write_lock(monkeypatch) -> None
     assert payload["status"] == "stopped"
 
 
-def test_quote_stream_start_initializes_empty_contract_universe(monkeypatch) -> None:
+def test_quote_stream_starting_status_uses_state_enum_not_message() -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    app.state.service_state.set_value("quote_stream.status", "starting")
+    app.state.service_state.set_value("quote_stream.running", "false")
+    app.state.service_state.set_value("quote_stream.worker_count", "4")
+    app.state.service_state.set_value("quote_stream.message", "使用已有合约列表启动实时订阅。")
+    client = TestClient(app)
+
+    payload = client.get("/api/quote-stream").json()
+
+    assert payload["status"] == "starting"
+    assert payload["running"] is False
+    assert payload["message"] == "使用已有合约列表启动实时订阅。"
+
+
+def test_quote_stream_start_blocks_when_contract_universe_is_empty(monkeypatch) -> None:
     class FakeProcess:
         _next_pid = 32100
 
@@ -303,18 +402,74 @@ def test_quote_stream_start_initializes_empty_contract_universe(monkeypatch) -> 
     payload = response.json()
 
     assert response.status_code == 200
-    assert payload["running"] is True
-    assert payload["message"] == "已初始化合约列表并启动实时订阅 worker。"
-    assert fake_api.closed is True
-    assert len(created) == 2
-    assert "--no-discover" in created[0].command
+    assert payload["status"] == "blocked"
+    assert payload["running"] is False
+    assert "合约管理器未正常运行" in payload["message"]
+    assert fake_api.closed is False
+    assert created == []
     assert connection.execute(
         "SELECT COUNT(*) FROM instruments WHERE option_class IN ('CALL', 'PUT')"
-    ).fetchone()[0] == 2
+    ).fetchone()[0] == 0
+
+
+def test_quote_stream_contract_discovery_initializes_empty_universe(monkeypatch) -> None:
+    class FakeApi:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake_api = FakeApi()
+    monkeypatch.setattr(
+        "option_data_manager.api.app.create_tqsdk_api_with_retries",
+        lambda account, password: fake_api,
+    )
+
+    def fake_discover(api, connection):
+        assert api is fake_api
+        InstrumentRepository(connection).upsert_instruments(
+            normalize_option_chain_discovery(
+                underlying_symbol="DCE.a2601",
+                call_symbols=("DCE.a2601C100",),
+                put_symbols=("DCE.a2601P100",),
+                last_seen_at="2026-05-11T00:00:00+08:00",
+            )
+        )
+        return None
+
+    monkeypatch.setattr(
+        "option_data_manager.api.app._discover_and_persist_market",
+        fake_discover,
+    )
+
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    client = TestClient(app)
+    client.put(
+        "/api/settings/tqsdk-credentials",
+        json={"account": "demo", "password": "super-secret"},
+    )
+
+    response = client.post("/api/quote-stream/discover-contracts")
+
+    assert response.status_code == 200
+    payload = client.get("/api/quote-stream").json()
+    for _ in range(100):
+        if not payload["contract_discovery_running"]:
+            break
+        time.sleep(0.02)
+        payload = client.get("/api/quote-stream").json()
+    assert payload["running"] is False
+    assert payload["active_option_count"] == 2
+    assert payload["contract_list_ready"] is True
+    assert "合约管理器正常运行" in payload["message"]
+    assert fake_api.closed is True
 
 
 def test_quote_stream_status_aggregates_runtime_subscription_progress(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     class FakeProcess:
         def __init__(self) -> None:
@@ -360,6 +515,7 @@ def test_quote_stream_status_aggregates_runtime_subscription_progress(
             "near_expiry_kline_total": 2,
             "near_expiry_subscribed": 5,
             "near_expiry_total": 6,
+            "contract_months": "all",
             "subscribed_objects": 6,
             "total_objects": 8,
             "completion_ratio": 0.75
@@ -376,6 +532,10 @@ def test_quote_stream_status_aggregates_runtime_subscription_progress(
     app.state.service_state.set_value("quote_stream.worker_count", "1")
     app.state.service_state.set_value("quote_stream.report_dir", str(report_dir))
     app.state.service_state.set_value("quote_stream.pids", "[33000]")
+    monkeypatch.setattr(
+        "option_data_manager.api.app.expected_subscription_counts",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not recalculate when reports exist")),
+    )
     client = TestClient(app)
 
     payload = client.get("/api/quote-stream").json()
@@ -387,6 +547,7 @@ def test_quote_stream_status_aggregates_runtime_subscription_progress(
     assert payload["progress"]["quote_subscribed"] == 4
     assert payload["progress"]["kline_subscribed"] == 2
     assert payload["progress"]["near_expiry_months"] == 2
+    assert payload["progress"]["contract_months"] == "all"
     assert payload["progress"]["near_expiry_subscribed"] == 5
     assert payload["progress"]["near_expiry_total"] == 6
     assert payload["progress"]["elapsed_seconds"] == 8

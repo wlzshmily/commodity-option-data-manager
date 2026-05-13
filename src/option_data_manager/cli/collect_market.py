@@ -27,6 +27,7 @@ from option_data_manager.settings import (
     TQSDK_PASSWORD_KEY,
     default_secret_protector,
 )
+from option_data_manager.sqlite_runtime import configure_sqlite_runtime
 from option_data_manager.tqsdk_connection import create_tqsdk_api_with_retries
 
 
@@ -320,7 +321,7 @@ def _finish_stale_running_runs(connection: sqlite3.Connection) -> int:
 
 def _connect_database(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path, timeout=30)
-    connection.execute("PRAGMA busy_timeout = 30000")
+    configure_sqlite_runtime(connection, enable_wal=True)
     return connection
 
 

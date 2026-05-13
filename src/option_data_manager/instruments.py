@@ -55,6 +55,21 @@ INSTRUMENT_TQSDK_FIELDS_MIGRATION = Migration(
     ),
 )
 
+INSTRUMENT_READ_MODEL_INDEX_MIGRATION = Migration(
+    102,
+    "add instrument read model indexes",
+    (
+        """
+        CREATE INDEX IF NOT EXISTS idx_instruments_active_option_underlying
+        ON instruments(active, option_class, underlying_symbol)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_instruments_active_quote_scope
+        ON instruments(active, ins_class, option_class)
+        """,
+    ),
+)
+
 
 class InstrumentNormalizationError(ValueError):
     """Raised when a discovered instrument cannot be normalized safely."""
@@ -96,7 +111,11 @@ class InstrumentRepository:
         self._connection = connection
         apply_migrations(
             connection,
-            (INSTRUMENTS_MIGRATION, INSTRUMENT_TQSDK_FIELDS_MIGRATION),
+            (
+                INSTRUMENTS_MIGRATION,
+                INSTRUMENT_TQSDK_FIELDS_MIGRATION,
+                INSTRUMENT_READ_MODEL_INDEX_MIGRATION,
+            ),
         )
 
     def upsert_instruments(self, records: list[InstrumentRecord]) -> None:

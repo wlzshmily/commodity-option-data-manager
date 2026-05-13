@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 import sqlite3
 
 from option_data_manager.webui.read_model import WebuiReadModel
@@ -87,6 +87,229 @@ def test_overview_can_prefer_parallel_collection_progress() -> None:
         "routine-market-current-slice",
         "parallel-market-current-slice",
     ]
+
+
+def test_overview_can_filter_to_current_realtime_quote_rows() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    cutoff = "2026-05-12T01:00:00+00:00"
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="SHFE.cu2606",
+        exchange_id="SHFE",
+        product_id="cu",
+        delivery_year=2026,
+        delivery_month=6,
+        received_at="2026-05-09T01:00:00+00:00",
+    )
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="SHFE.al2606",
+        exchange_id="SHFE",
+        product_id="al",
+        delivery_year=2026,
+        delivery_month=6,
+        received_at="2026-05-12T01:05:00+00:00",
+    )
+
+    rows = read_model.overview(current_quote_after=cutoff)["underlyings"]
+
+    assert [row["underlying_symbol"] for row in rows] == ["SHFE.al2606"]
+    assert rows[0]["current_quote_count"] == 2
+    assert rows[0]["latest_current_quote_received_at"] == "2026-05-12T01:05:00+00:00"
+
+
+def test_overview_can_skip_underlying_rows_when_realtime_has_not_started() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="SHFE.cu2606",
+        exchange_id="SHFE",
+        product_id="cu",
+        delivery_year=2026,
+        delivery_month=6,
+        received_at="2026-05-09T01:00:00+00:00",
+    )
+
+    overview = read_model.overview(require_current_quote=True)
+
+    assert overview["summary"]["active_options"] == 2
+    assert overview["underlyings"] == []
+
+
+def test_overview_sorts_underlyings_by_product_then_delivery_month() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    cutoff = "2026-05-12T01:00:00+00:00"
+    for symbol, product, month in (
+        ("DCE.b2604", "b", 4),
+        ("DCE.a2606", "a", 6),
+        ("DCE.a2605", "a", 5),
+    ):
+        _insert_simple_chain(
+            connection,
+            underlying_symbol=symbol,
+            exchange_id="DCE",
+            product_id=product,
+            delivery_year=2026,
+            delivery_month=month,
+            received_at="2026-05-12T01:05:00+00:00",
+        )
+
+    rows = read_model.overview(current_quote_after=cutoff)["underlyings"]
+
+    assert [row["underlying_symbol"] for row in rows] == [
+        "DCE.a2605",
+        "DCE.a2606",
+        "DCE.b2604",
+    ]
+
+
+def test_overview_subscription_scope_matches_realtime_contract_selection() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    cutoff = "2026-05-12T01:00:00+00:00"
+    today = date.today()
+    for symbol, product, month, option_expiry, received_at in (
+        ("CZCE.FG606", "FG", 6, today, "2026-05-12T01:05:00+00:00"),
+        ("CZCE.FG607", "FG", 7, today + timedelta(days=30), "2026-05-09T01:00:00+00:00"),
+        ("CZCE.FG608", "FG", 8, today + timedelta(days=60), "2026-05-09T01:00:00+00:00"),
+        ("CZCE.MA606", "MA", 6, today, "2026-05-12T01:05:00+00:00"),
+        ("CZCE.MA607", "MA", 7, today + timedelta(days=30), "2026-05-12T01:05:00+00:00"),
+        ("CZCE.MA608", "MA", 8, today + timedelta(days=60), "2026-05-12T01:05:00+00:00"),
+    ):
+        _insert_simple_chain(
+            connection,
+            underlying_symbol=symbol,
+            exchange_id="CZCE",
+            product_id=product,
+            delivery_year=2026,
+            delivery_month=month,
+            received_at=received_at,
+        )
+        connection.execute(
+            """
+            UPDATE instruments
+            SET expire_datetime = ?
+            WHERE underlying_symbol = ? AND option_class IN ('CALL', 'PUT')
+            """,
+            (option_expiry.isoformat(), symbol),
+        )
+    connection.commit()
+
+    rows = read_model.overview(
+        current_quote_after=cutoff,
+        require_current_quote=True,
+        subscription_scope_enabled=True,
+        subscription_contract_month_limit=2,
+        subscription_min_days_to_expiry=1,
+    )["underlyings"]
+
+    assert [row["underlying_symbol"] for row in rows] == [
+        "CZCE.FG607",
+        "CZCE.FG608",
+        "CZCE.MA607",
+        "CZCE.MA608",
+    ]
+    assert {row["underlying_symbol"]: row["status"] for row in rows} == {
+        "CZCE.FG607": "待订阅",
+        "CZCE.FG608": "待订阅",
+        "CZCE.MA607": "已订阅",
+        "CZCE.MA608": "已订阅",
+    }
+    assert all(row["days_to_expiry"] >= 1 for row in rows)
+
+
+def test_overview_subscription_status_can_follow_worker_lifecycle() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    cutoff = "2026-05-12T01:00:00+00:00"
+    today = date.today()
+    for symbol, product, month in (
+        ("CZCE.FG607", "FG", 7),
+        ("CZCE.FG608", "FG", 8),
+    ):
+        _insert_simple_chain(
+            connection,
+            underlying_symbol=symbol,
+            exchange_id="CZCE",
+            product_id=product,
+            delivery_year=2026,
+            delivery_month=month,
+            received_at="2026-05-09T01:00:00+00:00",
+        )
+        connection.execute(
+            """
+            UPDATE instruments
+            SET expire_datetime = ?
+            WHERE underlying_symbol = ? AND option_class IN ('CALL', 'PUT')
+            """,
+            ((today + timedelta(days=30)).isoformat(), symbol),
+        )
+    connection.commit()
+
+    rows = read_model.overview(
+        current_quote_after=cutoff,
+        require_current_quote=True,
+        subscription_scope_enabled=True,
+        subscription_contract_month_limit=2,
+        subscription_min_days_to_expiry=1,
+        subscription_lifecycle_status="subscribed",
+    )["underlyings"]
+
+    assert [row["underlying_symbol"] for row in rows] == [
+        "CZCE.FG607",
+        "CZCE.FG608",
+    ]
+    assert {row["status"] for row in rows} == {"已订阅"}
+    assert all(row["current_quote_count"] == 0 for row in rows)
+
+
+def test_tquote_marks_historical_cache_as_unsubscribed_until_realtime_refresh() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    cutoff = "2026-05-12T01:00:00+00:00"
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="SHFE.cu2606",
+        exchange_id="SHFE",
+        product_id="cu",
+        delivery_year=2026,
+        delivery_month=6,
+        received_at="2026-05-09T01:00:00+00:00",
+    )
+
+    stale_quote = read_model.tquote(
+        underlying_symbol="SHFE.cu2606",
+        include_selectors=False,
+        realtime_started_at=cutoff,
+    )
+
+    assert stale_quote["underlying"]["realtime_status"] == "未订阅"
+    assert stale_quote["underlying"]["realtime_subscribed"] is False
+    assert stale_quote["underlying"]["realtime_latest_quote_received_at"] is None
+
+    connection.execute(
+        """
+        UPDATE quote_current
+        SET received_at = '2026-05-12T01:05:00+00:00',
+            source_datetime = '2026-05-12 09:05:00.000000'
+        WHERE symbol = 'SHFE.cu2606C100'
+        """
+    )
+    fresh_quote = read_model.tquote(
+        underlying_symbol="SHFE.cu2606",
+        include_selectors=False,
+        realtime_started_at=cutoff,
+    )
+
+    assert fresh_quote["underlying"]["realtime_status"] == "正常"
+    assert fresh_quote["underlying"]["realtime_subscribed"] is True
+    assert (
+        fresh_quote["underlying"]["realtime_latest_quote_received_at"]
+        == "2026-05-12T01:05:00+00:00"
+    )
 
 
 def test_underlying_rows_expose_market_time_separately_from_received_at() -> None:
@@ -412,3 +635,98 @@ def test_runs_include_service_logs() -> None:
 
     assert logs[0]["category"] == "collection"
     assert logs[0]["message"] == "window started"
+
+
+def _insert_simple_chain(
+    connection: sqlite3.Connection,
+    *,
+    underlying_symbol: str,
+    exchange_id: str,
+    product_id: str,
+    delivery_year: int,
+    delivery_month: int,
+    received_at: str,
+) -> None:
+    instrument_id = underlying_symbol.split(".", maxsplit=1)[-1]
+    call_symbol = f"{underlying_symbol}C100"
+    put_symbol = f"{underlying_symbol}P100"
+    connection.executemany(
+        """
+        INSERT INTO instruments (
+            symbol,
+            exchange_id,
+            product_id,
+            instrument_id,
+            instrument_name,
+            ins_class,
+            underlying_symbol,
+            option_class,
+            strike_price,
+            delivery_year,
+            delivery_month,
+            price_tick,
+            volume_multiple,
+            expired,
+            active,
+            inactive_reason,
+            last_seen_at,
+            raw_payload_json
+        )
+        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 1, NULL, '2026-05-12T00:00:00+00:00', '{}')
+        """,
+        [
+            (
+                underlying_symbol,
+                exchange_id,
+                product_id,
+                instrument_id,
+                "FUTURE",
+                None,
+                None,
+                None,
+                delivery_year,
+                delivery_month,
+            ),
+            (
+                call_symbol,
+                exchange_id,
+                product_id,
+                f"{instrument_id}C100",
+                "OPTION",
+                underlying_symbol,
+                "CALL",
+                100,
+                None,
+                None,
+            ),
+            (
+                put_symbol,
+                exchange_id,
+                product_id,
+                f"{instrument_id}P100",
+                "OPTION",
+                underlying_symbol,
+                "PUT",
+                100,
+                None,
+                None,
+            ),
+        ],
+    )
+    connection.executemany(
+        """
+        INSERT INTO quote_current (
+            symbol,
+            source_datetime,
+            received_at,
+            last_price,
+            raw_payload_json
+        )
+        VALUES (?, '2026-05-12 09:00:00.000000', ?, 1, '{}')
+        """,
+        [
+            (underlying_symbol, received_at),
+            (call_symbol, received_at),
+            (put_symbol, received_at),
+        ],
+    )
