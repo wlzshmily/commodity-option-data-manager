@@ -26,6 +26,7 @@ from option_data_manager.quote_streamer import (
     DEFAULT_KLINE_DATA_LENGTH,
     DEFAULT_MIN_DAYS_TO_EXPIRY,
     DEFAULT_QUOTE_SHARD_SIZE,
+    DEFAULT_RUNNING_QUOTE_REFRESH_SECONDS,
     stream_quotes,
 )
 from option_data_manager.tqsdk_connection import create_tqsdk_api_with_retries
@@ -108,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
                     if args.contract_refresh
                     else None
                 ),
+                running_quote_refresh_seconds=args.running_quote_refresh_seconds,
             )
         finally:
             connection.close()
@@ -174,6 +176,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--cycles", type=int, default=None)
     parser.add_argument("--duration-seconds", type=float, default=None)
     parser.add_argument("--wait-deadline-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--running-quote-refresh-seconds",
+        type=float,
+        default=DEFAULT_RUNNING_QUOTE_REFRESH_SECONDS,
+        help="Maximum seconds between full current-Quote snapshots while running.",
+    )
     parser.add_argument(
         "--contract-refresh-interval-seconds",
         type=float,

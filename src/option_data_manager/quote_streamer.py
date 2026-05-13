@@ -26,6 +26,7 @@ DEFAULT_NEAR_EXPIRY_MONTHS = 2
 DEFAULT_CONTRACT_MONTH_LIMIT = 2
 DEFAULT_MIN_DAYS_TO_EXPIRY = 1
 DEFAULT_CONTRACT_REFRESH_INTERVAL_SECONDS = 30 * 60
+DEFAULT_RUNNING_QUOTE_REFRESH_SECONDS = 1.0
 KLINE_SETUP_QUOTE_REFRESH_SECONDS = 5.0
 _FAR_EXPIRY_KEY = (9999, 99)
 _MONTH_PATTERN = re.compile(r"(\d{3,4})")
@@ -101,6 +102,7 @@ def stream_quotes(
     tq_notify_factory: Callable[[Any], Any] | None = None,
     contract_refresh_callback: Callable[[], Any] | None = None,
     contract_refresh_interval_seconds: float | None = None,
+    running_quote_refresh_seconds: float = DEFAULT_RUNNING_QUOTE_REFRESH_SECONDS,
 ) -> QuoteStreamResult:
     """Keep quote references alive and write changed current quotes.
 
@@ -139,6 +141,8 @@ def stream_quotes(
         and contract_refresh_interval_seconds <= 0
     ):
         raise ValueError("contract_refresh_interval_seconds must be positive.")
+    if running_quote_refresh_seconds <= 0:
+        raise ValueError("running_quote_refresh_seconds must be positive.")
     if not include_futures and not include_options:
         raise ValueError("At least one symbol class must be included.")
 
@@ -409,6 +413,7 @@ def stream_quotes(
     )
     deadline_at = time.monotonic() + duration_seconds if duration_seconds else None
     next_progress_heartbeat_at = time.monotonic()
+    next_running_quote_refresh_at = time.monotonic() + running_quote_refresh_seconds
     next_contract_refresh_at = (
         time.monotonic() + contract_refresh_interval_seconds
         if contract_refresh_interval_seconds is not None
@@ -487,6 +492,10 @@ def stream_quotes(
             ):
                 last_contract_reconcile_at = datetime.now(UTC).isoformat()
         received_at = datetime.now(UTC).isoformat()
+        force_quote_snapshot = cycle_count == 1 and not initial_quote_snapshot_written
+        if wait_update_succeeded and now_monotonic >= next_running_quote_refresh_at:
+            force_quote_snapshot = True
+            next_running_quote_refresh_at = now_monotonic + running_quote_refresh_seconds
         write_result = _write_quote_refs(
             api,
             quote_refs=quote_refs,
@@ -495,7 +504,7 @@ def stream_quotes(
             metrics_dirty_queue=metrics_dirty_queue,
             symbol_metadata=symbol_metadata,
             received_at=received_at,
-            force_all=cycle_count == 1 and not initial_quote_snapshot_written,
+            force_all=force_quote_snapshot,
             count_changed=cycle_count > 1,
             underlying_chain_dirty_interval_seconds=(
                 underlying_chain_dirty_interval_seconds
