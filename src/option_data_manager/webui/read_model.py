@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from enum import StrEnum
+import json
 import re
 import sqlite3
 from typing import Any
@@ -13,10 +14,21 @@ from option_data_manager.acquisition import AcquisitionRepository
 from option_data_manager.collection_state import CollectionStateRepository
 from option_data_manager.instruments import InstrumentRepository
 from option_data_manager.klines import KlineRepository
+from option_data_manager.moneyness import (
+    classify_option_moneyness,
+    is_all_moneyness,
+    normalize_moneyness_filter,
+)
 from option_data_manager.option_metrics import OptionMetricsRepository
 from option_data_manager.quote_streamer import selected_underlying_contract_symbols
 from option_data_manager.quotes import QuoteRepository
 from option_data_manager.service_state import ServiceLogRepository
+from option_data_manager.trading_sessions import (
+    SESSION_IN,
+    SESSION_OUT,
+    SESSION_UNKNOWN,
+    trading_session_state_from_payload,
+)
 
 
 class SubscriptionLifecycleStatus(StrEnum):
@@ -145,6 +157,8 @@ class WebuiReadModel:
         underlying_symbol: str | None = None,
         include_selectors: bool = True,
         realtime_started_at: str | None = None,
+        subscription_progress: dict[str, Any] | None = None,
+        moneyness_filter: str | set[str] | list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         """Return one underlying option chain aligned by strike price."""
 
@@ -157,20 +171,35 @@ class WebuiReadModel:
                 "atm_strike": None,
                 "maxima": _empty_maxima(),
             }
+        selected_progress = _subscription_progress_for_row(
+            subscription_progress,
+            selected,
+        )
+        quote_subscribed = _subscription_progress_quote_subscribed(selected_progress)
         underlying = _underlying_summary(
             self.connection,
             selected,
             realtime_started_at=realtime_started_at,
+            allow_historical_realtime_data=quote_subscribed,
         )
         option_rows = _option_rows(
             self.connection,
             selected,
             realtime_started_at=realtime_started_at,
+            allow_historical_realtime_data=quote_subscribed,
         )
+        if realtime_started_at is not None:
+            _apply_moneyness_subscription_scope(
+                option_rows,
+                underlying_symbol=selected,
+                underlying_last_price=underlying.get("last_price"),
+                moneyness_filter=moneyness_filter,
+            )
         _apply_realtime_chain_status(
             underlying,
             option_rows,
             realtime_started_at=realtime_started_at,
+            subscription_progress=selected_progress,
         )
         strike_rows = _strike_rows(option_rows)
         atm_strike = _atm_strike(strike_rows, underlying.get("last_price"))
@@ -782,7 +811,8 @@ def _underlying_rows(
                 CASE
                     WHEN (? IS NULL OR q.received_at >= ?) THEN q.received_at
                 END AS received_at,
-                q.last_price
+                q.last_price,
+                q.raw_payload_json
             FROM quote_current q
             {underlying_quote_filter}
         )
@@ -809,6 +839,8 @@ def _underlying_rows(
             uq.source_datetime AS book_time,
             uq.received_at AS underlying_quote_received_at,
             uq.last_price AS underlying_last,
+            uq.raw_payload_json AS underlying_quote_raw_payload_json,
+            future.instrument_name AS underlying_instrument_name,
             future.expire_datetime AS future_expire_datetime,
             future.delivery_year,
             future.delivery_month
@@ -867,6 +899,11 @@ def _format_underlying_row(
     data = _row_dict(row)
     option_count = int(data["option_count"])
     data["expiry_month"] = _expiry_month(str(data["underlying_symbol"]))
+    data["product_display_name"] = _product_display_name(
+        data.get("product_id"),
+        instrument_name=data.get("underlying_instrument_name"),
+        raw_payload_json=data.get("underlying_quote_raw_payload_json"),
+    )
     data["option_expire_datetime"] = _expiry_date_text(
         data.get("option_expire_datetime")
     )
@@ -905,6 +942,12 @@ def _format_underlying_row(
         )
         if subscription_status_enabled
         else _status_from_counts(data, option_count)
+    )
+    _apply_trading_session_state(
+        data,
+        data.get("underlying_quote_raw_payload_json"),
+        quote_source_datetime=data.get("book_time"),
+        quote_pending=data["status"] != "已订阅",
     )
     return data
 
@@ -954,6 +997,7 @@ def _underlying_summary(
     symbol: str,
     *,
     realtime_started_at: str | None = None,
+    allow_historical_realtime_data: bool = False,
 ) -> dict[str, Any]:
     row = connection.execute(
         f"""
@@ -962,6 +1006,7 @@ def _underlying_summary(
             i.exchange_id,
             i.product_id,
             i.instrument_id,
+            i.instrument_name,
             COALESCE(NULLIF(i.expire_datetime, ''), json_extract(q.raw_payload_json, '$.expire_datetime')) AS future_expire_datetime,
             COALESCE(i.delivery_year, json_extract(q.raw_payload_json, '$.delivery_year')) AS delivery_year,
             COALESCE(i.delivery_month, json_extract(q.raw_payload_json, '$.delivery_month')) AS delivery_month,
@@ -980,6 +1025,7 @@ def _underlying_summary(
             k.last_kline_bar_datetime,
             k.last_kline_close_price,
             k.last_kline_volume,
+            q.raw_payload_json AS raw_payload_json,
             CASE
                 WHEN ? IS NOT NULL AND q.received_at >= ? THEN 1
                 ELSE 0
@@ -1033,6 +1079,11 @@ def _underlying_summary(
         return {"symbol": symbol, "missing": True}
     data = _row_dict(row)
     data["expiry_month"] = _expiry_month(symbol)
+    data["product_display_name"] = _product_display_name(
+        data.get("product_id"),
+        instrument_name=data.get("instrument_name"),
+        raw_payload_json=data.get("raw_payload_json"),
+    )
     data["future_expire_datetime"] = _expiry_date_text(data.get("future_expire_datetime"))
     data["option_expire_datetime"] = _expiry_date_text(
         data.get("option_expire_datetime")
@@ -1059,6 +1110,21 @@ def _underlying_summary(
         data.get("last_kline_bar_datetime"),
         reference_datetime=data.get("source_datetime") or data.get("received_at"),
     )
+    _apply_trading_session_state(
+        data,
+        data.get("raw_payload_json"),
+        quote_source_datetime=(
+            data.get("realtime_source_datetime")
+            if realtime_started_at is not None
+            else data.get("source_datetime")
+        ),
+    )
+    if (
+        realtime_started_at is not None
+        and not allow_historical_realtime_data
+        and not data.get("realtime_quote_fresh")
+    ):
+        _mask_stale_realtime_quote_fields(data)
     return data
 
 
@@ -1067,11 +1133,13 @@ def _option_rows(
     underlying_symbol: str,
     *,
     realtime_started_at: str | None = None,
+    allow_historical_realtime_data: bool = False,
 ) -> list[dict[str, Any]]:
     rows = connection.execute(
         f"""
         SELECT
             i.symbol,
+            i.underlying_symbol,
             i.option_class,
             i.strike_price,
             COALESCE(NULLIF(i.expire_datetime, ''), json_extract(q.raw_payload_json, '$.expire_datetime')) AS expire_datetime,
@@ -1109,7 +1177,11 @@ def _option_rows(
             END AS realtime_source_datetime,
             CASE
                 WHEN ? IS NOT NULL AND q.received_at >= ? THEN q.received_at
-            END AS realtime_received_at
+            END AS realtime_received_at,
+            CASE
+                WHEN ? IS NOT NULL AND m.received_at >= ? THEN 1
+                ELSE 0
+            END AS realtime_metrics_fresh
         FROM instruments i
         LEFT JOIN quote_current q ON q.symbol = i.symbol
         LEFT JOIN option_source_metrics_current m ON m.symbol = i.symbol
@@ -1131,13 +1203,27 @@ def _option_rows(
             realtime_started_at,
             realtime_started_at,
             realtime_started_at,
+            realtime_started_at,
+            realtime_started_at,
             underlying_symbol,
         ),
     ).fetchall()
-    return [_format_option_row(row) for row in rows]
+    return [
+        _format_option_row(
+            row,
+            mask_stale_realtime=realtime_started_at is not None,
+            allow_historical_realtime_data=allow_historical_realtime_data,
+        )
+        for row in rows
+    ]
 
 
-def _format_option_row(row: sqlite3.Row) -> dict[str, Any]:
+def _format_option_row(
+    row: sqlite3.Row,
+    *,
+    mask_stale_realtime: bool = False,
+    allow_historical_realtime_data: bool = False,
+) -> dict[str, Any]:
     data = _row_dict(row)
     data["expire_datetime"] = _expiry_date_text(data.get("expire_datetime"))
     data["last_exercise_datetime"] = _expiry_date_text(
@@ -1150,7 +1236,126 @@ def _format_option_row(row: sqlite3.Row) -> dict[str, Any]:
     data["days_to_last_exercise_datetime"] = _days_to_expiry(
         data.get("last_exercise_datetime")
     )
+    if mask_stale_realtime and not allow_historical_realtime_data:
+        if not data.get("realtime_quote_fresh"):
+            _mask_stale_realtime_quote_fields(data)
+            data["has_kline"] = 0
+            data["last_kline_bar_datetime"] = None
+            data["last_kline_close_price"] = None
+            data["last_kline_volume"] = None
+        if not data.get("realtime_metrics_fresh"):
+            _mask_stale_realtime_metrics_fields(data)
     return data
+
+
+def _apply_moneyness_subscription_scope(
+    option_rows: list[dict[str, Any]],
+    *,
+    underlying_symbol: str,
+    underlying_last_price: Any,
+    moneyness_filter: str | set[str] | list[str] | tuple[str, ...] | None,
+) -> None:
+    selected = normalize_moneyness_filter(moneyness_filter)
+    if is_all_moneyness(selected):
+        for row in option_rows:
+            row["moneyness_in_subscription_scope"] = True
+        return
+
+    underlying_price = _float_or_none(underlying_last_price)
+    classifications = (
+        classify_option_moneyness(
+            option_rows,
+            underlying_prices={underlying_symbol: underlying_price},
+        )
+        if underlying_price is not None
+        else {}
+    )
+    for row in option_rows:
+        moneyness = classifications.get(str(row.get("symbol") or ""))
+        in_scope = moneyness in selected
+        row["moneyness"] = moneyness
+        row["moneyness_in_subscription_scope"] = in_scope
+        if not in_scope:
+            _mask_unsubscribed_moneyness_fields(row)
+
+
+def _mask_unsubscribed_moneyness_fields(data: dict[str, Any]) -> None:
+    _mask_stale_realtime_quote_fields(data)
+    _mask_stale_realtime_metrics_fields(data)
+    data["has_kline"] = 0
+    data["last_kline_bar_datetime"] = None
+    data["last_kline_close_price"] = None
+    data["last_kline_volume"] = None
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mask_stale_realtime_quote_fields(data: dict[str, Any]) -> None:
+    for key in (
+        "bid_price1",
+        "ask_price1",
+        "last_price",
+        "bid_volume1",
+        "ask_volume1",
+        "volume",
+        "open_interest",
+        "source_datetime",
+        "quote_received_at",
+        "received_at",
+    ):
+        data[key] = None
+
+
+def _mask_stale_realtime_metrics_fields(data: dict[str, Any]) -> None:
+    for key in (
+        "delta",
+        "gamma",
+        "theta",
+        "vega",
+        "rho",
+        "iv",
+        "source_method",
+        "metrics_received_at",
+    ):
+        data[key] = None
+
+
+def _apply_trading_session_state(
+    data: dict[str, Any],
+    raw_payload_json: Any,
+    *,
+    quote_source_datetime: str | None = None,
+    quote_pending: bool = False,
+) -> None:
+    state = trading_session_state_from_payload(
+        str(raw_payload_json) if raw_payload_json is not None else None,
+        quote_source_datetime=quote_source_datetime,
+    )
+    if quote_source_datetime:
+        display_state = state.state
+    elif quote_pending:
+        display_state = SESSION_UNKNOWN
+    else:
+        display_state = SESSION_OUT
+    labels = {
+        SESSION_IN: "交易中",
+        SESSION_OUT: "休市",
+        SESSION_UNKNOWN: "待行情",
+    }
+    data["trading_session_state"] = display_state
+    data["trading_session_label"] = labels.get(display_state, "待行情")
+    data["has_night_session"] = state.has_night
+    data["trading_day_segments"] = [
+        f"{start}-{end}" for start, end in state.day
+    ]
+    data["trading_night_segments"] = [
+        f"{start}-{end}" for start, end in state.night
+    ]
 
 
 def _apply_realtime_chain_status(
@@ -1158,6 +1363,7 @@ def _apply_realtime_chain_status(
     option_rows: list[dict[str, Any]],
     *,
     realtime_started_at: str | None,
+    subscription_progress: dict[str, Any] | None = None,
 ) -> None:
     if not realtime_started_at or underlying.get("missing"):
         underlying["realtime_status"] = "未订阅"
@@ -1173,9 +1379,17 @@ def _apply_realtime_chain_status(
     fresh_rows.extend(row for row in option_rows if row.get("realtime_quote_fresh"))
     latest_received = _max_text(row.get("realtime_received_at") for row in fresh_rows)
     latest_source = _max_text(row.get("realtime_source_datetime") for row in fresh_rows)
+    quote_subscribed = _subscription_progress_quote_subscribed(subscription_progress)
+    if quote_subscribed and latest_received is None:
+        current_rows = [underlying, *option_rows]
+        latest_received = _max_text(
+            row.get("quote_received_at") or row.get("received_at")
+            for row in current_rows
+        )
+        latest_source = _max_text(row.get("source_datetime") for row in current_rows)
     is_fresh = latest_received is not None
-    underlying["realtime_status"] = "正常" if is_fresh else "未订阅"
-    underlying["realtime_subscribed"] = is_fresh
+    underlying["realtime_status"] = "正常" if (is_fresh or quote_subscribed) else "未订阅"
+    underlying["realtime_subscribed"] = is_fresh or quote_subscribed
     underlying["realtime_started_at"] = realtime_started_at
     underlying["realtime_latest_quote_received_at"] = latest_received
     underlying["realtime_latest_source_datetime"] = latest_source
@@ -1343,6 +1557,49 @@ def _datetime_display_text(value: Any) -> str | None:
     if parsed is None:
         return str(value).strip() if value is not None else None
     return parsed.isoformat()
+
+
+def _product_display_name(
+    product_id: Any,
+    *,
+    instrument_name: Any = None,
+    raw_payload_json: Any = None,
+) -> str | None:
+    raw_name = _text_or_none(instrument_name)
+    if raw_name is None:
+        raw_name = _instrument_name_from_payload(raw_payload_json)
+    if raw_name is None:
+        return None
+    product = str(product_id or "").strip()
+    if product:
+        product_prefix = re.escape(product)
+        raw_name = re.sub(
+            rf"^(?:{product_prefix}|{product_prefix.upper()})",
+            "",
+            raw_name,
+            count=1,
+        )
+    display = re.sub(r"\d{3,4}$", "", raw_name).strip()
+    return display or raw_name
+
+
+def _instrument_name_from_payload(raw_payload_json: Any) -> str | None:
+    if raw_payload_json is None:
+        return None
+    try:
+        payload = json.loads(str(raw_payload_json))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return _text_or_none(payload.get("instrument_name"))
+
+
+def _text_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _parse_expiry_date(value: Any) -> date | None:
@@ -1517,6 +1774,19 @@ def _apply_subscription_progress(
     data["subscription_subscribed"] = subscribed
     data["subscription_total"] = total
     data["subscription_completion_ratio"] = subscribed / total if total else 0.0
+
+
+def _subscription_progress_quote_subscribed(progress: dict[str, Any] | None) -> bool:
+    if not isinstance(progress, dict):
+        return False
+    quote_total = int(progress.get("quote_total") or 0)
+    quote_subscribed = int(progress.get("quote_subscribed") or 0)
+    if quote_total > 0 and quote_subscribed >= quote_total:
+        return True
+    return (
+        _coerce_subscription_lifecycle_status(progress.get("status"))
+        == SubscriptionLifecycleStatus.SUBSCRIBED
+    )
 
 
 def _coerce_subscription_lifecycle_status(

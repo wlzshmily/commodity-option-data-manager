@@ -24,7 +24,12 @@ from option_data_manager.api_keys import ApiKeyRecord, ApiKeyRepository
 from option_data_manager.collection_state import CollectionStateRepository
 from option_data_manager.klines import KlineRepository
 from option_data_manager.option_metrics import OptionMetricsRepository
-from option_data_manager.quote_streamer import expected_subscription_counts
+from option_data_manager.quote_streamer import (
+    DEFAULT_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS,
+    DEFAULT_MONEYNESS_FILTER,
+    DEFAULT_MONEYNESS_RECALC_SECONDS,
+    expected_subscription_counts,
+)
 from option_data_manager.quotes import QuoteRepository
 from option_data_manager.realtime_health import build_realtime_health
 from option_data_manager.settings import (
@@ -61,6 +66,11 @@ QUOTE_STREAM_PRIORITIZE_NEAR_EXPIRY_KEY = "quote_stream.prioritize_near_expiry"
 QUOTE_STREAM_NEAR_EXPIRY_MONTHS_KEY = "quote_stream.near_expiry_months"
 QUOTE_STREAM_CONTRACT_MONTHS_KEY = "quote_stream.contract_months"
 QUOTE_STREAM_MIN_DAYS_TO_EXPIRY_KEY = "quote_stream.min_days_to_expiry"
+QUOTE_STREAM_MONEYNESS_FILTER_KEY = "quote_stream.moneyness_filter"
+QUOTE_STREAM_MONEYNESS_RECALC_SECONDS_KEY = "quote_stream.moneyness_recalc_seconds"
+QUOTE_STREAM_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS_KEY = (
+    "quote_stream.kline_subscription_timeout_seconds"
+)
 CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS_KEY = "contract_manager.refresh_interval_seconds"
 METRICS_MIN_INTERVAL_SECONDS_KEY = "metrics.min_interval_seconds"
 METRICS_UNDERLYING_CHAIN_INTERVAL_SECONDS_KEY = "metrics.underlying_chain_interval_seconds"
@@ -72,6 +82,11 @@ DEFAULT_QUOTE_STREAM_PRIORITIZE_NEAR_EXPIRY = "true"
 DEFAULT_QUOTE_STREAM_NEAR_EXPIRY_MONTHS = "2"
 DEFAULT_QUOTE_STREAM_CONTRACT_MONTHS = "2"
 DEFAULT_QUOTE_STREAM_MIN_DAYS_TO_EXPIRY = "1"
+DEFAULT_QUOTE_STREAM_MONEYNESS_FILTER = DEFAULT_MONEYNESS_FILTER
+DEFAULT_QUOTE_STREAM_MONEYNESS_RECALC_SECONDS = str(DEFAULT_MONEYNESS_RECALC_SECONDS)
+DEFAULT_QUOTE_STREAM_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS = str(
+    int(DEFAULT_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS)
+)
 DEFAULT_CONTRACT_MANAGER_REFRESH_INTERVAL_SECONDS = "3600"
 DEFAULT_METRICS_MIN_INTERVAL_SECONDS = "30"
 
@@ -663,6 +678,20 @@ def create_app(
                 settings.get_value(QUOTE_STREAM_MIN_DAYS_TO_EXPIRY_KEY),
                 int(DEFAULT_QUOTE_STREAM_MIN_DAYS_TO_EXPIRY),
             )
+            moneyness_filter = (
+                settings.get_value(QUOTE_STREAM_MONEYNESS_FILTER_KEY)
+                or DEFAULT_QUOTE_STREAM_MONEYNESS_FILTER
+            )
+            moneyness_recalc_seconds = _positive_int_setting(
+                settings.get_value(QUOTE_STREAM_MONEYNESS_RECALC_SECONDS_KEY),
+                int(DEFAULT_QUOTE_STREAM_MONEYNESS_RECALC_SECONDS),
+            )
+            kline_subscription_timeout_seconds = _positive_int_setting(
+                settings.get_value(
+                    QUOTE_STREAM_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS_KEY
+                ),
+                int(DEFAULT_QUOTE_STREAM_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS),
+            )
             underlying_chain_interval_seconds = _positive_int_setting(
                 settings.get_value(METRICS_UNDERLYING_CHAIN_INTERVAL_SECONDS_KEY),
                 int(DEFAULT_METRICS_MIN_INTERVAL_SECONDS),
@@ -753,6 +782,11 @@ def create_app(
                     "near_expiry_months": near_expiry_months,
                     "contract_months": contract_months,
                     "min_days_to_expiry": min_days_to_expiry,
+                    "moneyness_filter": moneyness_filter,
+                    "moneyness_recalc_seconds": moneyness_recalc_seconds,
+                    "kline_subscription_timeout_seconds": (
+                        kline_subscription_timeout_seconds
+                    ),
                     "max_symbols_configured": max_symbols is not None,
                     "discover_requested": False,
                     "report_dir": str(report_dir),
@@ -781,6 +815,11 @@ def create_app(
                     "near_expiry_months": near_expiry_months,
                     "contract_months": contract_months,
                     "min_days_to_expiry": min_days_to_expiry,
+                    "moneyness_filter": moneyness_filter,
+                    "moneyness_recalc_seconds": moneyness_recalc_seconds,
+                    "kline_subscription_timeout_seconds": (
+                        kline_subscription_timeout_seconds
+                    ),
                     "max_symbols": max_symbols,
                     "metrics_dirty_min_interval_seconds": metrics_min_interval_seconds,
                     "underlying_chain_dirty_interval_seconds": underlying_chain_interval_seconds,
@@ -1203,6 +1242,20 @@ def create_app(
                 "min_days_to_expiry": _non_negative_int_setting(
                     settings.get_value(QUOTE_STREAM_MIN_DAYS_TO_EXPIRY_KEY),
                     int(DEFAULT_QUOTE_STREAM_MIN_DAYS_TO_EXPIRY),
+                ),
+                "moneyness_filter": settings.get_value(
+                    QUOTE_STREAM_MONEYNESS_FILTER_KEY
+                )
+                or DEFAULT_QUOTE_STREAM_MONEYNESS_FILTER,
+                "moneyness_recalc_seconds": _positive_int_setting(
+                    settings.get_value(QUOTE_STREAM_MONEYNESS_RECALC_SECONDS_KEY),
+                    int(DEFAULT_QUOTE_STREAM_MONEYNESS_RECALC_SECONDS),
+                ),
+                "kline_subscription_timeout_seconds": _positive_int_setting(
+                    settings.get_value(
+                        QUOTE_STREAM_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS_KEY
+                    ),
+                    int(DEFAULT_QUOTE_STREAM_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS),
                 ),
                 "status": _quote_stream_status(
                     service_state,
@@ -1629,6 +1682,9 @@ def _run_quote_stream_start(
     near_expiry_months: int,
     contract_months: str,
     min_days_to_expiry: int,
+    moneyness_filter: str,
+    moneyness_recalc_seconds: int,
+    kline_subscription_timeout_seconds: int,
     max_symbols: int | None,
     metrics_dirty_min_interval_seconds: int,
     underlying_chain_dirty_interval_seconds: int,
@@ -1660,6 +1716,16 @@ def _run_quote_stream_start(
                 _safe_set_service_value(service_state, "quote_stream.message", universe_message)
                 _safe_set_service_value(service_state, "quote_stream.pids", "[]")
             return
+        expected_counts = _calculate_expected_subscription_counts(
+            connection,
+            worker_count=worker_count,
+            contract_months=contract_months,
+            min_days_to_expiry=min_days_to_expiry,
+            max_symbols=max_symbols,
+            moneyness_filter=moneyness_filter,
+        )
+        with quote_stream_lock:
+            _store_quote_stream_expected_counts(service_state, expected_counts)
         processes = _start_quote_stream_processes(
             database_path=database_path,
             report_dir=report_dir,
@@ -1671,6 +1737,9 @@ def _run_quote_stream_start(
             near_expiry_months=near_expiry_months,
             contract_months=contract_months,
             min_days_to_expiry=min_days_to_expiry,
+            moneyness_filter=moneyness_filter,
+            moneyness_recalc_seconds=moneyness_recalc_seconds,
+            kline_subscription_timeout_seconds=kline_subscription_timeout_seconds,
             max_symbols=max_symbols,
             discover=False,
             metrics_dirty_min_interval_seconds=metrics_dirty_min_interval_seconds,
@@ -1765,6 +1834,9 @@ def _run_quote_stream_start(
             "near_expiry_months": near_expiry_months,
             "contract_months": contract_months,
             "min_days_to_expiry": min_days_to_expiry,
+            "moneyness_filter": moneyness_filter,
+            "moneyness_recalc_seconds": moneyness_recalc_seconds,
+            "kline_subscription_timeout_seconds": kline_subscription_timeout_seconds,
             "max_symbols_configured": max_symbols is not None,
             "discover_requested": force_discovery,
             "discovery_ran": discovery_ran,
@@ -1887,6 +1959,9 @@ def _start_quote_stream_processes(
     near_expiry_months: int,
     contract_months: str,
     min_days_to_expiry: int,
+    moneyness_filter: str,
+    moneyness_recalc_seconds: int,
+    kline_subscription_timeout_seconds: int,
     max_symbols: int | None,
     discover: bool,
     metrics_dirty_min_interval_seconds: int,
@@ -1927,6 +2002,12 @@ def _start_quote_stream_processes(
             contract_months,
             "--min-days-to-expiry",
             str(min_days_to_expiry),
+            "--moneyness-filter",
+            moneyness_filter,
+            "--moneyness-recalc-seconds",
+            str(moneyness_recalc_seconds),
+            "--kline-subscription-timeout-seconds",
+            str(kline_subscription_timeout_seconds),
             "--metrics-dirty-min-interval-seconds",
             str(metrics_dirty_min_interval_seconds),
             "--underlying-chain-dirty-interval-seconds",
@@ -2213,6 +2294,7 @@ def _calculate_expected_subscription_counts(
     contract_months: str | None,
     min_days_to_expiry: int | None,
     max_symbols: int | None,
+    moneyness_filter: str | None = None,
 ) -> dict[str, int]:
     contract_month_limit = None
     if (contract_months or "").strip().lower() != "all":
@@ -2230,6 +2312,7 @@ def _calculate_expected_subscription_counts(
             if min_days_to_expiry is not None
             else int(DEFAULT_QUOTE_STREAM_MIN_DAYS_TO_EXPIRY)
         ),
+        moneyness_filter=moneyness_filter or DEFAULT_QUOTE_STREAM_MONEYNESS_FILTER,
     )
 
 
@@ -2448,6 +2531,11 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str
         for row in progress_rows
         if row.get("last_contract_reconcile_at") is not None
     ]
+    moneyness_recalc_values = [
+        str(row.get("last_moneyness_recalc_at"))
+        for row in progress_rows
+        if row.get("last_moneyness_recalc_at") is not None
+    ]
     started_values = [
         str(row.get("started_at"))
         for row in progress_rows
@@ -2528,6 +2616,64 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str
         "contract_reconcile_removed_kline_count": sum(
             _int_value(row.get("contract_reconcile_removed_kline_count"))
             for row in progress_rows
+        ),
+        "moneyness_filter": _aggregate_text_value(progress_rows, "moneyness_filter"),
+        "moneyness_recalc_seconds": max(
+            _int_value(row.get("moneyness_recalc_seconds")) for row in progress_rows
+        ),
+        "moneyness_recalc_count": sum(
+            _int_value(row.get("moneyness_recalc_count")) for row in progress_rows
+        ),
+        "moneyness_kline_match_count": sum(
+            _int_value(row.get("moneyness_kline_match_count")) for row in progress_rows
+        ),
+        "moneyness_sticky_kline_count": sum(
+            _int_value(row.get("moneyness_sticky_kline_count")) for row in progress_rows
+        ),
+        "moneyness_added_kline_count": sum(
+            _int_value(row.get("moneyness_added_kline_count")) for row in progress_rows
+        ),
+        "moneyness_skipped_out_of_session_count": sum(
+            _int_value(row.get("moneyness_skipped_out_of_session_count"))
+            for row in progress_rows
+        ),
+        "moneyness_skipped_missing_price_count": sum(
+            _int_value(row.get("moneyness_skipped_missing_price_count"))
+            for row in progress_rows
+        ),
+        "last_moneyness_recalc_at": max(moneyness_recalc_values)
+        if moneyness_recalc_values
+        else None,
+        "current_kline_symbol": _aggregate_text_value(
+            progress_rows,
+            "current_kline_symbol",
+        ),
+        "current_kline_started_at": max(
+            str(row.get("current_kline_started_at"))
+            for row in progress_rows
+            if row.get("current_kline_started_at") is not None
+        )
+        if any(row.get("current_kline_started_at") is not None for row in progress_rows)
+        else None,
+        "kline_subscription_timeout_seconds": max(
+            _int_value(row.get("kline_subscription_timeout_seconds"))
+            for row in progress_rows
+        ),
+        "kline_subscription_timeout_count": sum(
+            _int_value(row.get("kline_subscription_timeout_count"))
+            for row in progress_rows
+        ),
+        "kline_subscription_error_count": sum(
+            _int_value(row.get("kline_subscription_error_count"))
+            for row in progress_rows
+        ),
+        "last_kline_subscription_error_symbol": _aggregate_text_value(
+            progress_rows,
+            "last_kline_subscription_error_symbol",
+        ),
+        "last_kline_subscription_error": _aggregate_text_value(
+            progress_rows,
+            "last_kline_subscription_error",
         ),
         "cycle_count": sum(_int_value(row.get("cycle_count")) for row in progress_rows),
         "wait_update_count": sum(
@@ -2638,6 +2784,40 @@ def _progress_from_report(payload: dict[str, Any]) -> dict[str, Any] | None:
         if total_objects
         else 0.0,
         "underlying_progress": result.get("underlying_progress") or {},
+        "moneyness_filter": result.get("moneyness_filter"),
+        "moneyness_recalc_seconds": _int_value(result.get("moneyness_recalc_seconds")),
+        "moneyness_recalc_count": _int_value(result.get("moneyness_recalc_count")),
+        "moneyness_kline_match_count": _int_value(
+            result.get("moneyness_kline_match_count")
+        ),
+        "moneyness_sticky_kline_count": _int_value(
+            result.get("moneyness_sticky_kline_count")
+        ),
+        "moneyness_added_kline_count": _int_value(
+            result.get("moneyness_added_kline_count")
+        ),
+        "moneyness_skipped_out_of_session_count": _int_value(
+            result.get("moneyness_skipped_out_of_session_count")
+        ),
+        "moneyness_skipped_missing_price_count": _int_value(
+            result.get("moneyness_skipped_missing_price_count")
+        ),
+        "last_moneyness_recalc_at": result.get("last_moneyness_recalc_at"),
+        "current_kline_symbol": result.get("current_kline_symbol"),
+        "current_kline_started_at": result.get("current_kline_started_at"),
+        "kline_subscription_timeout_seconds": _int_value(
+            result.get("kline_subscription_timeout_seconds")
+        ),
+        "kline_subscription_timeout_count": _int_value(
+            result.get("kline_subscription_timeout_count")
+        ),
+        "kline_subscription_error_count": _int_value(
+            result.get("kline_subscription_error_count")
+        ),
+        "last_kline_subscription_error_symbol": result.get(
+            "last_kline_subscription_error_symbol"
+        ),
+        "last_kline_subscription_error": result.get("last_kline_subscription_error"),
     }
 
 
@@ -2731,6 +2911,17 @@ def _aggregate_contract_months(rows: list[dict[str, Any]]) -> str | None:
     return str(parsed[-1]) if parsed else None
 
 
+def _aggregate_text_value(rows: list[dict[str, Any]], key: str) -> str | None:
+    values = {
+        str(row.get(key)).strip()
+        for row in rows
+        if row.get(key) is not None and str(row.get(key)).strip()
+    }
+    if not values:
+        return None
+    return ",".join(sorted(values))
+
+
 def _contract_months_from_result(result: dict[str, Any]) -> str | None:
     value = result.get("contract_months")
     if value is not None:
@@ -2780,6 +2971,22 @@ def _empty_quote_stream_progress(*, running: bool) -> dict[str, Any]:
         "contract_reconcile_removed_quote_count": 0,
         "contract_reconcile_added_kline_count": 0,
         "contract_reconcile_removed_kline_count": 0,
+        "moneyness_filter": None,
+        "moneyness_recalc_seconds": 0,
+        "moneyness_recalc_count": 0,
+        "moneyness_kline_match_count": 0,
+        "moneyness_sticky_kline_count": 0,
+        "moneyness_added_kline_count": 0,
+        "moneyness_skipped_out_of_session_count": 0,
+        "moneyness_skipped_missing_price_count": 0,
+        "last_moneyness_recalc_at": None,
+        "current_kline_symbol": None,
+        "current_kline_started_at": None,
+        "kline_subscription_timeout_seconds": 0,
+        "kline_subscription_timeout_count": 0,
+        "kline_subscription_error_count": 0,
+        "last_kline_subscription_error_symbol": None,
+        "last_kline_subscription_error": None,
         "cycle_count": 0,
         "wait_update_count": 0,
         "quotes_written": 0,

@@ -45,6 +45,9 @@ def test_api_status_and_settings_do_not_require_key_by_default() -> None:
     assert settings["quote_stream"]["near_expiry_months"] == 2
     assert settings["quote_stream"]["contract_months"] == "2"
     assert settings["quote_stream"]["min_days_to_expiry"] == 1
+    assert settings["quote_stream"]["moneyness_filter"] == "atm,itm,otm"
+    assert settings["quote_stream"]["moneyness_recalc_seconds"] == 30
+    assert settings["quote_stream"]["kline_subscription_timeout_seconds"] == 30
 
 
 def test_api_key_required_when_setting_enabled() -> None:
@@ -215,6 +218,10 @@ def test_quote_stream_controls_start_and_stop_workers(monkeypatch, tmp_path: Pat
     assert created[0].command[
         created[0].command.index("--kline-batch-size") + 1
     ] == "2"
+    assert "--kline-subscription-timeout-seconds" in created[0].command
+    assert created[0].command[
+        created[0].command.index("--kline-subscription-timeout-seconds") + 1
+    ] == "30"
     assert "--near-expiry-months" in created[0].command
     assert created[0].command[
         created[0].command.index("--near-expiry-months") + 1

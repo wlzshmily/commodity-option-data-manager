@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 import re
+import signal
 import sqlite3
 import time
 from collections.abc import Callable
@@ -12,8 +13,15 @@ from typing import Any
 
 from .instruments import InstrumentRepository
 from .metrics_dirty_queue import MetricsDirtyQueueRepository
+from .moneyness import (
+    MONEYNESS_ALL,
+    classify_option_moneyness,
+    is_all_moneyness,
+    normalize_moneyness_filter,
+)
 from .quotes import QUOTE_SOURCE_FIELDS, QuoteRepository, normalize_quote
 from .quotes import QuoteRecord
+from .trading_sessions import SESSION_OUT, trading_session_state_from_payload
 
 
 DEFAULT_QUOTE_SHARD_SIZE = 1_000
@@ -27,6 +35,9 @@ DEFAULT_CONTRACT_MONTH_LIMIT = 2
 DEFAULT_MIN_DAYS_TO_EXPIRY = 1
 DEFAULT_CONTRACT_REFRESH_INTERVAL_SECONDS = 30 * 60
 DEFAULT_RUNNING_QUOTE_REFRESH_SECONDS = 1.0
+DEFAULT_MONEYNESS_FILTER = ",".join(sorted(MONEYNESS_ALL))
+DEFAULT_MONEYNESS_RECALC_SECONDS = 30
+DEFAULT_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS = 30.0
 KLINE_SETUP_QUOTE_REFRESH_SECONDS = 5.0
 _FAR_EXPIRY_KEY = (9999, 99)
 _MONTH_PATTERN = re.compile(r"(\d{3,4})")
@@ -72,6 +83,20 @@ class QuoteStreamResult:
     contract_reconcile_removed_quote_count: int
     contract_reconcile_added_kline_count: int
     contract_reconcile_removed_kline_count: int
+    moneyness_filter: str
+    moneyness_recalc_seconds: int
+    moneyness_recalc_count: int
+    moneyness_kline_match_count: int
+    moneyness_sticky_kline_count: int
+    moneyness_added_kline_count: int
+    moneyness_skipped_out_of_session_count: int
+    moneyness_skipped_missing_price_count: int
+    last_moneyness_recalc_at: str | None
+    kline_subscription_timeout_seconds: float
+    kline_subscription_timeout_count: int
+    kline_subscription_error_count: int
+    last_kline_subscription_error_symbol: str | None
+    last_kline_subscription_error: str | None
     error_count: int
 
 
@@ -97,12 +122,15 @@ def stream_quotes(
     near_expiry_months: int = DEFAULT_NEAR_EXPIRY_MONTHS,
     contract_month_limit: int | None = DEFAULT_CONTRACT_MONTH_LIMIT,
     min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
+    moneyness_filter: str = DEFAULT_MONEYNESS_FILTER,
+    moneyness_recalc_seconds: int = DEFAULT_MONEYNESS_RECALC_SECONDS,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     stop_requested: Callable[[], bool] | None = None,
     tq_notify_factory: Callable[[Any], Any] | None = None,
     contract_refresh_callback: Callable[[], Any] | None = None,
     contract_refresh_interval_seconds: float | None = None,
     running_quote_refresh_seconds: float = DEFAULT_RUNNING_QUOTE_REFRESH_SECONDS,
+    kline_subscription_timeout_seconds: float = DEFAULT_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS,
 ) -> QuoteStreamResult:
     """Keep quote references alive and write changed current quotes.
 
@@ -136,6 +164,10 @@ def stream_quotes(
         raise ValueError("contract_month_limit must be positive when provided.")
     if min_days_to_expiry < 0:
         raise ValueError("min_days_to_expiry must be non-negative.")
+    selected_moneyness = normalize_moneyness_filter(moneyness_filter)
+    moneyness_progress_filter = ",".join(sorted(selected_moneyness))
+    if moneyness_recalc_seconds < 1:
+        raise ValueError("moneyness_recalc_seconds must be positive.")
     if (
         contract_refresh_interval_seconds is not None
         and contract_refresh_interval_seconds <= 0
@@ -143,6 +175,8 @@ def stream_quotes(
         raise ValueError("contract_refresh_interval_seconds must be positive.")
     if running_quote_refresh_seconds <= 0:
         raise ValueError("running_quote_refresh_seconds must be positive.")
+    if kline_subscription_timeout_seconds <= 0:
+        raise ValueError("kline_subscription_timeout_seconds must be positive.")
     if not include_futures and not include_options:
         raise ValueError("At least one symbol class must be included.")
 
@@ -168,6 +202,8 @@ def stream_quotes(
         near_expiry_kline_subscribed=0,
         near_expiry_kline_total=0,
         contract_month_limit=contract_month_limit,
+        moneyness_filter=moneyness_progress_filter,
+        moneyness_recalc_seconds=moneyness_recalc_seconds,
         tq_notify_state=tqsdk_notify_state,
     )
     symbols = select_quote_symbols(
@@ -192,6 +228,7 @@ def stream_quotes(
             prioritize_near_expiry=prioritize_near_expiry,
             contract_month_limit=contract_month_limit,
             min_days_to_expiry=min_days_to_expiry,
+            moneyness_filter=selected_moneyness,
         )
         if include_options and include_klines
         else []
@@ -222,6 +259,7 @@ def stream_quotes(
             near_expiry_months=near_expiry_months,
             contract_month_limit=contract_month_limit,
             min_days_to_expiry=min_days_to_expiry,
+            moneyness_filter=selected_moneyness,
         )
         if include_options and include_klines and prioritize_near_expiry
         else 0
@@ -256,6 +294,9 @@ def stream_quotes(
         near_expiry_kline_subscribed=0,
         near_expiry_kline_total=near_kline_total,
         contract_month_limit=contract_month_limit,
+        moneyness_filter=moneyness_progress_filter,
+        moneyness_recalc_seconds=moneyness_recalc_seconds,
+        moneyness_kline_match_count=len(kline_symbols),
         underlying_progress=_underlying_subscription_progress(
             quote_symbols=symbols,
             kline_symbols=kline_symbols,
@@ -291,6 +332,9 @@ def stream_quotes(
             near_expiry_kline_subscribed=0,
             near_expiry_kline_total=near_kline_total,
             contract_month_limit=contract_month_limit,
+            moneyness_filter=moneyness_progress_filter,
+            moneyness_recalc_seconds=moneyness_recalc_seconds,
+            moneyness_kline_match_count=len(kline_symbols),
             underlying_progress=_underlying_subscription_progress(
                 quote_symbols=symbols,
                 kline_symbols=kline_symbols,
@@ -308,6 +352,12 @@ def stream_quotes(
     last_wait_update_at: str | None = None
     last_quote_write_at: str | None = None
     initial_quote_snapshot_written = False
+    current_kline_symbol: str | None = None
+    current_kline_started_at: str | None = None
+    kline_subscription_timeout_count = 0
+    kline_subscription_error_count = 0
+    last_kline_subscription_error_symbol: str | None = None
+    last_kline_subscription_error: str | None = None
     if stop_requested is None or not stop_requested():
         received_at = datetime.now(UTC).isoformat()
         write_result = _write_quote_refs(
@@ -327,6 +377,36 @@ def stream_quotes(
         if write_result["wrote_quote"]:
             last_quote_write_at = received_at
             initial_quote_snapshot_written = True
+    if include_options and include_klines:
+        kline_symbols = select_kline_symbols(
+            connection,
+            worker_index=worker_index,
+            worker_count=worker_count,
+            max_symbols=max_symbols,
+            prioritize_near_expiry=prioritize_near_expiry,
+            contract_month_limit=contract_month_limit,
+            min_days_to_expiry=min_days_to_expiry,
+            moneyness_filter=selected_moneyness,
+        )
+        near_kline_total = (
+            count_near_expiry_kline_symbols(
+                connection,
+                worker_index=worker_index,
+                worker_count=worker_count,
+                max_symbols=max_symbols,
+                prioritize_near_expiry=prioritize_near_expiry,
+                near_expiry_months=near_expiry_months,
+                contract_month_limit=contract_month_limit,
+                min_days_to_expiry=min_days_to_expiry,
+                moneyness_filter=selected_moneyness,
+            )
+            if prioritize_near_expiry
+            else 0
+        )
+        symbol_metadata = _quote_symbol_metadata(
+            connection,
+            sorted(set(symbols) | set(kline_symbols)),
+        )
     kline_started_at = datetime.now(UTC).isoformat()
     kline_progress_step = max(1, min(100, len(kline_symbols) // 100 or 1))
     next_kline_progress_at = kline_progress_step
@@ -334,13 +414,66 @@ def stream_quotes(
     attempted_kline_count = 0
     for batch in _batches(kline_symbols, kline_batch_size):
         attempted_kline_count += len(batch)
-        refs, batch_error_count = _subscribe_kline_ref_batch(
+        current_kline_symbol = ",".join(batch[:5])
+        current_kline_started_at = datetime.now(UTC).isoformat()
+        _emit_progress(
+            progress_callback,
+            status="kline_subscribing",
+            started_at=started_at,
+            quote_started_at=quote_started_at,
+            quote_finished_at=quote_finished_at,
+            kline_started_at=kline_started_at,
+            worker_index=worker_index,
+            worker_count=worker_count,
+            quote_subscribed=len(quote_refs),
+            quote_total=len(symbols),
+            kline_subscribed=len(kline_refs),
+            kline_total=len(kline_symbols),
+            near_expiry_months=near_expiry_months,
+            near_expiry_quote_subscribed=near_quote_total,
+            near_expiry_quote_total=near_quote_total,
+            near_expiry_kline_subscribed=min(len(kline_refs), near_kline_total),
+            near_expiry_kline_total=near_kline_total,
+            contract_month_limit=contract_month_limit,
+            moneyness_filter=moneyness_progress_filter,
+            moneyness_recalc_seconds=moneyness_recalc_seconds,
+            moneyness_kline_match_count=len(kline_symbols),
+            current_kline_symbol=current_kline_symbol,
+            current_kline_started_at=current_kline_started_at,
+            kline_subscription_timeout_seconds=kline_subscription_timeout_seconds,
+            kline_subscription_timeout_count=kline_subscription_timeout_count,
+            kline_subscription_error_count=kline_subscription_error_count,
+            last_kline_subscription_error_symbol=last_kline_subscription_error_symbol,
+            last_kline_subscription_error=last_kline_subscription_error,
+            underlying_progress=_underlying_subscription_progress(
+                quote_symbols=symbols,
+                kline_symbols=kline_symbols,
+                quote_refs=quote_refs,
+                kline_refs=kline_refs,
+                symbol_metadata=symbol_metadata,
+            ),
+            wait_update_count=wait_update_count,
+            quotes_written=quotes_written,
+            changed_quotes_written=changed_quotes_written,
+            last_wait_update_at=last_wait_update_at,
+            last_quote_write_at=last_quote_write_at,
+            tq_notify_state=tqsdk_notify_state,
+        )
+        refs, batch_error_count, batch_timeout_count, last_error_symbol, last_error = _subscribe_kline_ref_batch(
             api,
             batch,
             data_length=kline_data_length,
+            timeout_seconds=kline_subscription_timeout_seconds,
         )
         kline_refs.update(refs)
+        current_kline_symbol = None
+        current_kline_started_at = None
         error_count += batch_error_count
+        kline_subscription_error_count += batch_error_count
+        kline_subscription_timeout_count += batch_timeout_count
+        if last_error_symbol is not None:
+            last_kline_subscription_error_symbol = last_error_symbol
+            last_kline_subscription_error = last_error
         if (
             attempted_kline_count == len(kline_symbols)
             or attempted_kline_count >= next_kline_progress_at
@@ -353,27 +486,29 @@ def stream_quotes(
                 next_kline_quote_refresh_at = (
                     now_monotonic + KLINE_SETUP_QUOTE_REFRESH_SECONDS
                 )
-                wait_update_succeeded = api.wait_update(deadline=time.time() + 0.1)
+                wait_update_succeeded = api.wait_update(
+                    deadline=time.time() + wait_deadline_seconds
+                )
                 if wait_update_succeeded:
                     wait_update_count += 1
                     last_wait_update_at = datetime.now(UTC).isoformat()
-                received_at = datetime.now(UTC).isoformat()
-                write_result = _write_quote_refs(
-                    api,
-                    quote_refs=quote_refs,
-                    repository=repository,
-                    instrument_repository=instrument_repository,
-                    metrics_dirty_queue=metrics_dirty_queue,
-                    symbol_metadata=symbol_metadata,
-                    received_at=received_at,
-                    force_all=True,
-                    count_changed=False,
-                )
-                quotes_written += write_result["quotes_written"]
-                changed_quotes_written += write_result["changed_quotes_written"]
-                error_count += write_result["error_count"]
-                if write_result["wrote_quote"]:
-                    last_quote_write_at = received_at
+                    received_at = datetime.now(UTC).isoformat()
+                    write_result = _write_quote_refs(
+                        api,
+                        quote_refs=quote_refs,
+                        repository=repository,
+                        instrument_repository=instrument_repository,
+                        metrics_dirty_queue=metrics_dirty_queue,
+                        symbol_metadata=symbol_metadata,
+                        received_at=received_at,
+                        force_all=True,
+                        count_changed=False,
+                    )
+                    quotes_written += write_result["quotes_written"]
+                    changed_quotes_written += write_result["changed_quotes_written"]
+                    error_count += write_result["error_count"]
+                    if write_result["wrote_quote"]:
+                        last_quote_write_at = received_at
             while next_kline_progress_at <= attempted_kline_count:
                 next_kline_progress_at += kline_progress_step
             _emit_progress(
@@ -395,6 +530,16 @@ def stream_quotes(
                 near_expiry_kline_subscribed=min(len(kline_refs), near_kline_total),
                 near_expiry_kline_total=near_kline_total,
                 contract_month_limit=contract_month_limit,
+                moneyness_filter=moneyness_progress_filter,
+                moneyness_recalc_seconds=moneyness_recalc_seconds,
+                moneyness_kline_match_count=len(kline_symbols),
+                current_kline_symbol=current_kline_symbol,
+                current_kline_started_at=current_kline_started_at,
+                kline_subscription_timeout_seconds=kline_subscription_timeout_seconds,
+                kline_subscription_timeout_count=kline_subscription_timeout_count,
+                kline_subscription_error_count=kline_subscription_error_count,
+                last_kline_subscription_error_symbol=last_kline_subscription_error_symbol,
+                last_kline_subscription_error=last_kline_subscription_error,
                 underlying_progress=_underlying_subscription_progress(
                     quote_symbols=symbols,
                     kline_symbols=kline_symbols,
@@ -428,6 +573,9 @@ def stream_quotes(
         near_expiry_kline_subscribed=min(len(kline_refs), near_kline_total),
         near_expiry_kline_total=near_kline_total,
         contract_month_limit=contract_month_limit,
+        moneyness_filter=moneyness_progress_filter,
+        moneyness_recalc_seconds=moneyness_recalc_seconds,
+        moneyness_kline_match_count=len(kline_symbols),
         underlying_progress=_underlying_subscription_progress(
             quote_symbols=symbols,
             kline_symbols=kline_symbols,
@@ -457,6 +605,13 @@ def stream_quotes(
     reconcile_removed_quote_count = 0
     reconcile_added_kline_count = 0
     reconcile_removed_kline_count = 0
+    moneyness_recalc_count = 0
+    moneyness_added_kline_count = 0
+    moneyness_skipped_out_of_session_count = 0
+    moneyness_skipped_missing_price_count = 0
+    last_moneyness_recalc_at: str | None = None
+    moneyness_kline_match_count = len(kline_symbols)
+    next_moneyness_recalc_at = time.monotonic() + moneyness_recalc_seconds
 
     while True:
         if stop_requested is not None and stop_requested():
@@ -501,9 +656,11 @@ def stream_quotes(
                 near_expiry_months=near_expiry_months,
                 contract_month_limit=contract_month_limit,
                 min_days_to_expiry=min_days_to_expiry,
+                moneyness_filter=selected_moneyness,
                 quote_shard_size=quote_shard_size,
                 kline_batch_size=kline_batch_size,
                 kline_data_length=kline_data_length,
+                kline_subscription_timeout_seconds=kline_subscription_timeout_seconds,
             )
             symbols = reconcile["symbols"]
             kline_symbols = reconcile["kline_symbols"]
@@ -525,6 +682,48 @@ def stream_quotes(
                 or reconcile["removed_kline_count"]
             ):
                 last_contract_reconcile_at = datetime.now(UTC).isoformat()
+        if include_options and include_klines and now_monotonic >= next_moneyness_recalc_at:
+            next_moneyness_recalc_at = now_monotonic + moneyness_recalc_seconds
+            sticky = _add_sticky_moneyness_klines(
+                api,
+                connection,
+                kline_refs=kline_refs,
+                worker_index=worker_index,
+                worker_count=worker_count,
+                max_symbols=max_symbols,
+                prioritize_near_expiry=prioritize_near_expiry,
+                near_expiry_months=near_expiry_months,
+                contract_month_limit=contract_month_limit,
+                min_days_to_expiry=min_days_to_expiry,
+                moneyness_filter=selected_moneyness,
+                kline_batch_size=kline_batch_size,
+                kline_data_length=kline_data_length,
+                kline_subscription_timeout_seconds=kline_subscription_timeout_seconds,
+            )
+            moneyness_recalc_count += 1
+            moneyness_added_kline_count += sticky["added_kline_count"]
+            moneyness_kline_match_count = sticky["kline_match_count"]
+            moneyness_skipped_out_of_session_count += sticky[
+                "skipped_out_of_session_count"
+            ]
+            moneyness_skipped_missing_price_count += sticky[
+                "skipped_missing_price_count"
+            ]
+            error_count += sticky["error_count"]
+            kline_subscription_error_count += sticky["error_count"]
+            kline_subscription_timeout_count += sticky["timeout_count"]
+            if sticky["last_kline_error_symbol"] is not None:
+                last_kline_subscription_error_symbol = sticky["last_kline_error_symbol"]
+                last_kline_subscription_error = sticky["last_kline_error"]
+            last_moneyness_recalc_at = datetime.now(UTC).isoformat()
+            kline_symbols = sorted(
+                set(kline_symbols) | set(sticky["target_kline_symbols"])
+            )
+            near_kline_total = max(near_kline_total, sticky["target_near_kline_count"])
+            symbol_metadata = _quote_symbol_metadata(
+                connection,
+                sorted(set(symbols) | set(kline_symbols)),
+            )
         received_at = datetime.now(UTC).isoformat()
         force_quote_snapshot = cycle_count == 1 and not initial_quote_snapshot_written
         if wait_update_succeeded and now_monotonic >= next_running_quote_refresh_at:
@@ -602,6 +801,26 @@ def stream_quotes(
                 contract_reconcile_removed_quote_count=reconcile_removed_quote_count,
                 contract_reconcile_added_kline_count=reconcile_added_kline_count,
                 contract_reconcile_removed_kline_count=reconcile_removed_kline_count,
+                moneyness_filter=moneyness_progress_filter,
+                moneyness_recalc_seconds=moneyness_recalc_seconds,
+                moneyness_recalc_count=moneyness_recalc_count,
+                moneyness_kline_match_count=moneyness_kline_match_count,
+                moneyness_sticky_kline_count=len(kline_refs),
+                moneyness_added_kline_count=moneyness_added_kline_count,
+                moneyness_skipped_out_of_session_count=(
+                    moneyness_skipped_out_of_session_count
+                ),
+                moneyness_skipped_missing_price_count=(
+                    moneyness_skipped_missing_price_count
+                ),
+                last_moneyness_recalc_at=last_moneyness_recalc_at,
+                kline_subscription_timeout_seconds=kline_subscription_timeout_seconds,
+                kline_subscription_timeout_count=kline_subscription_timeout_count,
+                kline_subscription_error_count=kline_subscription_error_count,
+                last_kline_subscription_error_symbol=(
+                    last_kline_subscription_error_symbol
+                ),
+                last_kline_subscription_error=last_kline_subscription_error,
             )
 
     return QuoteStreamResult(
@@ -641,6 +860,20 @@ def stream_quotes(
         contract_reconcile_removed_quote_count=reconcile_removed_quote_count,
         contract_reconcile_added_kline_count=reconcile_added_kline_count,
         contract_reconcile_removed_kline_count=reconcile_removed_kline_count,
+        moneyness_filter=moneyness_progress_filter,
+        moneyness_recalc_seconds=moneyness_recalc_seconds,
+        moneyness_recalc_count=moneyness_recalc_count,
+        moneyness_kline_match_count=moneyness_kline_match_count,
+        moneyness_sticky_kline_count=len(kline_refs),
+        moneyness_added_kline_count=moneyness_added_kline_count,
+        moneyness_skipped_out_of_session_count=moneyness_skipped_out_of_session_count,
+        moneyness_skipped_missing_price_count=moneyness_skipped_missing_price_count,
+        last_moneyness_recalc_at=last_moneyness_recalc_at,
+        kline_subscription_timeout_seconds=kline_subscription_timeout_seconds,
+        kline_subscription_timeout_count=kline_subscription_timeout_count,
+        kline_subscription_error_count=kline_subscription_error_count,
+        last_kline_subscription_error_symbol=last_kline_subscription_error_symbol,
+        last_kline_subscription_error=last_kline_subscription_error,
         error_count=error_count,
     )
 
@@ -758,15 +991,17 @@ def select_kline_symbols(
     prioritize_near_expiry: bool = True,
     contract_month_limit: int | None = DEFAULT_CONTRACT_MONTH_LIMIT,
     min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
+    moneyness_filter: str | set[str] = DEFAULT_MONEYNESS_FILTER,
 ) -> list[str]:
     """Return de-duplicated single-symbol realtime kline subscriptions."""
 
     _validate_worker(worker_index, worker_count)
-    rows = _kline_subscription_rows(
+    rows, stats = _kline_subscription_rows_with_stats(
         connection,
         prioritize_near_expiry=prioritize_near_expiry,
         contract_month_limit=contract_month_limit,
         min_days_to_expiry=min_days_to_expiry,
+        moneyness_filter=moneyness_filter,
     )
     symbols = [str(row["symbol"]) for row in rows]
     shard = symbols[worker_index::worker_count]
@@ -825,15 +1060,17 @@ def count_near_expiry_kline_symbols(
     near_expiry_months: int = DEFAULT_NEAR_EXPIRY_MONTHS,
     contract_month_limit: int | None = DEFAULT_CONTRACT_MONTH_LIMIT,
     min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
+    moneyness_filter: str | set[str] = DEFAULT_MONEYNESS_FILTER,
 ) -> int:
     """Count this shard's Kline objects before the first N expiry-month boundary."""
 
     _validate_worker(worker_index, worker_count)
-    rows = _kline_subscription_rows(
+    rows, stats = _kline_subscription_rows_with_stats(
         connection,
         prioritize_near_expiry=prioritize_near_expiry,
         contract_month_limit=contract_month_limit,
         min_days_to_expiry=min_days_to_expiry,
+        moneyness_filter=moneyness_filter,
     )
     return _near_expiry_count_for_shard(
         rows,
@@ -876,6 +1113,7 @@ def expected_subscription_counts(
     contract_month_limit: int | None = DEFAULT_CONTRACT_MONTH_LIMIT,
     min_days_to_expiry: int = DEFAULT_MIN_DAYS_TO_EXPIRY,
     prioritize_near_expiry: bool = True,
+    moneyness_filter: str | set[str] = DEFAULT_MONEYNESS_FILTER,
 ) -> dict[str, int]:
     """Return expected full-scope subscription object counts from SQLite."""
 
@@ -902,6 +1140,7 @@ def expected_subscription_counts(
                 prioritize_near_expiry=prioritize_near_expiry,
                 contract_month_limit=contract_month_limit,
                 min_days_to_expiry=min_days_to_expiry,
+                moneyness_filter=moneyness_filter,
             )
         )
     return {
@@ -965,32 +1204,91 @@ def _subscribe_kline_ref_batch(
     symbols: list[str],
     *,
     data_length: int,
-) -> tuple[dict[str, Any], int]:
+    timeout_seconds: float = DEFAULT_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS,
+) -> tuple[dict[str, Any], int, int, str | None, str | None]:
     """Subscribe Kline symbols and retain a symbol-to-reference map."""
 
     if not symbols:
-        return ({}, 0)
+        return ({}, 0, 0, None, None)
     try:
         symbol_arg: str | list[str] = symbols[0] if len(symbols) == 1 else list(symbols)
-        ref = api.get_kline_serial(
-            symbol_arg,
-            duration_seconds=SECONDS_PER_DAY,
-            data_length=data_length,
+        ref = _call_with_timeout(
+            lambda: api.get_kline_serial(
+                symbol_arg,
+                duration_seconds=SECONDS_PER_DAY,
+                data_length=data_length,
+            ),
+            timeout_seconds=timeout_seconds,
+            message=f"Kline subscription timed out: {symbol_arg}",
         )
-        return ({symbol: ref for symbol in symbols}, 0)
-    except Exception:
+        return ({symbol: ref for symbol in symbols}, 0, 0, None, None)
+    except Exception as exc:
+        if len(symbols) == 1:
+            return (
+                {},
+                1,
+                1 if isinstance(exc, KlineSubscriptionTimeout) else 0,
+                symbols[0],
+                f"{type(exc).__name__}: {exc}",
+            )
         refs: dict[str, Any] = {}
         error_count = 0
+        timeout_count = 0
+        last_error_symbol: str | None = None
+        last_error: str | None = None
         for symbol in symbols:
             try:
-                refs[symbol] = api.get_kline_serial(
-                    symbol,
-                    duration_seconds=SECONDS_PER_DAY,
-                    data_length=data_length,
+                refs[symbol] = _call_with_timeout(
+                    lambda symbol=symbol: api.get_kline_serial(
+                        symbol,
+                        duration_seconds=SECONDS_PER_DAY,
+                        data_length=data_length,
+                    ),
+                    timeout_seconds=timeout_seconds,
+                    message=f"Kline subscription timed out: {symbol}",
                 )
-            except Exception:
+            except Exception as single_exc:
                 error_count += 1
-        return (refs, error_count)
+                if isinstance(single_exc, KlineSubscriptionTimeout):
+                    timeout_count += 1
+                last_error_symbol = symbol
+                last_error = f"{type(single_exc).__name__}: {single_exc}"
+        return (refs, error_count, timeout_count, last_error_symbol, last_error)
+
+
+class KlineSubscriptionTimeout(TimeoutError):
+    """Raised when one Kline subscription call exceeds its guard timeout."""
+
+
+def _call_with_timeout(
+    callback: Callable[[], Any],
+    *,
+    timeout_seconds: float,
+    message: str,
+) -> Any:
+    if (
+        timeout_seconds <= 0
+        or not hasattr(signal, "SIGALRM")
+        or not hasattr(signal, "setitimer")
+    ):
+        return callback()
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def _raise_timeout(_signum: int, _frame: Any) -> None:
+        raise KlineSubscriptionTimeout(message)
+
+    try:
+        signal.signal(signal.SIGALRM, _raise_timeout)
+        signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+        return callback()
+    except ValueError:
+        return callback()
+    finally:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+        except ValueError:
+            pass
 
 
 def _reconcile_subscriptions(
@@ -1009,9 +1307,11 @@ def _reconcile_subscriptions(
     near_expiry_months: int,
     contract_month_limit: int | None,
     min_days_to_expiry: int,
+    moneyness_filter: str | set[str],
     quote_shard_size: int,
     kline_batch_size: int,
     kline_data_length: int,
+    kline_subscription_timeout_seconds: float,
 ) -> dict[str, Any]:
     symbols = select_quote_symbols(
         connection,
@@ -1024,7 +1324,7 @@ def _reconcile_subscriptions(
         contract_month_limit=contract_month_limit,
         min_days_to_expiry=min_days_to_expiry,
     )
-    kline_symbols = (
+    matching_kline_symbols = (
         select_kline_symbols(
             connection,
             worker_index=worker_index,
@@ -1033,12 +1333,27 @@ def _reconcile_subscriptions(
             prioritize_near_expiry=prioritize_near_expiry,
             contract_month_limit=contract_month_limit,
             min_days_to_expiry=min_days_to_expiry,
+            moneyness_filter=moneyness_filter,
+        )
+        if include_options and include_klines
+        else []
+    )
+    active_kline_symbols = (
+        select_kline_symbols(
+            connection,
+            worker_index=worker_index,
+            worker_count=worker_count,
+            max_symbols=max_symbols,
+            prioritize_near_expiry=prioritize_near_expiry,
+            contract_month_limit=contract_month_limit,
+            min_days_to_expiry=min_days_to_expiry,
+            moneyness_filter=DEFAULT_MONEYNESS_FILTER,
         )
         if include_options and include_klines
         else []
     )
     target_quotes = set(symbols)
-    target_klines = set(kline_symbols)
+    target_active_klines = set(active_kline_symbols)
     removed_quote_count = 0
     for symbol in list(quote_refs):
         if symbol not in target_quotes:
@@ -1046,7 +1361,7 @@ def _reconcile_subscriptions(
             removed_quote_count += 1
     removed_kline_count = 0
     for symbol in list(kline_refs):
-        if symbol not in target_klines:
+        if symbol not in target_active_klines:
             kline_refs.pop(symbol, None)
             removed_kline_count += 1
     added_quote_symbols = [symbol for symbol in symbols if symbol not in quote_refs]
@@ -1059,16 +1374,18 @@ def _reconcile_subscriptions(
         quote_error_count += batch_error_count
     added_kline_count = 0
     for batch in _batches(
-        [symbol for symbol in kline_symbols if symbol not in kline_refs],
+        [symbol for symbol in matching_kline_symbols if symbol not in kline_refs],
         kline_batch_size,
     ):
-        refs, _error_count = _subscribe_kline_ref_batch(
+        refs, error_count, _timeout_count, _last_error_symbol, _last_error = _subscribe_kline_ref_batch(
             api,
             batch,
             data_length=kline_data_length,
+            timeout_seconds=kline_subscription_timeout_seconds,
         )
         kline_refs.update(refs)
         added_kline_count += len(refs)
+        quote_error_count += error_count
     near_quote_total = (
         count_near_expiry_quote_symbols(
             connection,
@@ -1095,10 +1412,16 @@ def _reconcile_subscriptions(
             near_expiry_months=near_expiry_months,
             contract_month_limit=contract_month_limit,
             min_days_to_expiry=min_days_to_expiry,
+            moneyness_filter=moneyness_filter,
         )
         if include_options and include_klines and prioritize_near_expiry
         else 0
     )
+    kline_symbols = [
+        symbol
+        for symbol in active_kline_symbols
+        if symbol in kline_refs or symbol in set(matching_kline_symbols)
+    ]
     return {
         "symbols": symbols,
         "kline_symbols": kline_symbols,
@@ -1109,6 +1432,108 @@ def _reconcile_subscriptions(
         "added_kline_count": added_kline_count,
         "removed_kline_count": removed_kline_count,
         "error_count": quote_error_count,
+    }
+
+
+def _add_sticky_moneyness_klines(
+    api: Any,
+    connection: sqlite3.Connection,
+    *,
+    kline_refs: dict[str, Any],
+    worker_index: int,
+    worker_count: int,
+    max_symbols: int | None,
+    prioritize_near_expiry: bool,
+    near_expiry_months: int,
+    contract_month_limit: int | None,
+    min_days_to_expiry: int,
+    moneyness_filter: str | set[str],
+    kline_batch_size: int,
+    kline_data_length: int,
+    kline_subscription_timeout_seconds: float,
+) -> dict[str, Any]:
+    target_rows, target_stats = _kline_subscription_rows_with_stats(
+        connection,
+        prioritize_near_expiry=prioritize_near_expiry,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
+        moneyness_filter=moneyness_filter,
+        require_trading_session=False,
+    )
+    target_symbols = [str(row["symbol"]) for row in target_rows]
+    target_shard = target_symbols[worker_index::worker_count]
+    if max_symbols is not None:
+        target_shard = target_shard[:max_symbols]
+    target_near_total = (
+        count_near_expiry_kline_symbols(
+            connection,
+            worker_index=worker_index,
+            worker_count=worker_count,
+            max_symbols=max_symbols,
+            prioritize_near_expiry=prioritize_near_expiry,
+            near_expiry_months=near_expiry_months,
+            contract_month_limit=contract_month_limit,
+            min_days_to_expiry=min_days_to_expiry,
+            moneyness_filter=moneyness_filter,
+        )
+        if prioritize_near_expiry
+        else 0
+    )
+    eligible_rows, eligible_stats = _kline_subscription_rows_with_stats(
+        connection,
+        prioritize_near_expiry=prioritize_near_expiry,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
+        moneyness_filter=moneyness_filter,
+        require_trading_session=True,
+    )
+    symbols = [str(row["symbol"]) for row in eligible_rows]
+    shard = symbols[worker_index::worker_count]
+    if max_symbols is not None:
+        shard = shard[:max_symbols]
+    kline_symbols = shard
+    added_kline_count = 0
+    error_count = 0
+    timeout_count = 0
+    last_kline_error_symbol: str | None = None
+    last_kline_error: str | None = None
+    for batch in _batches(
+        [symbol for symbol in kline_symbols if symbol not in kline_refs],
+        kline_batch_size,
+    ):
+        refs, batch_error_count, batch_timeout_count, last_error_symbol, last_error = _subscribe_kline_ref_batch(
+            api,
+            batch,
+            data_length=kline_data_length,
+            timeout_seconds=kline_subscription_timeout_seconds,
+        )
+        kline_refs.update(refs)
+        added_kline_count += len(refs)
+        error_count += batch_error_count
+        timeout_count += batch_timeout_count
+        if last_error_symbol is not None:
+            last_kline_error_symbol = last_error_symbol
+            last_kline_error = last_error
+    return {
+        "target_kline_symbols": target_shard,
+        "target_near_kline_count": target_near_total,
+        "eligible_kline_symbols": kline_symbols,
+        "kline_symbols": kline_symbols,
+        "kline_match_count": len(target_shard),
+        "added_kline_count": added_kline_count,
+        "skipped_out_of_session_count": int(
+            eligible_stats.get("skipped_out_of_session_count") or 0
+        ),
+        "skipped_missing_price_count": int(
+            max(
+                target_stats.get("skipped_missing_price_count") or 0,
+                eligible_stats.get("skipped_missing_price_count") or 0,
+            )
+        ),
+        "error_count": error_count,
+        "timeout_count": timeout_count,
+        "last_kline_error_symbol": last_kline_error_symbol,
+        "last_kline_error": last_kline_error,
     }
 
 
@@ -1156,6 +1581,7 @@ def _quote_subscription_rows(
         if quote_current_available
         else "NULL"
     )
+    future_quote_raw_payload_sql = "fq.raw_payload_json" if quote_current_available else "NULL"
     cursor = _execute_read_with_retry(
         connection,
         f"""
@@ -1167,6 +1593,7 @@ def _quote_subscription_rows(
             i.ins_class,
             i.option_class,
             i.underlying_symbol,
+            i.strike_price,
             i.delivery_year,
             i.delivery_month,
             i.exercise_year,
@@ -1203,7 +1630,29 @@ def _kline_subscription_rows(
     prioritize_near_expiry: bool,
     contract_month_limit: int | None,
     min_days_to_expiry: int,
+    moneyness_filter: str | set[str] = DEFAULT_MONEYNESS_FILTER,
+    require_trading_session: bool = False,
 ) -> list[dict[str, Any]]:
+    rows, _stats = _kline_subscription_rows_with_stats(
+        connection,
+        prioritize_near_expiry=prioritize_near_expiry,
+        contract_month_limit=contract_month_limit,
+        min_days_to_expiry=min_days_to_expiry,
+        moneyness_filter=moneyness_filter,
+        require_trading_session=require_trading_session,
+    )
+    return rows
+
+
+def _kline_subscription_rows_with_stats(
+    connection: sqlite3.Connection,
+    *,
+    prioritize_near_expiry: bool,
+    contract_month_limit: int | None,
+    min_days_to_expiry: int,
+    moneyness_filter: str | set[str] = DEFAULT_MONEYNESS_FILTER,
+    require_trading_session: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
     quote_current_available = _table_exists(connection, "quote_current")
     quote_join_sql = (
         """
@@ -1233,6 +1682,10 @@ def _kline_subscription_rows(
         if quote_current_available
         else "NULL"
     )
+    future_quote_raw_payload_sql = "fq.raw_payload_json" if quote_current_available else "NULL"
+    future_quote_source_datetime_sql = (
+        "fq.source_datetime" if quote_current_available else "NULL"
+    )
     cursor = _execute_read_with_retry(
         connection,
         f"""
@@ -1244,6 +1697,7 @@ def _kline_subscription_rows(
             i.ins_class,
             i.option_class,
             i.underlying_symbol,
+            i.strike_price,
             i.delivery_year,
             i.delivery_month,
             i.exercise_year,
@@ -1257,7 +1711,9 @@ def _kline_subscription_rows(
             COALESCE(
                 CAST(json_extract(future.raw_payload_json, '$.expire_rest_days') AS INTEGER),
                 {future_quote_expire_rest_sql}
-            ) AS underlying_expire_rest_days
+            ) AS underlying_expire_rest_days,
+            {future_quote_raw_payload_sql} AS underlying_quote_raw_payload_json,
+            {future_quote_source_datetime_sql} AS underlying_quote_source_datetime
         FROM instruments i
         LEFT JOIN instruments future ON future.symbol = i.underlying_symbol
         {quote_join_sql}
@@ -1286,11 +1742,157 @@ def _kline_subscription_rows(
             rows.append(row)
             seen_symbols.add(option_symbol)
     rows = _sort_subscription_rows(rows, prioritize_near_expiry=prioritize_near_expiry)
-    return _limit_rows_by_expiry_months(
+    limited_rows = _limit_rows_by_expiry_months(
         rows,
         contract_month_limit,
         min_days_to_expiry=min_days_to_expiry,
     )
+    return _filter_kline_rows_by_moneyness(
+        connection,
+        limited_rows,
+        moneyness_filter=moneyness_filter,
+        require_trading_session=require_trading_session,
+    )
+
+
+def _filter_kline_rows_by_moneyness(
+    connection: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    moneyness_filter: str | set[str],
+    require_trading_session: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    stats = {
+        "skipped_out_of_session_count": 0,
+        "skipped_missing_price_count": 0,
+    }
+    selected = (
+        set(moneyness_filter)
+        if isinstance(moneyness_filter, set)
+        else normalize_moneyness_filter(moneyness_filter)
+    )
+    option_rows = [row for row in rows if row.get("option_class") in {"CALL", "PUT"}]
+    if require_trading_session:
+        option_rows, skipped_out_of_session = _filter_option_rows_in_session(option_rows)
+        stats["skipped_out_of_session_count"] = skipped_out_of_session
+    if is_all_moneyness(selected):
+        if not require_trading_session:
+            return rows, stats
+        selected_underlyings = {
+            str(row.get("underlying_symbol") or "").strip()
+            for row in option_rows
+            if str(row.get("underlying_symbol") or "").strip()
+        }
+        return _rows_for_selected_options_and_underlyings(
+            rows,
+            selected_option_symbols={
+                str(row.get("symbol") or "").strip()
+                for row in option_rows
+                if str(row.get("symbol") or "").strip()
+            },
+            selected_underlyings=selected_underlyings,
+        ), stats
+    if not option_rows:
+        return [], stats
+    underlying_prices = _underlying_prices_for_rows(connection, option_rows)
+    expected_underlyings = {
+        str(row.get("underlying_symbol") or "").strip()
+        for row in option_rows
+        if str(row.get("underlying_symbol") or "").strip()
+    }
+    stats["skipped_missing_price_count"] = len(
+        expected_underlyings - set(underlying_prices)
+    )
+    classifications = classify_option_moneyness(
+        option_rows,
+        underlying_prices=underlying_prices,
+    )
+    selected_option_symbols = {
+        symbol
+        for symbol, moneyness in classifications.items()
+        if moneyness in selected
+    }
+    selected_underlyings = {
+        str(row.get("underlying_symbol") or "").strip()
+        for row in option_rows
+        if str(row.get("symbol") or "").strip() in selected_option_symbols
+    }
+    return _rows_for_selected_options_and_underlyings(
+        rows,
+        selected_option_symbols=selected_option_symbols,
+        selected_underlyings=selected_underlyings,
+    ), stats
+
+
+def _rows_for_selected_options_and_underlyings(
+    rows: list[dict[str, Any]],
+    *,
+    selected_option_symbols: set[str],
+    selected_underlyings: set[str],
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip()
+        option_class = row.get("option_class")
+        underlying = str(row.get("underlying_symbol") or "").strip()
+        if option_class in {"CALL", "PUT"}:
+            if symbol in selected_option_symbols:
+                filtered.append(row)
+        elif symbol in selected_underlyings or underlying in selected_underlyings:
+            filtered.append(row)
+    return filtered
+
+
+def _filter_option_rows_in_session(
+    option_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    skipped_underlyings: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    for row in option_rows:
+        underlying = str(row.get("underlying_symbol") or "").strip()
+        state = trading_session_state_from_payload(
+            str(row.get("underlying_quote_raw_payload_json") or ""),
+            quote_source_datetime=(
+                str(row.get("underlying_quote_source_datetime") or "") or None
+            ),
+        )
+        if state.state == SESSION_OUT:
+            skipped_underlyings.add(underlying)
+            continue
+        kept.append(row)
+    return kept, len(skipped_underlyings)
+
+
+def _underlying_prices_for_rows(
+    connection: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+) -> dict[str, float]:
+    underlyings = sorted(
+        {
+            str(row.get("underlying_symbol") or "").strip()
+            for row in rows
+            if str(row.get("underlying_symbol") or "").strip()
+        }
+    )
+    if not underlyings or not _table_exists(connection, "quote_current"):
+        return {}
+    placeholders = ",".join("?" for _ in underlyings)
+    fetched = _execute_read_with_retry(
+        connection,
+        f"""
+        SELECT symbol, COALESCE(last_price, average_price, close_price) AS price
+        FROM quote_current
+        WHERE symbol IN ({placeholders})
+        """,
+        tuple(underlyings),
+    ).fetchall()
+    prices: dict[str, float] = {}
+    for row in fetched:
+        try:
+            prices[str(row["symbol"])] = float(row["price"])
+        except (TypeError, ValueError):
+            continue
+    return prices
 
 
 def _dict_rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
@@ -1936,6 +2538,22 @@ def _emit_progress(
     contract_reconcile_added_kline_count: int = 0,
     contract_reconcile_removed_kline_count: int = 0,
     underlying_progress: dict[str, dict[str, Any]] | None = None,
+    moneyness_filter: str = DEFAULT_MONEYNESS_FILTER,
+    moneyness_recalc_seconds: int = DEFAULT_MONEYNESS_RECALC_SECONDS,
+    moneyness_recalc_count: int = 0,
+    moneyness_kline_match_count: int = 0,
+    moneyness_sticky_kline_count: int = 0,
+    moneyness_added_kline_count: int = 0,
+    moneyness_skipped_out_of_session_count: int = 0,
+    moneyness_skipped_missing_price_count: int = 0,
+    last_moneyness_recalc_at: str | None = None,
+    current_kline_symbol: str | None = None,
+    current_kline_started_at: str | None = None,
+    kline_subscription_timeout_seconds: float = DEFAULT_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS,
+    kline_subscription_timeout_count: int = 0,
+    kline_subscription_error_count: int = 0,
+    last_kline_subscription_error_symbol: str | None = None,
+    last_kline_subscription_error: str | None = None,
 ) -> None:
     if progress_callback is None:
         return
@@ -1992,6 +2610,28 @@ def _emit_progress(
             "contract_reconcile_removed_kline_count": (
                 contract_reconcile_removed_kline_count
             ),
+            "moneyness_filter": moneyness_filter,
+            "moneyness_recalc_seconds": moneyness_recalc_seconds,
+            "moneyness_recalc_count": moneyness_recalc_count,
+            "moneyness_kline_match_count": moneyness_kline_match_count,
+            "moneyness_sticky_kline_count": moneyness_sticky_kline_count,
+            "moneyness_added_kline_count": moneyness_added_kline_count,
+            "moneyness_skipped_out_of_session_count": (
+                moneyness_skipped_out_of_session_count
+            ),
+            "moneyness_skipped_missing_price_count": (
+                moneyness_skipped_missing_price_count
+            ),
+            "last_moneyness_recalc_at": last_moneyness_recalc_at,
+            "current_kline_symbol": current_kline_symbol,
+            "current_kline_started_at": current_kline_started_at,
+            "kline_subscription_timeout_seconds": kline_subscription_timeout_seconds,
+            "kline_subscription_timeout_count": kline_subscription_timeout_count,
+            "kline_subscription_error_count": kline_subscription_error_count,
+            "last_kline_subscription_error_symbol": (
+                last_kline_subscription_error_symbol
+            ),
+            "last_kline_subscription_error": last_kline_subscription_error,
             "completion_ratio": subscribed_objects / total_objects
             if total_objects
             else 0.0,

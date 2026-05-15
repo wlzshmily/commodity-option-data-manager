@@ -101,6 +101,12 @@ def create_webui_app(
                 underlying_symbol=underlying,
                 include_selectors=selectors,
                 realtime_started_at=_realtime_started_at(quote_stream),
+                subscription_progress=(
+                    quote_stream.get("progress") or {}
+                ).get("underlying_progress"),
+                moneyness_filter=(quote_stream.get("progress") or {}).get(
+                    "moneyness_filter"
+                ),
             )
         finally:
             if read_connection is not None:
@@ -612,6 +618,53 @@ def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict:
             _int_value(row.get("contract_reconcile_removed_kline_count"))
             for row in rows
         ),
+        "moneyness_filter": _aggregate_text_value(rows, "moneyness_filter"),
+        "moneyness_recalc_seconds": max(
+            _int_value(row.get("moneyness_recalc_seconds")) for row in rows
+        ),
+        "moneyness_recalc_count": sum(
+            _int_value(row.get("moneyness_recalc_count")) for row in rows
+        ),
+        "moneyness_kline_match_count": sum(
+            _int_value(row.get("moneyness_kline_match_count")) for row in rows
+        ),
+        "moneyness_sticky_kline_count": sum(
+            _int_value(row.get("moneyness_sticky_kline_count")) for row in rows
+        ),
+        "moneyness_added_kline_count": sum(
+            _int_value(row.get("moneyness_added_kline_count")) for row in rows
+        ),
+        "moneyness_skipped_out_of_session_count": sum(
+            _int_value(row.get("moneyness_skipped_out_of_session_count"))
+            for row in rows
+        ),
+        "moneyness_skipped_missing_price_count": sum(
+            _int_value(row.get("moneyness_skipped_missing_price_count"))
+            for row in rows
+        ),
+        "last_moneyness_recalc_at": _max_text_value(
+            rows,
+            "last_moneyness_recalc_at",
+        ),
+        "current_kline_symbol": _aggregate_text_value(rows, "current_kline_symbol"),
+        "current_kline_started_at": _max_text_value(rows, "current_kline_started_at"),
+        "kline_subscription_timeout_seconds": max(
+            _int_value(row.get("kline_subscription_timeout_seconds")) for row in rows
+        ),
+        "kline_subscription_timeout_count": sum(
+            _int_value(row.get("kline_subscription_timeout_count")) for row in rows
+        ),
+        "kline_subscription_error_count": sum(
+            _int_value(row.get("kline_subscription_error_count")) for row in rows
+        ),
+        "last_kline_subscription_error_symbol": _aggregate_text_value(
+            rows,
+            "last_kline_subscription_error_symbol",
+        ),
+        "last_kline_subscription_error": _aggregate_text_value(
+            rows,
+            "last_kline_subscription_error",
+        ),
         "cycle_count": sum(_int_value(row.get("cycle_count")) for row in rows),
         "wait_update_count": sum(_int_value(row.get("wait_update_count")) for row in rows),
         "quotes_written": sum(_int_value(row.get("quotes_written")) for row in rows),
@@ -716,6 +769,42 @@ def _progress_from_report(payload: dict) -> dict | None:
         "completion_ratio": subscribed_objects / total_objects
         if total_objects
         else 0.0,
+        "moneyness_filter": result.get("moneyness_filter"),
+        "moneyness_recalc_seconds": _int_value(
+            result.get("moneyness_recalc_seconds")
+        ),
+        "moneyness_recalc_count": _int_value(result.get("moneyness_recalc_count")),
+        "moneyness_kline_match_count": _int_value(
+            result.get("moneyness_kline_match_count")
+        ),
+        "moneyness_sticky_kline_count": _int_value(
+            result.get("moneyness_sticky_kline_count")
+        ),
+        "moneyness_added_kline_count": _int_value(
+            result.get("moneyness_added_kline_count")
+        ),
+        "moneyness_skipped_out_of_session_count": _int_value(
+            result.get("moneyness_skipped_out_of_session_count")
+        ),
+        "moneyness_skipped_missing_price_count": _int_value(
+            result.get("moneyness_skipped_missing_price_count")
+        ),
+        "last_moneyness_recalc_at": result.get("last_moneyness_recalc_at"),
+        "current_kline_symbol": result.get("current_kline_symbol"),
+        "current_kline_started_at": result.get("current_kline_started_at"),
+        "kline_subscription_timeout_seconds": _int_value(
+            result.get("kline_subscription_timeout_seconds")
+        ),
+        "kline_subscription_timeout_count": _int_value(
+            result.get("kline_subscription_timeout_count")
+        ),
+        "kline_subscription_error_count": _int_value(
+            result.get("kline_subscription_error_count")
+        ),
+        "last_kline_subscription_error_symbol": result.get(
+            "last_kline_subscription_error_symbol"
+        ),
+        "last_kline_subscription_error": result.get("last_kline_subscription_error"),
         "underlying_progress": result.get("underlying_progress") or {},
     }
 
@@ -802,6 +891,26 @@ def _aggregate_contract_months(rows: list[dict]) -> str | None:
         return "all"
     parsed = sorted(_int_value(value) for value in values if _int_value(value) > 0)
     return str(parsed[-1]) if parsed else None
+
+
+def _aggregate_text_value(rows: list[dict], key: str) -> str | None:
+    values = {
+        str(row.get(key)).strip()
+        for row in rows
+        if row.get(key) is not None and str(row.get(key)).strip()
+    }
+    if not values:
+        return None
+    return ",".join(sorted(values))
+
+
+def _max_text_value(rows: list[dict], key: str) -> str | None:
+    values = [
+        str(row.get(key)).strip()
+        for row in rows
+        if row.get(key) is not None and str(row.get(key)).strip()
+    ]
+    return max(values) if values else None
 
 
 def _contract_months_from_result(result: dict) -> str | None:
@@ -1101,7 +1210,7 @@ INDEX_HTML = """<!doctype html>
             <div class="hero-metrics">
               <div class="metric-card"><span>最新刷新</span><strong id="latest-update">--</strong></div>
               <div class="metric-card"><span>活跃期权</span><strong id="summary-options">--</strong></div>
-              <div class="metric-card"><span>Greeks/IV 覆盖</span><strong class="good" id="summary-iv">--</strong></div>
+              <div class="metric-card"><span>指标覆盖</span><strong class="good" id="summary-iv">--</strong></div>
               <div class="metric-card"><span>20日K线</span><strong class="good" id="summary-kline">正常</strong></div>
               <div class="metric-card"><span>采集分片</span><strong id="summary-batches">--</strong></div>
             </div>
@@ -1133,8 +1242,8 @@ INDEX_HTML = """<!doctype html>
             <div class="exchange-tabs" id="exchange-tabs" role="tablist" aria-label="交易所筛选"></div>
             <div class="table-responsive table-shell">
               <table class="table table-sm align-middle summary-table underlying-table">
-                <colgroup><col class="underlying-exchange"><col class="underlying-product"><col class="underlying-symbol"><col class="underlying-expiry"><col class="underlying-count"><col class="underlying-count"><col class="underlying-count"><col class="underlying-ratio"><col class="underlying-ratio"><col class="underlying-kline"><col class="underlying-time"><col class="underlying-status"><col class="underlying-action"></colgroup>
-                <thead><tr><th>交易所</th><th>品种</th><th>标的合约</th><th>到期月</th><th>剩余天数</th><th>CALL</th><th>PUT</th><th>Quote</th><th>Greeks/IV</th><th>20D K线</th><th>行情时间</th><th>状态</th><th>操作</th></tr></thead>
+                <colgroup><col class="underlying-exchange"><col class="underlying-product"><col class="underlying-symbol"><col class="underlying-expiry"><col class="underlying-count"><col class="underlying-count"><col class="underlying-count"><col class="underlying-ratio"><col class="underlying-ratio"><col class="underlying-kline"><col class="underlying-time"><col class="underlying-status"><col class="underlying-status"><col class="underlying-action"></colgroup>
+                <thead><tr><th>交易所</th><th>品种</th><th>标的合约</th><th>到期月</th><th>剩余天数</th><th>CALL</th><th>PUT</th><th>Quote</th><th>IV</th><th>20D K线</th><th>行情时间</th><th>交易时间</th><th>状态</th><th>操作</th></tr></thead>
                 <tbody id="underlying-rows"></tbody>
               </table>
               <div class="empty-state d-none" id="overview-empty">
@@ -1153,7 +1262,7 @@ INDEX_HTML = """<!doctype html>
             <div class="hero-metrics">
               <div class="metric-card"><span>实时行情时间</span><strong id="quote-book-time">--</strong></div>
               <div class="metric-card"><span>活跃期权</span><strong id="quote-active-options">--</strong></div>
-              <div class="metric-card"><span>Greeks/IV 覆盖</span><strong class="good" id="quote-iv-coverage">--</strong></div>
+              <div class="metric-card"><span>指标覆盖</span><strong class="good" id="quote-iv-coverage">--</strong></div>
               <div class="metric-card"><span>实时状态</span><strong class="warn" id="quote-kline-status">未订阅</strong></div>
             </div>
           </div>
@@ -1167,6 +1276,7 @@ INDEX_HTML = """<!doctype html>
               <label class="form-label mb-0">到期月</label>
               <select class="form-select form-select-sm" id="expiry-select"></select>
               <span class="expiry-days">剩余到期天数 <strong id="toolbar-expiry-days">--</strong></span>
+              <span>交易时间 <strong id="toolbar-session-state">--</strong></span>
               <span class="ms-auto">行情时间 <strong id="toolbar-book-time">--</strong></span>
             </div>
             <div class="quote-table-wrap">
@@ -1243,13 +1353,18 @@ INDEX_HTML = """<!doctype html>
               <label>订阅分片大小<input class="form-control form-control-sm" id="setting-quote-shard-size" type="number" min="1" /></label>
               <label>K线批量大小<input class="form-control form-control-sm" id="setting-kline-batch-size" type="number" min="1" /></label>
               <label>K线窗口天数<input class="form-control form-control-sm" id="setting-kline-data-length" type="number" min="1" /></label>
+              <label>K线单合约超时秒<input class="form-control form-control-sm" id="setting-kline-timeout-seconds" type="number" min="1" /></label>
               <label>近月标记数量<input class="form-control form-control-sm" id="setting-near-expiry-months" type="number" min="1" /></label>
               <label>订阅合约月份<select class="form-select form-select-sm" id="setting-contract-months"><option value="1">1 个</option><option value="2">2 个</option><option value="3">3 个</option><option value="all">全部</option></select></label>
               <label>最小剩余天数<input class="form-control form-control-sm" id="setting-min-days-to-expiry" type="number" min="0" /></label>
+              <label>虚实度重算秒<input class="form-control form-control-sm" id="setting-moneyness-recalc-seconds" type="number" min="1" /></label>
               <label>最大 symbols<input class="form-control form-control-sm" id="setting-quote-max-symbols" type="number" min="1" placeholder="留空为全量" /></label>
               <label>指标最小间隔秒<input class="form-control form-control-sm" id="setting-metrics-min-interval" type="number" min="1" /></label>
               <label>标的全链间隔秒<input class="form-control form-control-sm" id="setting-metrics-chain-interval" type="number" min="1" /></label>
               <label class="checkline"><input class="form-check-input" id="setting-prioritize-near-expiry" type="checkbox" /> 近月优先订阅</label>
+              <label class="checkline"><input class="form-check-input setting-moneyness" value="otm" type="checkbox" /> 虚值K线</label>
+              <label class="checkline"><input class="form-check-input setting-moneyness" value="atm" type="checkbox" /> 平值K线</label>
+              <label class="checkline"><input class="form-check-input setting-moneyness" value="itm" type="checkbox" /> 实值K线</label>
               <div class="settings-actions quote-stream-actions">
                 <button class="btn btn-sm btn-primary" type="button" id="start-quote-stream">启动实时订阅</button>
                 <button class="btn btn-sm btn-light" type="button" id="stop-quote-stream">停止实时订阅</button>
@@ -1637,6 +1752,8 @@ body {
 .table td { color: var(--text); background: rgba(255, 253, 248, .98); }
 .summary-table tbody tr:nth-child(even) td { background: #f7fbf3; }
 .summary-table tbody tr.clickable:hover td { background: rgba(242, 198, 212, .22); }
+.summary-table td.cell-right { text-align: right; }
+.summary-table td.cell-center { text-align: center; }
 .summary-table .empty-row td {
   height: 54px;
   padding: 0 16px;
@@ -1647,11 +1764,11 @@ body {
 }
 .underlying-table col.underlying-exchange { width: 7%; }
 .underlying-table col.underlying-product { width: 7%; }
-.underlying-table col.underlying-symbol { width: 15%; }
+.underlying-table col.underlying-symbol { width: 10%; }
 .underlying-table col.underlying-expiry { width: 7%; }
 .underlying-table col.underlying-count { width: 6%; }
 .underlying-table col.underlying-ratio { width: 8%; }
-.underlying-table col.underlying-kline { width: 8%; }
+.underlying-table col.underlying-kline { width: 13%; }
 .underlying-table col.underlying-time { width: 13%; }
 .underlying-table col.underlying-status { width: 8%; }
 .underlying-table col.underlying-action { width: 7%; }
@@ -1710,6 +1827,7 @@ body {
 .tag.warn { background: #fff2dc; color: var(--warn); }
 .tag.bad { background: #fae3e6; color: var(--brand); }
 .status-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.cell-center .status-cell { align-items: center; }
 .status-subline { font-size: 11px; line-height: 1; color: var(--muted); white-space: nowrap; }
 .quote-shell { overflow: hidden; }
 .quote-toolbar {
@@ -1880,7 +1998,7 @@ const exchangeNames = {
 
 const productNames = {
   a: "黄大豆1号",
-  ad: "氧化铝",
+  ad: "铝合金",
   ag: "白银",
   al: "铝",
   ao: "氧化铝",
@@ -1956,6 +2074,10 @@ const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => 
 function productLabel(product) {
   const key = String(product ?? "").toLowerCase();
   return productNames[key] ?? product ?? "--";
+}
+
+function productLabelForRow(row) {
+  return row?.product_display_name ?? productLabel(row?.product_id);
 }
 
 function localizeStatusMessage(message) {
@@ -2208,9 +2330,15 @@ async function loadSettings() {
     $("#setting-quote-shard-size").value = settings.quote_stream?.quote_shard_size ?? 1000;
     $("#setting-kline-batch-size").value = settings.quote_stream?.kline_batch_size ?? 1;
     $("#setting-kline-data-length").value = settings.quote_stream?.kline_data_length ?? 3;
+    $("#setting-kline-timeout-seconds").value = settings.quote_stream?.kline_subscription_timeout_seconds ?? 30;
     $("#setting-near-expiry-months").value = settings.quote_stream?.near_expiry_months ?? 2;
     $("#setting-contract-months").value = settings.quote_stream?.contract_months ?? "2";
     $("#setting-min-days-to-expiry").value = settings.quote_stream?.min_days_to_expiry ?? 1;
+    $("#setting-moneyness-recalc-seconds").value = settings.quote_stream?.moneyness_recalc_seconds ?? 30;
+    const moneyness = new Set(String(settings.quote_stream?.moneyness_filter ?? "atm,itm,otm").split(",").map((item) => item.trim()));
+    $$(".setting-moneyness").forEach((checkbox) => {
+      checkbox.checked = moneyness.has(checkbox.value);
+    });
     $("#setting-prioritize-near-expiry").checked = settings.quote_stream?.prioritize_near_expiry ?? true;
     $("#setting-quote-max-symbols").value = settings.quote_stream?.max_symbols ?? "";
     $("#setting-metrics-min-interval").value = settings.metrics?.min_interval_seconds ?? 30;
@@ -2261,9 +2389,12 @@ async function saveRuntimeSettings() {
     ["quote_stream.quote_shard_size", $("#setting-quote-shard-size").value || "1000"],
     ["quote_stream.kline_batch_size", $("#setting-kline-batch-size").value || "1"],
     ["quote_stream.kline_data_length", $("#setting-kline-data-length").value || "3"],
+    ["quote_stream.kline_subscription_timeout_seconds", $("#setting-kline-timeout-seconds").value || "30"],
     ["quote_stream.near_expiry_months", $("#setting-near-expiry-months").value || "2"],
     ["quote_stream.contract_months", $("#setting-contract-months").value || "2"],
     ["quote_stream.min_days_to_expiry", $("#setting-min-days-to-expiry").value || "1"],
+    ["quote_stream.moneyness_filter", selectedMoneynessFilter()],
+    ["quote_stream.moneyness_recalc_seconds", $("#setting-moneyness-recalc-seconds").value || "30"],
     ["quote_stream.prioritize_near_expiry", $("#setting-prioritize-near-expiry").checked ? "true" : "false"],
     ["quote_stream.max_symbols", $("#setting-quote-max-symbols").value || ""],
     ["metrics.min_interval_seconds", $("#setting-metrics-min-interval").value || "30"],
@@ -2281,6 +2412,13 @@ async function triggerRefresh() {
   const result = await fetchJsonWithBody("/api/refresh", "POST", {});
   setNotice("#settings-message", `${result.message} 报告：${result.report_path}`, result.status === "started" ? "good" : "warn");
   await refreshOverview();
+}
+
+function selectedMoneynessFilter() {
+  const selected = $$(".setting-moneyness")
+    .filter((checkbox) => checkbox.checked)
+    .map((checkbox) => checkbox.value);
+  return selected.length ? selected.join(",") : "atm,itm,otm";
 }
 
 async function startContractManager() {
@@ -2380,9 +2518,11 @@ function renderQuoteStreamStatus(status) {
   const message = status.message ? `上次状态：${status.message}` : "等待启动。";
   const reports = status.report_dir ? `报告目录：${status.report_dir}` : "";
   const health = status.health ? `网络健康：${status.health.label ?? status.health.status}` : "";
+  const moneyness = fmtMoneynessHint(status);
+  const klineGuard = fmtKlineGuardHint(status);
   const notify = fmtTqsdkNotifyHint(status);
   const tone = status.health?.tone === "bad" ? "bad" : status.running ? "good" : status.status === "blocked" || !hasContracts || !contractListReady ? "bad" : "warn";
-  setNotice("#quote-stream-message", [stateText, workerText, contractText, health, notify, message, reports].filter(Boolean).join(" · "), tone);
+  setNotice("#quote-stream-message", [stateText, workerText, contractText, health, moneyness, klineGuard, notify, message, reports].filter(Boolean).join(" · "), tone);
   setQuoteStreamControls({
     running: Boolean(status.running),
     busy: starting || discovering,
@@ -2442,13 +2582,20 @@ function setQuoteStreamControls({ running, busy = false, discovering = false, ha
     "setting-quote-shard-size",
     "setting-kline-batch-size",
     "setting-kline-data-length",
+    "setting-kline-timeout-seconds",
     "setting-near-expiry-months",
     "setting-contract-months",
     "setting-min-days-to-expiry",
+    "setting-moneyness-recalc-seconds",
     "setting-quote-max-symbols",
+    "setting-metrics-min-interval",
+    "setting-metrics-chain-interval",
     "setting-prioritize-near-expiry",
   ].forEach((id) => {
     $(`#${id}`).disabled = Boolean(running || busy);
+  });
+  $$(".setting-moneyness").forEach((checkbox) => {
+    checkbox.disabled = Boolean(running || busy);
   });
 }
 
@@ -2536,7 +2683,7 @@ function renderOverview() {
   const summary = state.overview.summary;
   $("#latest-update").textContent = fmtDateTime(summary.latest_update ?? state.overview.latest_run?.finished_at);
   $("#summary-options").textContent = fmtNum(summary.active_options);
-  $("#summary-iv").textContent = fmtPct(summary.iv_coverage);
+  $("#summary-iv").textContent = `IV ${fmtPct(summary.iv_coverage)} · Greeks ${fmtPct(summary.greeks_coverage)}`;
   $("#summary-kline").textContent = summary.kline_coverage >= 0.999 ? "正常" : "补齐中";
   $("#summary-batches").textContent = fmtCollectionProgress(state.overview.collection);
   updateHealthPill(summary);
@@ -2632,6 +2779,29 @@ function fmtContractManagerHint(quoteStream) {
   return `合约管理 ${fmtNum(refreshCount)}次 · 增${fmtNum(added)} / 减${fmtNum(removed)} · ${timeText}`;
 }
 
+function fmtMoneynessHint(quoteStream) {
+  const progress = quoteStream?.progress ?? {};
+  const recalcCount = Number(progress.moneyness_recalc_count ?? 0);
+  const matchCount = Number(progress.moneyness_kline_match_count ?? 0);
+  const stickyCount = Number(progress.moneyness_sticky_kline_count ?? 0);
+  const addedCount = Number(progress.moneyness_added_kline_count ?? 0);
+  if (!recalcCount && !matchCount && !stickyCount && !addedCount) return "";
+  const skippedSession = Number(progress.moneyness_skipped_out_of_session_count ?? 0);
+  const skippedPrice = Number(progress.moneyness_skipped_missing_price_count ?? 0);
+  return `虚实度K线 命中${fmtNum(matchCount)} / sticky${fmtNum(stickyCount)} / 新增${fmtNum(addedCount)} / 跳过${fmtNum(skippedSession + skippedPrice)}`;
+}
+
+function fmtKlineGuardHint(quoteStream) {
+  const progress = quoteStream?.progress ?? {};
+  const timeoutCount = Number(progress.kline_subscription_timeout_count ?? 0);
+  const errorCount = Number(progress.kline_subscription_error_count ?? 0);
+  const current = progress.current_kline_symbol;
+  if (!timeoutCount && !errorCount && !current) return "";
+  const currentText = current ? `当前K线 ${current}` : "";
+  const errorText = timeoutCount || errorCount ? `K线跳过 超时${fmtNum(timeoutCount)} / 失败${fmtNum(errorCount)}` : "";
+  return [currentText, errorText].filter(Boolean).join(" · ");
+}
+
 function fmtBatchRefreshHint(refresh) {
   const message = localizeStatusMessage(refresh?.message);
   if (refresh?.running) return message ?? "批量补采正在按分片窗口推进。";
@@ -2665,6 +2835,21 @@ function quoteStreamProgress(quoteStream) {
     nearExpiryKlineSubscribed: Number(progress.near_expiry_kline_subscribed ?? 0),
     nearExpiryKlineTotal: Number(progress.near_expiry_kline_total ?? 0),
     contractMonths: progress.contract_months ?? quoteStream?.contract_months ?? null,
+    moneynessFilter: progress.moneyness_filter ?? null,
+    moneynessRecalcCount: Number(progress.moneyness_recalc_count ?? 0),
+    moneynessMatchCount: Number(progress.moneyness_kline_match_count ?? 0),
+    moneynessStickyCount: Number(progress.moneyness_sticky_kline_count ?? 0),
+    moneynessAddedCount: Number(progress.moneyness_added_kline_count ?? 0),
+    moneynessSkippedOutOfSession: Number(progress.moneyness_skipped_out_of_session_count ?? 0),
+    moneynessSkippedMissingPrice: Number(progress.moneyness_skipped_missing_price_count ?? 0),
+    lastMoneynessRecalcAt: progress.last_moneyness_recalc_at,
+    currentKlineSymbol: progress.current_kline_symbol,
+    currentKlineStartedAt: progress.current_kline_started_at,
+    klineTimeoutSeconds: Number(progress.kline_subscription_timeout_seconds ?? 0),
+    klineTimeoutCount: Number(progress.kline_subscription_timeout_count ?? 0),
+    klineErrorCount: Number(progress.kline_subscription_error_count ?? 0),
+    lastKlineErrorSymbol: progress.last_kline_subscription_error_symbol,
+    lastKlineError: progress.last_kline_subscription_error,
     refreshingContracts: Boolean(quoteStream?.contract_discovery_running),
     workerReports: Number(progress.worker_reports ?? 0),
     updatedAt: progress.updated_at,
@@ -2782,6 +2967,30 @@ function streamContractScopeText(progress) {
   return "订阅范围：按当前设置";
 }
 
+function streamMoneynessSummary(progress) {
+  const filter = moneynessFilterLabel(progress?.moneynessFilter);
+  const match = Number(progress?.moneynessMatchCount ?? 0);
+  const sticky = Number(progress?.moneynessStickyCount ?? 0);
+  const added = Number(progress?.moneynessAddedCount ?? 0);
+  const skipped = Number(progress?.moneynessSkippedOutOfSession ?? 0)
+    + Number(progress?.moneynessSkippedMissingPrice ?? 0);
+  const timeout = Number(progress?.klineTimeoutCount ?? 0);
+  const errors = Number(progress?.klineErrorCount ?? 0);
+  const guard = timeout || errors ? `，订阅跳过 超时 ${fmtNum(timeout)} / 失败 ${fmtNum(errors)}` : "";
+  return `虚实度K线：${filter}，当前命中 ${fmtNum(match)}，日内累计 ${fmtNum(sticky)}，新增 ${fmtNum(added)}，跳过 ${fmtNum(skipped)}${guard}`;
+}
+
+function moneynessFilterLabel(value) {
+  const labels = { otm: "虚值", atm: "平值", itm: "实值" };
+  const items = String(value || "atm,itm,otm")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  const unique = [...new Set(items)];
+  if (!unique.length || unique.length >= 3) return "全选";
+  return unique.map((item) => labels[item] ?? item).join("+");
+}
+
 function renderCollectionProgress() {
   const summary = state.overview.summary ?? {};
   const progress = state.overview.collection ?? {};
@@ -2852,7 +3061,7 @@ function renderCollectionProgress() {
           </div>
         </div>
       </div>
-      <small>${escapeHtml(streamContractScopeText(streamProgress))} · ${escapeHtml(fmtNum(streamProgress.workerReports))} worker报告${escapeHtml(streamNearExpirySummary(streamProgress))} · 订阅总用时 ${escapeHtml(fmtDuration(streamProgress.elapsedSeconds))} · ${escapeHtml(streamEtaSummary(streamProgress))}</small>
+      <small>${escapeHtml(streamContractScopeText(streamProgress))} · ${escapeHtml(streamMoneynessSummary(streamProgress))} · ${escapeHtml(fmtNum(streamProgress.workerReports))} worker报告${escapeHtml(streamNearExpirySummary(streamProgress))} · 订阅总用时 ${escapeHtml(fmtDuration(streamProgress.elapsedSeconds))} · ${escapeHtml(streamEtaSummary(streamProgress))}</small>
     </div>
   `;
   $("#collection-progress").innerHTML = streamProgressHtml + cards.map(([label, value, hint, tone]) => `
@@ -2917,20 +3126,22 @@ function renderUnderlyingRows() {
     const subscriptionText = row.subscription_total
       ? `${fmtNum(row.subscription_subscribed)}/${fmtNum(row.subscription_total)}`
       : "";
+    const sessionTone = tradingSessionTone(row.trading_session_state);
     return `<tr class="clickable" data-underlying="${escapeHtml(row.underlying_symbol)}">
       <td>${escapeHtml(exchangeNames[row.exchange_id] ?? row.exchange_id)}</td>
-      <td>${escapeHtml(productNames[row.product_id] ?? row.product_id)}</td>
+      <td>${escapeHtml(productLabelForRow(row))}</td>
       <td class="mono">${escapeHtml(row.underlying_symbol)}</td>
       <td class="mono">${escapeHtml(row.expiry_month ?? "--")}</td>
-      <td class="mono">${fmtDaysToExpiry(row.days_to_expiry)}</td>
-      <td class="mono">${fmtNum(row.call_count)}</td>
-      <td class="mono">${fmtNum(row.put_count)}</td>
-      <td class="good">${fmtPct(row.quote_coverage)}</td>
-      <td class="${row.iv_coverage < 0.98 ? "warn" : "good"}">${fmtPct(row.iv_coverage)}</td>
-      <td class="${row.kline_count ? "good" : "warn"}">${row.kline_count ? escapeHtml(fmtDateTime(row.display_kline_time ?? row.latest_kline_time)) : "缺口"}</td>
-      <td class="mono">${escapeHtml(fmtDateTime(row.display_market_time ?? row.latest_quote_time))}</td>
-      <td><div class="status-cell"><span class="tag ${statusClass}">${escapeHtml(row.status)}</span>${subscriptionText ? `<span class="status-subline mono">${escapeHtml(subscriptionText)}</span>` : ""}</div></td>
-      <td><button class="btn btn-sm btn-light" type="button">进入T型</button></td>
+      <td class="mono cell-right">${fmtDaysToExpiry(row.days_to_expiry)}</td>
+      <td class="mono cell-right">${fmtNum(row.call_count)}</td>
+      <td class="mono cell-right">${fmtNum(row.put_count)}</td>
+      <td class="good cell-right">${fmtPct(row.quote_coverage)}</td>
+      <td class="${row.iv_coverage < 0.98 ? "warn" : "good"} cell-right">${fmtPct(row.iv_coverage)}</td>
+      <td class="${row.kline_count ? "good" : "warn"} cell-center">${row.kline_count ? escapeHtml(fmtDateTime(row.display_kline_time ?? row.latest_kline_time)) : "缺口"}</td>
+      <td class="mono cell-center">${escapeHtml(fmtDateTime(row.display_market_time ?? row.latest_quote_time))}</td>
+      <td class="cell-center"><span class="tag ${sessionTone}">${escapeHtml(row.trading_session_label ?? "--")}</span></td>
+      <td class="cell-center"><div class="status-cell"><span class="tag ${statusClass}">${escapeHtml(row.status)}</span>${subscriptionText ? `<span class="status-subline mono">${escapeHtml(subscriptionText)}</span>` : ""}</div></td>
+      <td class="cell-center"><button class="btn btn-sm btn-light" type="button">进入T型</button></td>
     </tr>`;
   }).join("");
   $$("#underlying-rows tr").forEach((row) => row.addEventListener("click", async () => {
@@ -3010,7 +3221,7 @@ function renderSelectors() {
   const exchangeRows = rows.filter((row) => row.exchange_id === current.exchange_id);
   const productRows = exchangeRows.filter((row) => row.product_id === current.product_id);
   fillSelect($("#exchange-select"), unique(rows.map((row) => row.exchange_id)), current.exchange_id, (value) => exchangeNames[value] ?? value);
-  fillSelect($("#product-select"), unique(exchangeRows.map((row) => row.product_id)), current.product_id, (value) => productNames[value] ?? value);
+  fillSelect($("#product-select"), unique(exchangeRows.map((row) => row.product_id)), current.product_id, (value) => productLabel(productRows.find((row) => row.product_id === value)?.product_display_name ?? value));
   fillSelectOptions(
     $("#expiry-select"),
     productRows.map((row) => ({
@@ -3137,9 +3348,14 @@ function renderQuote(options = {}) {
   const underlying = data.underlying ?? {};
   const parts = symbolParts(underlying.symbol);
   const activeOptions = data.strikes.reduce((count, row) => count + (row.CALL ? 1 : 0) + (row.PUT ? 1 : 0), 0);
-  const withIv = data.strikes.reduce((count, row) => count + (row.CALL?.iv ? 1 : 0) + (row.PUT?.iv ? 1 : 0), 0);
-  const withKline = data.strikes.reduce((count, row) => count + (row.CALL?.has_kline ? 1 : 0) + (row.PUT?.has_kline ? 1 : 0), 0);
-  $("#quote-title").textContent = `${underlying.symbol ?? "T型报价"} ${parts.productName}期货`;
+  const subscribedOptions = data.strikes.reduce((count, row) => count + (isSubscribedQuoteOption(row.CALL) ? 1 : 0) + (isSubscribedQuoteOption(row.PUT) ? 1 : 0), 0);
+  const hasIv = (option) => isSubscribedQuoteOption(option) && option?.iv !== null && option?.iv !== undefined;
+  const withIv = data.strikes.reduce((count, row) => count + (hasIv(row.CALL) ? 1 : 0) + (hasIv(row.PUT) ? 1 : 0), 0);
+  const hasGreeks = (option) => ["delta", "gamma", "theta", "vega", "rho"].some((key) => option?.[key] !== null && option?.[key] !== undefined);
+  const hasSubscribedGreeks = (option) => isSubscribedQuoteOption(option) && hasGreeks(option);
+  const withGreeks = data.strikes.reduce((count, row) => count + (hasSubscribedGreeks(row.CALL) ? 1 : 0) + (hasSubscribedGreeks(row.PUT) ? 1 : 0), 0);
+  const withKline = data.strikes.reduce((count, row) => count + (isSubscribedQuoteOption(row.CALL) && row.CALL?.has_kline ? 1 : 0) + (isSubscribedQuoteOption(row.PUT) && row.PUT?.has_kline ? 1 : 0), 0);
+  $("#quote-title").textContent = `${underlying.symbol ?? "T型报价"} ${underlying.product_display_name ?? parts.productName}期货`;
   const realtimeFresh = Boolean(underlying.realtime_subscribed);
   const displayTime = realtimeFresh
     ? (underlying.realtime_latest_source_datetime ?? underlying.realtime_latest_quote_received_at)
@@ -3147,19 +3363,21 @@ function renderQuote(options = {}) {
   $("#quote-book-time").textContent = fmtDateTime(displayTime);
   $("#toolbar-book-time").textContent = fmtDateTime(displayTime);
   $("#toolbar-expiry-days").textContent = fmtDaysToExpiry(underlying.days_to_expiry);
+  $("#toolbar-session-state").textContent = underlying.trading_session_label ?? "--";
   $("#quote-active-options").textContent = fmtNum(activeOptions);
-  $("#quote-iv-coverage").textContent = activeOptions ? fmtPct(withIv / activeOptions) : "--";
+  $("#quote-iv-coverage").textContent = subscribedOptions ? `IV ${fmtPct(withIv / subscribedOptions)} · Greeks ${fmtPct(withGreeks / subscribedOptions)}` : "--";
   const realtimeStatus = realtimeFresh
-    ? activeOptions && withKline >= activeOptions
+    ? subscribedOptions && withKline >= subscribedOptions
       ? "正常"
       : "K线补齐中"
     : "未订阅";
   const realtimeTone = !realtimeFresh
     ? "warn"
-    : activeOptions && withKline >= activeOptions
+    : subscribedOptions && withKline >= subscribedOptions
     ? "good"
     : "warn";
-  $("#quote-kline-status").textContent = realtimeStatus;
+  const sessionLabel = underlying.trading_session_label ? ` · ${underlying.trading_session_label}` : "";
+  $("#quote-kline-status").textContent = `${realtimeStatus}${sessionLabel}`;
   $("#quote-kline-status").classList.remove("good", "warn", "bad");
   $("#quote-kline-status").classList.add(realtimeTone);
   $("#quote-head").innerHTML = `<tr class="market-strip">
@@ -3178,6 +3396,16 @@ function renderQuote(options = {}) {
   $("#quote-rows").innerHTML = data.strikes.map((row) => quoteRow(row, data, maxima)).join("");
   $$("#quote-rows tr").forEach((row) => row.addEventListener("click", () => openDetail(JSON.parse(row.dataset.payload))));
   applyLatestAnimation(options.animate !== false);
+}
+
+function isSubscribedQuoteOption(option) {
+  return Boolean(option) && option.moneyness_in_subscription_scope !== false;
+}
+
+function tradingSessionTone(value) {
+  if (value === "in_session") return "good";
+  if (value === "out_of_session") return "warn";
+  return "";
 }
 
 function sideMaxima(rows) {

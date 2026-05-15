@@ -15,6 +15,7 @@ from .source_values import (
     normalize_datetime,
 )
 from .storage import Migration, apply_migrations
+from .trading_sessions import normalize_trading_time_object
 
 
 QUOTE_CURRENT_MIGRATION = Migration(
@@ -84,6 +85,7 @@ QUOTE_SOURCE_FIELDS = (
     "last_exercise_datetime",
     "exercise_year",
     "exercise_month",
+    "trading_time",
 )
 
 
@@ -300,12 +302,22 @@ def normalize_quote(
 
 def _payload_from_raw_quote(raw_quote: Mapping[str, Any] | object) -> dict[str, Any]:
     if isinstance(raw_quote, Mapping):
-        return dict(raw_quote)
+        payload = dict(raw_quote)
+        if "trading_time" in payload:
+            payload["trading_time"] = normalize_trading_time_object(
+                payload.get("trading_time")
+            )
+        return payload
 
     payload: dict[str, Any] = {}
     for field in QUOTE_SOURCE_FIELDS:
         if hasattr(raw_quote, field):
-            payload[field] = getattr(raw_quote, field)
+            value = getattr(raw_quote, field)
+            payload[field] = (
+                normalize_trading_time_object(value)
+                if field == "trading_time"
+                else value
+            )
     if not payload:
         raise ValueError("Quote payload does not expose expected source fields.")
     return payload

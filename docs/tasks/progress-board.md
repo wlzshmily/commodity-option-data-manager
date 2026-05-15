@@ -2,14 +2,24 @@
 
 ## In Progress
 
-- None
+- No active implementation task.
 
 ## Pending
 
-- None
+- None.
 
 ## Done
 
+- WebUI product display-name correction completed: overview and T型报价 now prefer TQSDK `instrument_name` from Quote payloads to derive product names, with frontend static product mappings only as fallback; `ad` fallback is corrected from `氧化铝` to `铝合金`, while `ao` remains `氧化铝`.
+- T型报价 subscribed-scope metric coverage completed: quote-page IV/Greeks coverage now uses only the currently subscribed/displayable option legs as the denominator, rather than the full chain; `iv=0.0` is counted as covered, and Kline status uses the same subscribed-scope denominator so OTM-only views do not stay incorrectly degraded by hidden ITM/ATM legs.
+- Realtime Quote freshness during Kline setup hotfix completed: Kline subscription setup now waits with the normal realtime `wait_deadline_seconds` before writing forced Quote snapshots, and it no longer rewrites stale Quote objects with a fresh `received_at` when `wait_update` times out. Live restart verified `DCE.b2607` recovered from stale `3538 / 21:57:21` to current `3533 / 22:23:18` while Kline setup continued.
+- T型报价 moneyness-scope masking completed: during realtime operation, the selected chain now displays Quote/盘口/成交持仓/IV/Greeks/K线 cache only for option legs inside the active moneyness Kline filter. Legs outside the current filter, such as ITM/ATM when only OTM Klines are selected, are returned as empty realtime fields so the page renders `--` instead of stale historical values; each refresh recomputes moneyness from the latest underlying price so legs can dynamically hide/show as strikes cross between OTM/ATM/ITM.
+- T型报价 subscription-aware data masking completed: when realtime is running, T型报价 hides stale cached values only while the selected chain's Quote objects are not yet fully subscribed; once `quote_subscribed == quote_total`, it displays the current cached Quote/盘口/成交持仓/IV/Greeks values even if K线 objects are still catching up or the market is closed.
+- SPEC-002 trading-session no-quote-state correction completed: overview rows now show `待行情` only while the row is not yet fully subscribed; once a row is `已订阅`, a missing underlying Quote time is treated as `休市`. This keeps startup uncertainty distinct from subscribed-but-no-market-time closed-session evidence.
+- SPEC-002 trading-session display correction completed: overview/T型报价 and running moneyness Kline expansion now treat fresh underlying Quote source time as authoritative live trading evidence before falling back to theoretical TQSDK `trading_time` ranges. This fixes live night-session cases where `trading_time.night` is empty while Quote `datetime/source_datetime` is actively advancing; live API verification showed SHFE ad/ag/al rows as `交易中` while non-night CZCE AP stayed `休市`.
+- SPEC-002 timeout watchdog follow-up completed: the live worker session no longer freezes on a single Kline symbol, `current_kline_symbol` advances across workers, and the representative live trial-run reached `quote_subscribed=11126/11126` with `kline_subscribed=320/5008` and `kline_subscription_timeout_count=0`.
+- SPEC-002 browser-review correction completed: initial moneyness-filtered Kline targets are recomputed after the first live Quote snapshot and subscribed without trading-session gating, heartbeat recalculation no longer reports target Kline totals as zero during closed sessions, and the realtime Worker settings panel disables all parameters while running. Local live restart showed Quote `11126/11126`, OTM Kline target `5009`, and 4 worker reports.
+- SPEC-002 / CR-2026-05-14-MONEYNESS-KLINE-FILTER completed: realtime Quote remains broad; Kline selection can filter by selected moneyness ranges; running workers add newly matching Kline symbols on the configured interval without releasing old in-session sticky symbols; product/contract-level `trading_time` state is exposed in overview/T型报价; aggregate moneyness counters and skip reasons are visible in worker progress/API/WebUI.
 - WEBUI-022 completed: T型报价 no longer waits for the full Kline subscription phase before receiving fresh Quote rows. Quote workers update subscribed data in the backend independently from WebUI pages, bulk-write startup snapshots, periodically refresh Quote snapshots during Kline setup, avoid startup metrics-queue storms, and health checks prefer actual fresh DB quote writes over stale worker statistic fields.
 - WEBUI-021 completed: overview row status now follows realtime subscription lifecycle enums instead of fresh Quote write coverage, scoped summary counts align with worker subscription progress, WebUI SQLite runtime uses WAL for concurrent realtime reads/writes, and live local verification returned 128 subscribed underlyings including `CZCE.FG607`/`CZCE.FG608`.
 - WEBUI-020 completed: realtime quote-stream lifecycle state is now a stable enum (`blocked`/`starting`/`running`/`stopped`) persisted in service state and returned by API/WebUI; frontend controls no longer infer startup state from Chinese message text, and live local start transitioned `starting` to `running` with 4 worker PIDs.

@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import sqlite3
 
 from option_data_manager.webui.read_model import WebuiReadModel
@@ -117,6 +117,215 @@ def test_overview_can_filter_to_current_realtime_quote_rows() -> None:
     assert [row["underlying_symbol"] for row in rows] == ["SHFE.al2606"]
     assert rows[0]["current_quote_count"] == 2
     assert rows[0]["latest_current_quote_received_at"] == "2026-05-12T01:05:00+00:00"
+
+
+def test_overview_and_tquote_include_underlying_trading_session_state() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="SHFE.cu2606",
+        exchange_id="SHFE",
+        product_id="cu",
+        delivery_year=2026,
+        delivery_month=6,
+        received_at="2026-05-12T01:05:00+00:00",
+    )
+    connection.execute(
+        """
+        UPDATE quote_current
+        SET raw_payload_json = ?
+        WHERE symbol = 'SHFE.cu2606'
+        """,
+        (
+            '{"trading_time":{"day":[["00:00:00","23:59:59"]],"night":[]}}',
+        ),
+    )
+    connection.commit()
+
+    overview_row = read_model.overview()["underlyings"][0]
+    quote = read_model.tquote(underlying_symbol="SHFE.cu2606")
+
+    assert overview_row["trading_session_state"] == "in_session"
+    assert overview_row["trading_session_label"] == "交易中"
+    assert quote["underlying"]["trading_session_state"] == "in_session"
+    assert quote["underlying"]["trading_session_label"] == "交易中"
+
+
+def test_overview_and_tquote_prefer_tqsdk_instrument_name_for_product_display() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="SHFE.ad2606",
+        exchange_id="SHFE",
+        product_id="ad",
+        delivery_year=2026,
+        delivery_month=6,
+        received_at="2026-05-12T01:05:00+00:00",
+    )
+    connection.execute(
+        """
+        UPDATE quote_current
+        SET raw_payload_json = '{"instrument_name":"铝合金2606","product_id":"ad"}'
+        WHERE symbol = 'SHFE.ad2606'
+        """
+    )
+
+    overview_row = read_model.overview()["underlyings"][0]
+    quote = read_model.tquote(underlying_symbol="SHFE.ad2606")
+
+    assert overview_row["product_display_name"] == "铝合金"
+    assert quote["underlying"]["product_display_name"] == "铝合金"
+
+
+def test_overview_marks_fresh_quote_time_as_trading_even_when_night_profile_missing() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="SHFE.ad2606",
+        exchange_id="SHFE",
+        product_id="ad",
+        delivery_year=2026,
+        delivery_month=6,
+        received_at=datetime.now().isoformat(),
+    )
+    fresh_market_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S.000000")
+    connection.execute(
+        """
+        UPDATE quote_current
+        SET source_datetime = ?,
+            raw_payload_json = ?
+        WHERE symbol = 'SHFE.ad2606'
+        """,
+        (
+            fresh_market_time,
+            '{"trading_time":{"day":[["09:00:00","10:15:00"],'
+            '["10:30:00","11:30:00"],["13:30:00","15:00:00"]],"night":[]}}',
+        ),
+    )
+    connection.commit()
+
+    overview_row = read_model.overview()["underlyings"][0]
+    quote = read_model.tquote(underlying_symbol="SHFE.ad2606")
+
+    assert overview_row["display_market_time"] == fresh_market_time
+    assert overview_row["trading_session_state"] == "in_session"
+    assert overview_row["trading_session_label"] == "交易中"
+    assert quote["underlying"]["trading_session_state"] == "in_session"
+
+
+def test_overview_marks_session_pending_until_underlying_quote_is_current() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="SHFE.ad2606",
+        exchange_id="SHFE",
+        product_id="ad",
+        delivery_year=2026,
+        delivery_month=6,
+        received_at="2026-05-12T01:05:00+00:00",
+    )
+    connection.execute(
+        """
+        UPDATE quote_current
+        SET raw_payload_json = ?
+        WHERE symbol = 'SHFE.ad2606'
+        """,
+        (
+            '{"trading_time":{"day":[["09:00:00","10:15:00"],'
+            '["10:30:00","11:30:00"],["13:30:00","15:00:00"]],"night":[]}}',
+        ),
+    )
+    connection.commit()
+
+    overview_row = read_model.overview(
+        current_quote_after="2026-05-13T00:00:00+00:00",
+        require_current_quote=True,
+        subscription_scope_enabled=True,
+        subscription_contract_month_limit=2,
+    )["underlyings"][0]
+
+    assert overview_row["book_time"] is None
+    assert overview_row["trading_session_state"] == "unknown"
+    assert overview_row["trading_session_label"] == "待行情"
+
+
+def test_overview_marks_session_closed_when_subscribed_without_underlying_quote_time() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="CZCE.AP610",
+        exchange_id="CZCE",
+        product_id="AP",
+        delivery_year=2026,
+        delivery_month=10,
+        received_at="2026-05-12T01:05:00+00:00",
+    )
+    connection.execute(
+        """
+        UPDATE quote_current
+        SET source_datetime = NULL,
+            raw_payload_json = ?
+        WHERE symbol = 'CZCE.AP610'
+        """,
+        (
+            '{"trading_time":{"day":[["09:00:00","10:15:00"],'
+            '["10:30:00","11:30:00"],["13:30:00","15:00:00"]],"night":[]}}',
+        ),
+    )
+    connection.commit()
+
+    overview_row = read_model.overview(
+        current_quote_after="2026-05-13T00:00:00+00:00",
+        require_current_quote=True,
+        subscription_scope_enabled=True,
+        subscription_contract_month_limit=2,
+        subscription_lifecycle_status="subscribed",
+    )["underlyings"][0]
+
+    assert overview_row["book_time"] is None
+    assert overview_row["status"] == "已订阅"
+    assert overview_row["trading_session_state"] == "out_of_session"
+    assert overview_row["trading_session_label"] == "休市"
+
+
+def test_tquote_marks_session_closed_without_realtime_underlying_quote_time() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="SHFE.ad2606",
+        exchange_id="SHFE",
+        product_id="ad",
+        delivery_year=2026,
+        delivery_month=6,
+        received_at="2026-05-12T01:05:00+00:00",
+    )
+    connection.execute(
+        """
+        UPDATE quote_current
+        SET raw_payload_json = ?
+        WHERE symbol = 'SHFE.ad2606'
+        """,
+        (
+            '{"trading_time":{"day":[["09:00:00","10:15:00"],'
+            '["10:30:00","11:30:00"],["13:30:00","15:00:00"]],"night":[]}}',
+        ),
+    )
+    connection.commit()
+
+    quote = read_model.tquote(
+        underlying_symbol="SHFE.ad2606",
+        realtime_started_at="2026-05-13T00:00:00+00:00",
+    )
+
+    assert quote["underlying"]["realtime_source_datetime"] is None
+    assert quote["underlying"]["trading_session_state"] == "out_of_session"
+    assert quote["underlying"]["trading_session_label"] == "休市"
 
 
 def test_overview_can_skip_underlying_rows_when_realtime_has_not_started() -> None:
@@ -346,6 +555,34 @@ def test_tquote_marks_historical_cache_as_unsubscribed_until_realtime_refresh() 
         delivery_month=6,
         received_at="2026-05-09T01:00:00+00:00",
     )
+    connection.execute(
+        """
+        INSERT INTO option_source_metrics_current (
+            symbol,
+            received_at,
+            delta,
+            gamma,
+            theta,
+            vega,
+            rho,
+            iv,
+            source_method,
+            raw_payload_json
+        )
+        VALUES (
+            'SHFE.cu2606C100',
+            '2026-05-09T01:05:00+00:00',
+            0.5,
+            0.1,
+            -0.2,
+            0.3,
+            0.01,
+            0.2,
+            'fixture',
+            '{}'
+        )
+        """
+    )
 
     stale_quote = read_model.tquote(
         underlying_symbol="SHFE.cu2606",
@@ -356,6 +593,36 @@ def test_tquote_marks_historical_cache_as_unsubscribed_until_realtime_refresh() 
     assert stale_quote["underlying"]["realtime_status"] == "未订阅"
     assert stale_quote["underlying"]["realtime_subscribed"] is False
     assert stale_quote["underlying"]["realtime_latest_quote_received_at"] is None
+    stale_call = stale_quote["strikes"][0]["CALL"]
+    assert stale_quote["underlying"]["last_price"] is None
+    assert stale_call["last_price"] is None
+    assert stale_call["volume"] is None
+    assert stale_call["iv"] is None
+    assert stale_call["has_kline"] == 0
+
+    quote_subscribed = read_model.tquote(
+        underlying_symbol="SHFE.cu2606",
+        include_selectors=False,
+        realtime_started_at=cutoff,
+        subscription_progress={
+            "SHFE.cu2606": {
+                "status": "subscribing",
+                "quote_subscribed": 3,
+                "quote_total": 3,
+                "kline_subscribed": 1,
+                "kline_total": 3,
+                "subscribed_objects": 4,
+                "total_objects": 6,
+            },
+        },
+    )
+    subscribed_call = quote_subscribed["strikes"][0]["CALL"]
+
+    assert quote_subscribed["underlying"]["realtime_status"] == "正常"
+    assert quote_subscribed["underlying"]["realtime_subscribed"] is True
+    assert quote_subscribed["underlying"]["last_price"] == 1
+    assert subscribed_call["last_price"] == 1
+    assert subscribed_call["iv"] == 0.2
 
     connection.execute(
         """
@@ -377,6 +644,178 @@ def test_tquote_marks_historical_cache_as_unsubscribed_until_realtime_refresh() 
         fresh_quote["underlying"]["realtime_latest_quote_received_at"]
         == "2026-05-12T01:05:00+00:00"
     )
+    fresh_call = fresh_quote["strikes"][0]["CALL"]
+    stale_put = fresh_quote["strikes"][0]["PUT"]
+    assert fresh_call["last_price"] == 1
+    assert fresh_call["iv"] is None
+    assert stale_put["last_price"] is None
+
+
+def test_tquote_masks_rows_outside_realtime_moneyness_scope() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    cutoff = "2026-05-12T01:00:00+00:00"
+    symbols = [
+        ("DCE.b2606", "b2606", "FUTURE", None, None, None),
+        ("DCE.b2606C90", "b2606C90", "OPTION", "DCE.b2606", "CALL", 90),
+        ("DCE.b2606P90", "b2606P90", "OPTION", "DCE.b2606", "PUT", 90),
+        ("DCE.b2606C100", "b2606C100", "OPTION", "DCE.b2606", "CALL", 100),
+        ("DCE.b2606P100", "b2606P100", "OPTION", "DCE.b2606", "PUT", 100),
+        ("DCE.b2606C110", "b2606C110", "OPTION", "DCE.b2606", "CALL", 110),
+        ("DCE.b2606P110", "b2606P110", "OPTION", "DCE.b2606", "PUT", 110),
+        ("DCE.b2606C120", "b2606C120", "OPTION", "DCE.b2606", "CALL", 120),
+        ("DCE.b2606P120", "b2606P120", "OPTION", "DCE.b2606", "PUT", 120),
+    ]
+    connection.executemany(
+        """
+        INSERT INTO instruments (
+            symbol,
+            exchange_id,
+            product_id,
+            instrument_id,
+            instrument_name,
+            ins_class,
+            underlying_symbol,
+            option_class,
+            strike_price,
+            delivery_year,
+            delivery_month,
+            price_tick,
+            volume_multiple,
+            expired,
+            active,
+            inactive_reason,
+            last_seen_at,
+            raw_payload_json
+        )
+        VALUES (?, 'DCE', 'b', ?, NULL, ?, ?, ?, ?, 2026, 6, NULL, NULL, 0, 1, NULL, '2026-05-12T00:00:00+00:00', '{}')
+        """,
+        symbols,
+    )
+    connection.executemany(
+        """
+        INSERT INTO quote_current (
+            symbol,
+            source_datetime,
+            received_at,
+            bid_price1,
+            ask_price1,
+            last_price,
+            volume,
+            raw_payload_json
+        )
+        VALUES (?, '2026-05-12 09:00:00.000000', '2026-05-09T01:00:00+00:00', ?, ?, ?, 10, '{}')
+        """,
+        [
+            ("DCE.b2606", 99.5, 100.5, 100),
+            ("DCE.b2606C90", 10, 11, 10.5),
+            ("DCE.b2606P90", 1, 2, 1.5),
+            ("DCE.b2606C100", 4, 5, 4.5),
+            ("DCE.b2606P100", 4, 5, 4.5),
+            ("DCE.b2606C110", 1, 2, 1.5),
+            ("DCE.b2606P110", 10, 11, 10.5),
+            ("DCE.b2606C120", 1, 2, 1.5),
+            ("DCE.b2606P120", 20, 21, 20.5),
+        ],
+    )
+    connection.executemany(
+        """
+        INSERT INTO option_source_metrics_current (
+            symbol,
+            received_at,
+            delta,
+            gamma,
+            theta,
+            vega,
+            rho,
+            iv,
+            source_method,
+            raw_payload_json
+        )
+        VALUES (?, '2026-05-09T01:05:00+00:00', 0.5, 0.1, -0.2, 0.3, 0.01, 0.2, 'fixture', '{}')
+        """,
+        [(symbol[0],) for symbol in symbols[1:]],
+    )
+    connection.executemany(
+        """
+        INSERT INTO kline_20d_current (
+            symbol,
+            bar_datetime,
+            received_at,
+            close_price,
+            volume,
+            raw_payload_json
+        )
+        VALUES (?, '2026-05-09T00:00:00+08:00', '2026-05-09T01:05:00+00:00', 1, 100, '{}')
+        """,
+        [(symbol[0],) for symbol in symbols[1:]],
+    )
+
+    quote = read_model.tquote(
+        underlying_symbol="DCE.b2606",
+        include_selectors=False,
+        realtime_started_at=cutoff,
+        subscription_progress={
+            "DCE.b2606": {
+                "status": "subscribing",
+                "quote_subscribed": len(symbols),
+                "quote_total": len(symbols),
+                "kline_subscribed": 2,
+                "kline_total": 2,
+                "subscribed_objects": len(symbols) + 2,
+                "total_objects": len(symbols) + 2,
+            },
+        },
+        moneyness_filter="otm",
+    )
+    by_strike = {row["strike_price"]: row for row in quote["strikes"]}
+
+    assert by_strike[110.0]["CALL"]["moneyness"] == "otm"
+    assert by_strike[110.0]["CALL"]["last_price"] == 1.5
+    assert by_strike[110.0]["CALL"]["iv"] == 0.2
+    assert by_strike[90.0]["PUT"]["moneyness"] == "otm"
+    assert by_strike[90.0]["PUT"]["last_price"] == 1.5
+    assert by_strike[90.0]["PUT"]["iv"] == 0.2
+
+    assert by_strike[90.0]["CALL"]["moneyness"] == "itm"
+    assert by_strike[90.0]["CALL"]["last_price"] is None
+    assert by_strike[90.0]["CALL"]["iv"] is None
+    assert by_strike[90.0]["CALL"]["has_kline"] == 0
+    assert by_strike[100.0]["CALL"]["moneyness"] == "atm"
+    assert by_strike[100.0]["CALL"]["last_price"] is None
+    assert by_strike[110.0]["PUT"]["moneyness"] == "itm"
+    assert by_strike[110.0]["PUT"]["ask_price1"] is None
+    assert by_strike[100.0]["PUT"]["moneyness"] == "atm"
+    assert by_strike[100.0]["PUT"]["last_price"] is None
+
+    connection.execute(
+        "UPDATE quote_current SET last_price = 125 WHERE symbol = 'DCE.b2606'"
+    )
+
+    shifted_quote = read_model.tquote(
+        underlying_symbol="DCE.b2606",
+        include_selectors=False,
+        realtime_started_at=cutoff,
+        subscription_progress={
+            "DCE.b2606": {
+                "status": "subscribing",
+                "quote_subscribed": len(symbols),
+                "quote_total": len(symbols),
+                "kline_subscribed": 2,
+                "kline_total": 2,
+                "subscribed_objects": len(symbols) + 2,
+                "total_objects": len(symbols) + 2,
+            },
+        },
+        moneyness_filter="otm",
+    )
+    shifted_by_strike = {row["strike_price"]: row for row in shifted_quote["strikes"]}
+
+    assert shifted_by_strike[110.0]["CALL"]["moneyness"] == "itm"
+    assert shifted_by_strike[110.0]["CALL"]["last_price"] is None
+    assert shifted_by_strike[110.0]["PUT"]["moneyness"] == "otm"
+    assert shifted_by_strike[110.0]["PUT"]["last_price"] == 10.5
+    assert shifted_by_strike[110.0]["PUT"]["ask_price1"] == 11
 
 
 def test_underlying_rows_expose_market_time_separately_from_received_at() -> None:

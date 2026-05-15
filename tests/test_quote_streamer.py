@@ -15,6 +15,7 @@ from option_data_manager.quote_streamer import (
     select_quote_symbols,
     stream_quotes,
 )
+from option_data_manager.quotes import QuoteRepository, normalize_quote
 
 
 def test_select_quote_symbols_splits_workers_deterministically() -> None:
@@ -297,6 +298,52 @@ def test_subscription_scope_includes_standalone_futures_by_product() -> None:
     ]
 
 
+def test_moneyness_filter_keeps_quote_scope_broad_but_filters_klines() -> None:
+    connection = sqlite3.connect(":memory:")
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C90", "DCE.a2601C100", "DCE.a2601C110"),
+            put_symbols=("DCE.a2601P90", "DCE.a2601P100", "DCE.a2601P110"),
+            last_seen_at="2026-05-08T00:00:00+00:00",
+        )
+    )
+    QuoteRepository(connection).upsert_quote(
+        normalize_quote(
+            "DCE.a2601",
+            {"last_price": 100.0, "datetime": "2026-05-14 09:30:00"},
+            received_at="2026-05-14T01:30:00+00:00",
+        )
+    )
+
+    quote_symbols = select_quote_symbols(connection, include_options=True)
+    kline_symbols = select_kline_symbols(connection, moneyness_filter="otm")
+
+    assert quote_symbols[0] == "DCE.a2601"
+    assert set(quote_symbols[1:]) == {
+        "DCE.a2601C90",
+        "DCE.a2601C100",
+        "DCE.a2601C110",
+        "DCE.a2601P90",
+        "DCE.a2601P100",
+        "DCE.a2601P110",
+    }
+    assert kline_symbols[0] == "DCE.a2601"
+    assert set(kline_symbols[1:]) == {
+        "DCE.a2601C110",
+        "DCE.a2601P90",
+    }
+    assert kline_symbols != [
+        "DCE.a2601",
+        "DCE.a2601C90",
+        "DCE.a2601C100",
+        "DCE.a2601C110",
+        "DCE.a2601P90",
+        "DCE.a2601P100",
+        "DCE.a2601P110",
+    ]
+
+
 def test_stream_quotes_writes_initial_snapshot_only_when_unchanged() -> None:
     connection = sqlite3.connect(":memory:")
     InstrumentRepository(connection).upsert_instruments(
@@ -480,6 +527,90 @@ def test_stream_quotes_refreshes_all_quotes_during_kline_setup_without_ui(
     ]
 
 
+def test_stream_quotes_does_not_rewrite_stale_quotes_when_kline_wait_update_times_out(
+    monkeypatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C100",),
+            put_symbols=("DCE.a2601P100",),
+            last_seen_at="2026-05-08T00:00:00+00:00",
+        )
+    )
+    clock = {"value": 0.0}
+    monkeypatch.setattr(
+        quote_streamer_module.time,
+        "monotonic",
+        lambda: clock["value"],
+    )
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.quotes: dict[str, dict[str, object]] = {}
+            self.wait_deadlines: list[float] = []
+
+        def get_quote_list(self, symbols: list[str]) -> list[dict[str, object]]:
+            self.quotes = {
+                symbol: {
+                    "datetime": "2026-05-09T00:00:00+00:00",
+                    "last_price": 1.0,
+                }
+                for symbol in symbols
+            }
+            return [self.quotes[symbol] for symbol in symbols]
+
+        def wait_update(self, *, deadline: float) -> bool:
+            self.wait_deadlines.append(deadline)
+            clock["value"] += (
+                quote_streamer_module.KLINE_SETUP_QUOTE_REFRESH_SECONDS + 1
+            )
+            for quote in self.quotes.values():
+                quote["last_price"] = 99.0
+            return False
+
+        def is_changing(self, quote: object, fields: object) -> bool:
+            return False
+
+        def get_kline_serial(
+            self,
+            symbol: object,
+            *,
+            duration_seconds: int,
+            data_length: int,
+        ) -> list[dict[str, object]]:
+            clock["value"] += (
+                quote_streamer_module.KLINE_SETUP_QUOTE_REFRESH_SECONDS + 1
+            )
+            return []
+
+    api = FakeApi()
+    result = stream_quotes(
+        api,
+        connection,
+        cycles=1,
+        wait_deadline_seconds=1,
+        running_quote_refresh_seconds=999,
+    )
+
+    assert result.wait_update_count == 0
+    assert result.quotes_written == 3
+    rows = connection.execute(
+        """
+        SELECT symbol, last_price
+        FROM quote_current
+        ORDER BY symbol
+        """
+    ).fetchall()
+    assert [(row["symbol"], row["last_price"]) for row in rows] == [
+        ("DCE.a2601", 1.0),
+        ("DCE.a2601C100", 1.0),
+        ("DCE.a2601P100", 1.0),
+    ]
+    assert len(api.wait_deadlines) >= 3
+
+
 def test_stream_quotes_periodically_refreshes_running_snapshot_when_sdk_change_detection_is_quiet(
     monkeypatch,
 ) -> None:
@@ -649,6 +780,65 @@ def test_stream_quotes_falls_back_when_kline_batch_subscription_fails() -> None:
         "DCE.a2601C100",
         "DCE.a2601P100",
     ]
+
+
+def test_stream_quotes_skips_timed_out_kline_symbol_and_keeps_running() -> None:
+    connection = sqlite3.connect(":memory:")
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C100",),
+            put_symbols=("DCE.a2601P100",),
+            last_seen_at="2026-05-08T00:00:00+00:00",
+        )
+    )
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.kline_symbols: list[object] = []
+
+        def get_quote_list(self, symbols: list[str]) -> list[dict[str, object]]:
+            return [{"datetime": "2026-05-09T00:00:00+00:00"} for _ in symbols]
+
+        def wait_update(self, *, deadline: float) -> bool:
+            return False
+
+        def is_changing(self, quote: object, fields: object) -> bool:
+            return False
+
+        def get_kline_serial(
+            self,
+            symbol: object,
+            *,
+            duration_seconds: int,
+            data_length: int,
+        ) -> list[dict[str, object]]:
+            self.kline_symbols.append(symbol)
+            if symbol == "DCE.a2601C100":
+                time.sleep(1)
+            return []
+
+    progress_events: list[dict[str, object]] = []
+    api = FakeApi()
+    result = stream_quotes(
+        api,
+        connection,
+        cycles=1,
+        wait_deadline_seconds=1,
+        kline_subscription_timeout_seconds=0.05,
+        progress_callback=progress_events.append,
+    )
+
+    assert result.subscribed_kline_count == 2
+    assert result.kline_subscription_timeout_count == 1
+    assert result.kline_subscription_error_count == 1
+    assert result.last_kline_subscription_error_symbol == "DCE.a2601C100"
+    assert progress_events[-1]["status"] == "running"
+    assert progress_events[-1]["kline_subscription_timeout_count"] == 1
+    assert "Kline subscription timed out" in str(
+        progress_events[-1]["last_kline_subscription_error"]
+    )
+    assert api.kline_symbols == ["DCE.a2601", "DCE.a2601C100", "DCE.a2601P100"]
 
 
 def test_stream_quotes_falls_back_when_quote_batch_subscription_times_out() -> None:
@@ -978,3 +1168,220 @@ def test_stream_quotes_reconciles_contract_universe_incrementally() -> None:
     assert result.contract_reconcile_removed_kline_count == 1
     assert repository.get_instrument("DCE.a2601C100").active is False
     assert repository.get_instrument("DCE.a2601C200").active is True
+
+
+def test_stream_quotes_sticky_adds_moneyness_klines_without_releasing_old(
+    monkeypatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C90", "DCE.a2601C100", "DCE.a2601C110"),
+            put_symbols=("DCE.a2601P90", "DCE.a2601P100", "DCE.a2601P110"),
+            last_seen_at="2026-05-08T00:00:00+00:00",
+        )
+    )
+    clock = {"value": 0.0}
+    monkeypatch.setattr(
+        quote_streamer_module.time,
+        "monotonic",
+        lambda: clock["value"],
+    )
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.kline_symbols: list[object] = []
+            self.quote_refs: dict[str, dict[str, object]] = {}
+
+        def get_quote_list(self, symbols: list[str]) -> list[dict[str, object]]:
+            self.quote_refs = {
+                symbol: {
+                    "datetime": "2026-05-14T09:30:00+08:00",
+                    "last_price": None if symbol == "DCE.a2601" else 1.0,
+                }
+                for symbol in symbols
+            }
+            return list(self.quote_refs.values())
+
+        def wait_update(self, *, deadline: float) -> bool:
+            clock["value"] += 2.0
+            self.quote_refs["DCE.a2601"]["last_price"] = 100.0
+            return True
+
+        def is_changing(self, quote: object, fields: object) -> bool:
+            return False
+
+        def get_kline_serial(
+            self,
+            symbol: object,
+            *,
+            duration_seconds: int,
+            data_length: int,
+        ) -> list[dict[str, object]]:
+            self.kline_symbols.append(symbol)
+            return []
+
+    api = FakeApi()
+    result = stream_quotes(
+        api,
+        connection,
+        cycles=2,
+        wait_deadline_seconds=1,
+        moneyness_filter="otm",
+        moneyness_recalc_seconds=1,
+    )
+
+    assert result.moneyness_recalc_count >= 1
+    assert result.moneyness_added_kline_count >= 3
+    assert set(api.kline_symbols) >= {
+        "DCE.a2601",
+        "DCE.a2601C110",
+        "DCE.a2601P90",
+    }
+
+
+def test_stream_quotes_initial_moneyness_subscription_ignores_closed_session(
+    monkeypatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C90", "DCE.a2601C100", "DCE.a2601C110"),
+            put_symbols=("DCE.a2601P90", "DCE.a2601P100", "DCE.a2601P110"),
+            last_seen_at="2026-05-08T00:00:00+00:00",
+        )
+    )
+
+    class ClosedSession:
+        state = "out_of_session"
+
+    monkeypatch.setattr(
+        quote_streamer_module,
+        "trading_session_state_from_payload",
+        lambda payload, **kwargs: ClosedSession(),
+    )
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.kline_symbols: list[object] = []
+
+        def get_quote_list(self, symbols: list[str]) -> list[dict[str, object]]:
+            return [
+                {
+                    "datetime": "2026-05-14T20:30:00+08:00",
+                    "last_price": 100.0 if symbol == "DCE.a2601" else 1.0,
+                }
+                for symbol in symbols
+            ]
+
+        def wait_update(self, *, deadline: float) -> bool:
+            return False
+
+        def is_changing(self, quote: object, fields: object) -> bool:
+            return False
+
+        def get_kline_serial(
+            self,
+            symbol: object,
+            *,
+            duration_seconds: int,
+            data_length: int,
+        ) -> list[dict[str, object]]:
+            self.kline_symbols.append(symbol)
+            return []
+
+    api = FakeApi()
+    result = stream_quotes(
+        api,
+        connection,
+        cycles=1,
+        wait_deadline_seconds=1,
+        moneyness_filter="otm",
+        moneyness_recalc_seconds=1,
+    )
+
+    assert result.subscribed_kline_count == 3
+    assert set(api.kline_symbols) == {
+        "DCE.a2601",
+        "DCE.a2601C110",
+        "DCE.a2601P90",
+    }
+
+
+def test_stream_quotes_skips_sticky_moneyness_when_underlying_session_is_closed(
+    monkeypatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C90", "DCE.a2601C100", "DCE.a2601C110"),
+            put_symbols=("DCE.a2601P90", "DCE.a2601P100", "DCE.a2601P110"),
+            last_seen_at="2026-05-08T00:00:00+00:00",
+        )
+    )
+    clock = {"value": 0.0}
+    monkeypatch.setattr(
+        quote_streamer_module.time,
+        "monotonic",
+        lambda: clock["value"],
+    )
+
+    class ClosedSession:
+        state = "out_of_session"
+
+    monkeypatch.setattr(
+        quote_streamer_module,
+        "trading_session_state_from_payload",
+        lambda payload, **kwargs: ClosedSession(),
+    )
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.kline_symbols: list[object] = []
+            self.quote_refs: dict[str, dict[str, object]] = {}
+
+        def get_quote_list(self, symbols: list[str]) -> list[dict[str, object]]:
+            self.quote_refs = {
+                symbol: {
+                    "datetime": "2026-05-14T09:30:00+08:00",
+                    "last_price": None if symbol == "DCE.a2601" else 1.0,
+                }
+                for symbol in symbols
+            }
+            return list(self.quote_refs.values())
+
+        def wait_update(self, *, deadline: float) -> bool:
+            clock["value"] += 2.0
+            self.quote_refs["DCE.a2601"]["last_price"] = 100.0
+            return True
+
+        def is_changing(self, quote: object, fields: object) -> bool:
+            return False
+
+        def get_kline_serial(
+            self,
+            symbol: object,
+            *,
+            duration_seconds: int,
+            data_length: int,
+        ) -> list[dict[str, object]]:
+            self.kline_symbols.append(symbol)
+            return []
+
+    api = FakeApi()
+    result = stream_quotes(
+        api,
+        connection,
+        cycles=2,
+        wait_deadline_seconds=1,
+        moneyness_filter="otm",
+        moneyness_recalc_seconds=1,
+    )
+
+    assert result.moneyness_recalc_count >= 1
+    assert result.moneyness_added_kline_count == 0
+    assert result.moneyness_skipped_out_of_session_count >= 1
+    assert api.kline_symbols == []

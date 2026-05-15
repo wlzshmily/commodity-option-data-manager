@@ -24,7 +24,10 @@ from option_data_manager.quote_streamer import (
     DEFAULT_CONTRACT_MONTH_LIMIT,
     DEFAULT_KLINE_BATCH_SIZE,
     DEFAULT_KLINE_DATA_LENGTH,
+    DEFAULT_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS,
     DEFAULT_MIN_DAYS_TO_EXPIRY,
+    DEFAULT_MONEYNESS_FILTER,
+    DEFAULT_MONEYNESS_RECALC_SECONDS,
     DEFAULT_QUOTE_SHARD_SIZE,
     DEFAULT_RUNNING_QUOTE_REFRESH_SECONDS,
     stream_quotes,
@@ -91,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
                 near_expiry_months=args.near_expiry_months,
                 contract_month_limit=args.contract_month_limit,
                 min_days_to_expiry=args.min_days_to_expiry,
+                moneyness_filter=args.moneyness_filter,
+                moneyness_recalc_seconds=args.moneyness_recalc_seconds,
                 progress_callback=_progress_writer(
                     report_path,
                     credential_source=credentials.source,
@@ -110,6 +115,9 @@ def main(argv: list[str] | None = None) -> int:
                     else None
                 ),
                 running_quote_refresh_seconds=args.running_quote_refresh_seconds,
+                kline_subscription_timeout_seconds=(
+                    args.kline_subscription_timeout_seconds
+                ),
             )
         finally:
             connection.close()
@@ -170,6 +178,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--quote-shard-size", type=int, default=DEFAULT_QUOTE_SHARD_SIZE)
     parser.add_argument("--kline-batch-size", type=int, default=DEFAULT_KLINE_BATCH_SIZE)
     parser.add_argument("--kline-data-length", type=int, default=DEFAULT_KLINE_DATA_LENGTH)
+    parser.add_argument(
+        "--kline-subscription-timeout-seconds",
+        type=float,
+        default=DEFAULT_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS,
+        help="Maximum seconds to wait for one Kline subscription call before skipping it.",
+    )
     parser.add_argument("--metrics-dirty-min-interval-seconds", type=int, default=30)
     parser.add_argument("--underlying-chain-dirty-interval-seconds", type=int, default=30)
     parser.add_argument("--max-symbols", type=int, default=None)
@@ -212,6 +226,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         choices=("1", "2", "3", "all"),
         default=str(DEFAULT_CONTRACT_MONTH_LIMIT),
         help="Subscribe contracts through the first N expiry months, or all months.",
+    )
+    parser.add_argument(
+        "--moneyness-filter",
+        default=DEFAULT_MONEYNESS_FILTER,
+        help="Comma-separated Kline moneyness filter: itm,atm,otm.",
+    )
+    parser.add_argument(
+        "--moneyness-recalc-seconds",
+        type=int,
+        default=DEFAULT_MONEYNESS_RECALC_SECONDS,
+        help="Seconds between intraday moneyness Kline expansion checks.",
     )
     parser.add_argument("--futures-only", action="store_true")
     parser.add_argument("--options-only", action="store_true")
