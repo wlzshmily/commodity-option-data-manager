@@ -5,6 +5,7 @@
 | Current commodity option slice | collection, repositories, SQLite | unit tests, live collection reports, perf tuning evidence |
 | WebUI overview and T-Quote | webui read model/app | WebUI smoke tests, local smoke command |
 | Local API integration | api app | API tests, local smoke command |
+| API page status and access entry | `webui/app.py`, lightweight `/api/webui/api-summary` | `tests/test_webui_app.py`, `tests/test_api_app.py`; local `8765` smoke for `/`, `/api/webui/api-summary`, `/docs`, and `/openapi.json` |
 | Credential safety | settings, API responses, reports, service logs, TQSDK CLI env handling | unit/API tests, safe log-context review, transient-env TQSDK attempts |
 | Resumable shards | collection_state, market_collector | unit tests, live evidence, process-level shard tuning sample |
 | TQSDK live reference update model | chain_collector, continuous_collector | `wait_update` absolute deadline unit test, live subscription tuning evidence |

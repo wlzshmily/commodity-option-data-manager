@@ -10,6 +10,7 @@
 
 ## Done
 
+- API page redesign completed: `/#api` now serves as a local API status and access page with Base URL, Swagger/OpenAPI links, auth-header guidance, common read-only endpoint list, runtime metrics, and a jump to API Key management in settings. The old DEV-024 placeholder text was removed, and the page uses lightweight `/api/webui/api-summary` instead of heavy `/api/status`.
 - WebUI product display-name correction completed: overview and T型报价 now prefer TQSDK `instrument_name` from Quote payloads to derive product names, with frontend static product mappings only as fallback; `ad` fallback is corrected from `氧化铝` to `铝合金`, while `ao` remains `氧化铝`.
 - T型报价 subscribed-scope metric coverage completed: quote-page IV/Greeks coverage now uses only the currently subscribed/displayable option legs as the denominator, rather than the full chain; `iv=0.0` is counted as covered, and Kline status uses the same subscribed-scope denominator so OTM-only views do not stay incorrectly degraded by hidden ITM/ATM legs.
 - Realtime Quote freshness during Kline setup hotfix completed: Kline subscription setup now waits with the normal realtime `wait_deadline_seconds` before writing forced Quote snapshots, and it no longer rewrites stale Quote objects with a fresh `received_at` when `wait_update` times out. Live restart verified `DCE.b2607` recovered from stale `3538 / 21:57:21` to current `3533 / 22:23:18` while Kline setup continued.

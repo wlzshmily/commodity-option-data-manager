@@ -124,6 +124,23 @@ def create_webui_app(
             if read_connection is not None:
                 read_connection.close()
 
+    @app.get("/api/webui/api-summary")
+    def api_page_summary() -> dict:
+        summary = service_state.api_summary()
+        return {
+            "status": "ok",
+            "database_path": database_path,
+            "api": {
+                "request_count": summary.request_count,
+                "error_count": summary.error_count,
+                "average_latency_ms": round(summary.average_latency_ms, 3),
+            },
+            "summary": {
+                "active_options": _active_option_count(connection),
+                "latest_quote_update": _latest_quote_update(connection),
+            },
+        }
+
     return app
 
 
@@ -457,6 +474,16 @@ def _active_option_count(connection: sqlite3.Connection | None) -> int | None:
     except sqlite3.OperationalError:
         return None
     return int(row[0] or 0) if row is not None else 0
+
+
+def _latest_quote_update(connection: sqlite3.Connection | None) -> str | None:
+    if connection is None:
+        return None
+    try:
+        row = connection.execute("SELECT MAX(received_at) FROM quote_current").fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return None if row is None else row[0]
 
 
 def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict:
@@ -1303,8 +1330,73 @@ INDEX_HTML = """<!doctype html>
         </section>
 
         <section id="api" class="page">
-          <div class="hero-card card"><div class="hero-title-block"><h1>本地 API</h1><p>为未来比例价差监控平台提供本地只读数据入口。</p></div><div class="hero-metrics"><div class="metric-card"><span>模式</span><strong class="good">只读</strong></div><div class="metric-card"><span>Swagger</span><a class="btn btn-sm btn-primary" href="/docs" target="_blank" rel="noreferrer">文档入口</a></div></div></div>
-          <section class="panel card"><div class="notice">API 仅绑定本机，当前 DEV-024 只交付展示切片。</div></section>
+          <div class="hero-card card">
+            <div class="hero-title-block"><h1>本地 API</h1><p>本机只读数据接口、文档入口和接入状态。</p></div>
+            <div class="hero-metrics">
+              <div class="metric-card"><span>服务状态</span><strong id="api-health-status">检查中</strong></div>
+              <div class="metric-card"><span>认证</span><strong id="api-auth-status">--</strong></div>
+              <div class="metric-card"><span>请求数</span><strong id="api-request-count">--</strong></div>
+              <div class="metric-card"><span>平均延迟</span><strong id="api-latency">--</strong></div>
+            </div>
+          </div>
+          <section class="panel card">
+            <div class="panel-header"><span class="panel-title">接入信息</span><span class="panel-note">API Key 在设置页管理；这里保留调用入口和运行状态。</span></div>
+            <div class="api-access-grid">
+              <div class="api-access-card">
+                <span>Base URL</span>
+                <strong class="mono" id="api-base-url">--</strong>
+                <small>当前 WebUI 同源挂载本地 API。</small>
+              </div>
+              <div class="api-access-card">
+                <span>Swagger UI</span>
+                <a class="btn btn-sm btn-primary" href="/docs" target="_blank" rel="noreferrer">打开文档</a>
+                <small>用于查看和试调完整接口。</small>
+              </div>
+              <div class="api-access-card">
+                <span>OpenAPI Schema</span>
+                <a class="btn btn-sm btn-light" href="/openapi.json" target="_blank" rel="noreferrer">查看 JSON</a>
+                <small>供外部监控平台生成客户端。</small>
+              </div>
+              <div class="api-access-card">
+                <span>API Key</span>
+                <button class="btn btn-sm btn-light" type="button" id="manage-api-keys">管理 Key</button>
+                <small id="api-key-hint">认证状态加载中。</small>
+              </div>
+            </div>
+          </section>
+          <section class="panel card">
+            <div class="panel-header"><span class="panel-title">调用方式</span><span class="panel-note">只读接口默认面向本机集成，开启认证后需传 Bearer Token。</span></div>
+            <div class="api-callout">
+              <div>
+                <span>认证头</span>
+                <code id="api-auth-header">Authorization: Bearer &lt;API_KEY&gt;</code>
+              </div>
+              <div>
+                <span>当前绑定</span>
+                <code id="api-bind-info">--</code>
+              </div>
+            </div>
+          </section>
+          <section class="panel card">
+            <div class="panel-header"><span class="panel-title">常用端点</span><span class="panel-note">监控平台优先从这些只读接口取当前切片和运行状态。</span></div>
+            <div class="table-responsive table-shell">
+              <table class="table table-sm align-middle summary-table api-endpoint-table">
+                <colgroup><col class="api-method"><col class="api-path"><col class="api-purpose"><col class="api-action"></colgroup>
+                <thead><tr><th>方法</th><th>路径</th><th>用途</th><th>操作</th></tr></thead>
+                <tbody id="api-endpoint-rows"></tbody>
+              </table>
+            </div>
+          </section>
+          <section class="panel card">
+            <div class="panel-header"><span class="panel-title">运行摘要</span><span class="panel-note">用于判断 API 是否可作为外部监控平台的数据出口。</span></div>
+            <div class="api-runtime-grid">
+              <div><span>数据库</span><strong class="mono" id="api-database-path">--</strong></div>
+              <div><span>活跃期权</span><strong id="api-active-options">--</strong></div>
+              <div><span>最新切片</span><strong id="api-latest-update">--</strong></div>
+              <div><span>错误数</span><strong id="api-error-count">--</strong></div>
+            </div>
+            <div class="notice mt-3 good" id="api-page-message">API 页面加载中。</div>
+          </section>
         </section>
 
         <section id="settings" class="page">
@@ -1372,7 +1464,7 @@ INDEX_HTML = """<!doctype html>
             </div>
             <div class="notice mt-3" id="quote-stream-message">实时订阅状态加载中。</div>
           </section>
-          <section class="panel card">
+          <section class="panel card" id="settings-api-key-panel">
             <div class="panel-header"><span class="panel-title">API Key</span><span class="panel-note">完整 Key 只在创建时显示。</span></div>
             <div class="settings-grid">
               <label>名称<input class="form-control form-control-sm" id="api-key-name" placeholder="local-monitor" /></label>
@@ -1610,6 +1702,83 @@ body {
 }
 .settings-grid + .notice,
 .settings-grid + .table-shell { margin-top: 18px; }
+.api-access-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+.api-access-card,
+.api-runtime-grid > div {
+  min-height: 86px;
+  padding: 13px 14px;
+  border: 1px solid rgba(138, 66, 70, .13);
+  border-radius: 4px;
+  background: rgba(255, 253, 248, .94);
+}
+.api-access-card span,
+.api-runtime-grid span,
+.api-callout span {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+.api-access-card strong,
+.api-runtime-grid strong {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.api-access-card small {
+  display: block;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.api-access-card .btn {
+  min-height: 30px;
+  min-width: 104px;
+}
+.api-callout {
+  display: grid;
+  grid-template-columns: minmax(320px, .9fr) minmax(320px, 1.1fr);
+  gap: 14px;
+}
+.api-callout > div {
+  padding: 13px 14px;
+  border: 1px solid rgba(138, 66, 70, .13);
+  border-radius: 4px;
+  background: #fffdf8;
+}
+.api-callout code {
+  display: block;
+  min-height: 30px;
+  padding: 7px 9px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fbfaf3;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.api-runtime-grid {
+  display: grid;
+  grid-template-columns: 1.4fr repeat(3, minmax(0, .8fr));
+  gap: 14px;
+}
+.api-endpoint-table col.api-method { width: 9%; }
+.api-endpoint-table col.api-path { width: 25%; }
+.api-endpoint-table col.api-purpose { width: 48%; }
+.api-endpoint-table col.api-action { width: 18%; }
+.api-endpoint-table code {
+  font-family: var(--mono);
+  font-weight: 800;
+}
 .exchange-card {
   min-height: 74px;
   padding: 12px 14px;
@@ -1976,6 +2145,7 @@ const QuoteStreamStatus = Object.freeze({
 const state = {
   overview: null,
   quote: null,
+  settings: null,
   selectedUnderlying: null,
   selectedExchange: "ALL",
   showIssuesOnly: false,
@@ -2206,7 +2376,7 @@ async function init() {
     renderSelectors();
     if (state.quote) renderQuote({ animate: false });
     await renderRuns();
-  } else if (initialPage !== "settings") {
+  } else if (!["settings", "api"].includes(initialPage)) {
     refreshOverview();
     renderRuns();
   }
@@ -2233,6 +2403,7 @@ function showPage(page, options = {}) {
   if (options.updateHash !== false) history.replaceState(null, "", `#${id}`);
   if (id === "overview" && !state.overview) refreshOverview();
   if (id === "runs") renderRuns();
+  if (id === "api") renderApiPage();
 }
 
 function emptyOverview() {
@@ -2312,11 +2483,16 @@ function bindControls() {
   $("#start-quote-stream").addEventListener("click", startQuoteStream);
   $("#stop-quote-stream").addEventListener("click", stopQuoteStream);
   $("#create-api-key").addEventListener("click", createApiKey);
+  $("#manage-api-keys").addEventListener("click", () => {
+    showPage("settings");
+    setTimeout(() => $("#settings-api-key-panel")?.scrollIntoView({ block: "start", behavior: "smooth" }), 30);
+  });
 }
 
 async function loadSettings() {
   try {
     const settings = await fetchJson("/api/settings");
+    state.settings = settings;
     $("#setting-account").value = settings.tqsdk.account ?? "";
     $("#setting-api-bind").value = settings.api.bind ?? "127.0.0.1";
     $("#setting-api-port").value = settings.api.port ?? 8770;
@@ -2354,6 +2530,74 @@ async function loadSettings() {
   } catch (error) {
     setNotice("#settings-message", `设置加载失败：${error.message}`, "bad");
   }
+}
+
+async function renderApiPage() {
+  if (!$("#api").classList.contains("active")) return;
+  try {
+    const [status, settings] = await Promise.all([
+      fetchJson("/api/webui/api-summary"),
+      state.settings ? Promise.resolve(state.settings) : fetchJson("/api/settings"),
+    ]);
+    state.settings = settings;
+    const api = status.api ?? {};
+    const summary = status.summary ?? {};
+    const authRequired = Boolean(settings.api?.auth_required ?? api.auth_required);
+    const baseUrl = window.location.origin;
+    const bind = settings.api?.bind ?? api.bind ?? "127.0.0.1";
+    const port = settings.api?.port ?? api.port ?? window.location.port;
+    setText("#api-health-status", status.status === "empty" ? "空库可用" : "正常");
+    setTone("#api-health-status", status.status === "error" ? "bad" : status.status === "empty" ? "warn" : "good");
+    setText("#api-auth-status", authRequired ? "需要 Key" : "本机免 Key");
+    setTone("#api-auth-status", authRequired ? "warn" : "good");
+    setText("#api-request-count", fmtNum(api.request_count));
+    setText("#api-latency", `${fmtMaybeTrim(api.average_latency_ms, 1, true)} ms`);
+    setText("#api-base-url", baseUrl);
+    setText("#api-key-hint", authRequired ? "已开启强制认证，请在设置页创建或管理 Key。" : "当前未强制认证；如需外部集成可先创建 Key 再开启认证。");
+    setText("#api-auth-header", authRequired ? "Authorization: Bearer <API_KEY>" : "当前未强制要求；开启后使用 Authorization: Bearer <API_KEY>");
+    setText("#api-bind-info", `${bind}:${port}`);
+    setText("#api-database-path", status.database_path ?? "--");
+    setText("#api-active-options", fmtNum(summary.active_options));
+    setText("#api-latest-update", fmtDateTime(summary.latest_quote_update));
+    setText("#api-error-count", fmtNum(api.error_count));
+    renderApiEndpointRows(authRequired);
+    setNotice("#api-page-message", "API 状态已更新。API Key 管理保留在设置页，接入方从这里查看调用入口。", "good");
+  } catch (error) {
+    setText("#api-health-status", "不可用");
+    setTone("#api-health-status", "bad");
+    setNotice("#api-page-message", `API 状态加载失败：${error.message}`, "bad");
+  }
+}
+
+function setText(selector, value) {
+  const element = $(selector);
+  if (element) element.textContent = value ?? "--";
+}
+
+function setTone(selector, tone) {
+  const element = $(selector);
+  if (!element) return;
+  element.classList.remove("good", "warn", "bad");
+  if (tone) element.classList.add(tone);
+}
+
+function renderApiEndpointRows(authRequired) {
+  const endpoints = [
+    ["GET", "/api/health", "服务健康检查和数据库连通性。", "/api/health"],
+    ["GET", "/api/status", "汇总 API 请求统计、采集状态、实时订阅状态和数据覆盖。", "/api/status"],
+    ["GET", "/api/quote-stream", "读取实时 Quote/K线 worker 状态和按标的聚合的订阅进度。", "/api/quote-stream"],
+    ["GET", "/api/underlyings", "当前订阅范围内标的列表，适合监控平台做标的导航。", "/api/underlyings"],
+    ["GET", "/api/options?underlying=...", "按标的读取期权链合约元数据。", "/api/options"],
+    ["GET", "/api/options/{symbol}/quote", "读取单个期权合约当前 Quote 切片。", null],
+  ];
+  $("#api-endpoint-rows").innerHTML = endpoints.map(([method, path, purpose, href]) => `
+    <tr>
+      <td><span class="tag good">${method}</span></td>
+      <td><code>${escapeHtml(path)}</code></td>
+      <td>${escapeHtml(purpose)}${authRequired ? " 需要 Bearer Token。" : ""}</td>
+      <td>${href ? `<a class="btn btn-sm btn-light table-action" href="${href}" target="_blank" rel="noreferrer">打开</a>` : `<span class="muted">填入 symbol 后调用</span>`}</td>
+    </tr>
+  `).join("");
 }
 
 async function saveCredentials() {

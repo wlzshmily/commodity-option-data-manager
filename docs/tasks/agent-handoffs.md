@@ -1,5 +1,13 @@
 # Agent Handoffs
 
+## 2026-05-16
+
+- API verification check completed with no business-code changes.
+- Current workspace verification passed: `uv run python -m pytest -s -q` (125 passed), compileall, agentic-SDLC shell check, TestClient smoke, and a temporary bound API server smoke on `127.0.0.1:18770`.
+- The first `uv run pytest -q` attempt failed before running tests due to pytest capture cleanup `FileNotFoundError`; the no-capture rerun passed and should be preferred on this WSL `/mnt/c` workspace if the capture issue recurs.
+- Subscription distinction capability exists today through `/api/quote-stream` `progress.underlying_progress` and WebUI read-model status fields. There is no dedicated narrow REST endpoint like `/api/subscriptions/{underlying}` yet; callers currently read aggregate progress or WebUI overview/T型报价 payloads.
+- API page redesign follow-up completed after browser feedback. `/#api` is now a status and access page rather than a placeholder: it shows Base URL, Swagger/OpenAPI links, auth guidance, common endpoints, lightweight runtime summary, and a jump to API Key management in settings. A lightweight `/api/webui/api-summary` endpoint was added because `/api/status` performs heavier overview aggregation and can be slow on the large local SQLite database. Verification passed with targeted WebUI/API tests, compileall, local smoke, agentic-SDLC check, and live `8765` HTTP checks.
+
 ## 2026-05-08
 
 - Active work: implement approved release plan.

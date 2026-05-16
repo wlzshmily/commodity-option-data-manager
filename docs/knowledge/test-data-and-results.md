@@ -1,5 +1,22 @@
 # Test Data And Results
 
+## 2026-05-16
+
+- API health check rerun in WSL current workspace:
+  - Initial `uv run pytest -q` did not execute tests and exited during pytest capture cleanup with `FileNotFoundError`; rerun without capture was used.
+  - `uv run python -m pytest -s -q`: 125 passed.
+  - `uv run python -m compileall -q src tests option_data_manager`: passed.
+  - `bash scripts/agentic-sdlc/check-agentic-sdlc.sh`: passed.
+  - `uv run python scripts/smoke-local-app.py --database data/tmp-smoke/api-check-smoke.sqlite3`: passed for API/WebUI factory endpoints.
+  - Temporary bound API server on `127.0.0.1:18770` using `data/tmp-smoke/api-server-smoke.sqlite3` returned HTTP 200 for `/api/health`, `/api/status`, `/api/settings`, `/api/quote-stream`, `/api/contract-manager`, `/api/underlyings`, `/api/options?limit=1`, and `/docs`.
+- API capability note: `/api/quote-stream` exposes aggregate realtime subscription progress plus `progress.underlying_progress` keyed by underlying symbol. WebUI API endpoints use the same progress to classify chains as `已订阅`, `订阅中`, `待订阅`, or `未订阅`.
+- API page redesign completed: `/#api` now shows access status, Base URL, Swagger/OpenAPI links, auth header guidance, common read-only endpoints, runtime metrics, and a jump to settings-page API Key management instead of repeating key management. The page uses lightweight `/api/webui/api-summary` instead of heavy `/api/status` so it does not block on full overview aggregation.
+  - `uv run pytest -s -q tests/test_webui_app.py tests/test_api_app.py`: 22 passed.
+  - `uv run python -m compileall -q src tests option_data_manager`: passed.
+  - `uv run python scripts/smoke-local-app.py --database data/tmp-smoke/api-page-smoke.sqlite3`: passed.
+  - `bash scripts/agentic-sdlc/check-agentic-sdlc.sh`: passed.
+  - Restarted local WebUI at `http://127.0.0.1:8765`; `/`, `/api/webui/api-summary`, `/api/settings`, `/docs`, and `/openapi.json` returned 200, and the old DEV-024 placeholder text was absent from the HTML.
+
 ## 2026-05-08
 
 - `uv run pytest -q`: 19 passed.
