@@ -4,7 +4,11 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from option_data_manager.api.app import API_AUTH_REQUIRED_KEY, create_app
+from option_data_manager.api.app import (
+    API_AUTH_REQUIRED_KEY,
+    _safe_record_request,
+    create_app,
+)
 from option_data_manager.instruments import (
     InstrumentRepository,
     normalize_option_chain_discovery,
@@ -337,6 +341,22 @@ def test_quote_stream_status_ignores_stale_state_write_lock(monkeypatch) -> None
     payload = response.json()
     assert payload["running"] is False
     assert payload["status"] == "stopped"
+
+
+def test_request_metric_commit_state_error_is_best_effort() -> None:
+    class BrokenRequestMetrics:
+        def record_request(self, **_kwargs) -> None:
+            raise sqlite3.OperationalError("cannot commit - no transaction is active")
+
+    recorded = _safe_record_request(
+        BrokenRequestMetrics(),
+        path="/api/quote-stream",
+        method="GET",
+        status_code=200,
+        latency_ms=1.2,
+    )
+
+    assert recorded is False
 
 
 def test_quote_stream_starting_status_uses_state_enum_not_message() -> None:

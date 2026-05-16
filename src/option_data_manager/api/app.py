@@ -2443,14 +2443,18 @@ def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
 
 
 def _is_sqlite_retryable(exc: sqlite3.OperationalError | SystemError) -> bool:
+    message = str(exc).lower()
     if isinstance(exc, SystemError):
-        message = str(exc).lower()
         return (
             "sqlite3.connection" in message
             or "commit" in message
             or "error return without exception set" in message
         )
-    return _is_sqlite_busy(exc)
+    return (
+        _is_sqlite_busy(exc)
+        or "cannot commit - no transaction is active" in message
+        or "cannot rollback - no transaction is active" in message
+    )
 
 
 def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str, Any]:
