@@ -2,6 +2,15 @@
 
 ## 2026-05-17
 
+- OPS-004 deployment completed for the dedicated Ubuntu test server `39.103.49.231`.
+- Target release: GitHub commit `0780618709561ccd864fd9b1401d313cf9b31ddb`, deployed at `/opt/option-data-manager/releases/078061870956`; `/opt/option-data-manager/current` points there and `/opt/option-data-manager/current-release.txt` contains the full SHA.
+- Server-side `git fetch` timed out connecting to GitHub, but the server successfully downloaded the official GitHub codeload archive for the same commit and rebuilt the release from that archive.
+- First deployment candidate `17f289d638f1` was not activated because remote validation found a request-metric SQLite commit-state exception (`cannot commit - no transaction is active`). Commit `078061870956` hardened request metric retry handling and added regression coverage in `tests/test_api_app.py`.
+- Remote verification passed: `.venv/bin/python -m pytest -s -q` (138 passed), compileall, `scripts/smoke-local-app.py`, and `bash scripts/agentic-sdlc/check-agentic-sdlc.sh`.
+- Runtime verification passed: `odm-webui.service` active under systemd as user `odm`, listening on `0.0.0.0:8765`; local server smoke and external public smoke against `http://39.103.49.231:8765` both returned 200 for core UI/API/static endpoints.
+- Runtime workers were restored after the service restart: contract manager is healthy with 28,060 active options, quote-stream worker PID `60222` and metrics-worker PID `60223` run from the new release, and observed realtime progress reached Quote `3200/11126`, Kline `0/5077`, OTM moneyness target `5077`, with 0 Kline subscription errors.
+- No real TQSDK password, raw API key, or live credential evidence was written into tracked files.
+
 - MM-T019 completed locally in WSL2 Ubuntu. The realtime Kline moneyness filter and T型报价 display now consume a shared backend classification context from `moneyness.py`; JavaScript no longer re-derives CALL/PUT moneyness from price, and instead maps backend `moneyness` plus row `is_atm` to display classes.
 - Code areas touched: `src/option_data_manager/moneyness.py`, `src/option_data_manager/quote_streamer.py`, `src/option_data_manager/webui/read_model.py`, `src/option_data_manager/webui/app.py`, `tests/test_moneyness.py`, `tests/test_webui_read_model.py`, and `tests/test_webui_app.py`.
 - Verification so far: targeted `uv run python -m pytest -s -q tests/test_moneyness.py tests/test_webui_read_model.py::test_tquote_masks_rows_outside_realtime_moneyness_scope tests/test_webui_app.py::test_tquote_coloring_uses_backend_moneyness_classification tests/test_quote_streamer.py::test_moneyness_filter_keeps_quote_scope_broad_but_filters_klines tests/test_quote_streamer.py::test_moneyness_filter_uses_underlying_quote_price_fallbacks` passed 11 tests; local AP610 SQLite verification showed reference price `7650`, ATM strike `7700`, CALL OTM `24`, PUT OTM `12`, and Kline target `37` including the underlying future.
