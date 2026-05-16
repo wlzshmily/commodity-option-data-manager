@@ -27,6 +27,7 @@
 
 ## Acceptance Evidence
 
+- Ubuntu test server update on 2026-05-16: `39.103.49.231` runs GitHub commit `c54847bfe4c6d73c15d87e1a42a9eb74c0b0cd53` from `/opt/option-data-manager/releases/c54847bfe4c6`; server-side verification passed 127 tests, compileall, smoke-local-app, and agentic-SDLC check; systemd `odm-webui` is active on `0.0.0.0:8765`, and public smoke for core UI/API/static endpoints returned 200.
 - Final tuned full-market catch-up: `docs/qa/live-evidence/final-parallel-catchup/summary.json` with 4 worker shards, 6 waves, 27,386 active options, 864/864 successful batches, 0 failed batches, 4,325.332 seconds, and 6.332 options/second.
 - Real runtime display readiness: WebUI read model reported `completion_ratio=1.0`, `failed_batches=0`, `stale_batches=0`, K-line coverage `1.0`, IV coverage `0.9013`, Greeks coverage `0.8959`, and price-field quote coverage `0.8553`.
 - Source quality note: all active options have Quote, K-line, and metrics rows. Remaining IV/Greeks and price-field gaps are retained as visible source-quality diagnostics.

@@ -36,6 +36,21 @@ def test_tquote_metric_coverage_uses_subscription_scope_denominator() -> None:
     assert "option?.iv !== null && option?.iv !== undefined" in WEBUI_JS
 
 
+def test_tquote_coloring_uses_backend_moneyness_classification() -> None:
+    assert "function optionMoneynessClass(option)" in WEBUI_JS
+    assert "option?.moneyness" in WEBUI_JS
+    assert "row.is_atm ? \" atm\" : \"\"" in WEBUI_JS
+    assert "function moneynessClass" not in WEBUI_JS
+
+
+def test_overview_call_put_counts_use_subscription_kline_scope_when_running() -> None:
+    assert "function overviewSideCount(row, side)" in WEBUI_JS
+    assert "subscription_kline_call_total" in WEBUI_JS
+    assert "subscription_kline_put_total" in WEBUI_JS
+    assert "overviewSideCount(row, \"CALL\")" in WEBUI_JS
+    assert "overviewSideCount(row, \"PUT\")" in WEBUI_JS
+
+
 def test_webui_product_label_prefers_tqsdk_display_name_and_ad_fallback_is_alloy() -> None:
     assert 'ad: "铝合金"' in WEBUI_JS
     assert "function productLabelForRow(row)" in WEBUI_JS

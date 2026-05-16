@@ -15,9 +15,10 @@ from .instruments import InstrumentRepository
 from .metrics_dirty_queue import MetricsDirtyQueueRepository
 from .moneyness import (
     MONEYNESS_ALL,
-    classify_option_moneyness,
+    build_moneyness_classification,
     is_all_moneyness,
     normalize_moneyness_filter,
+    underlying_reference_price,
 )
 from .quotes import QUOTE_SOURCE_FIELDS, QuoteRepository, normalize_quote
 from .quotes import QuoteRecord
@@ -716,10 +717,12 @@ def stream_quotes(
                 last_kline_subscription_error_symbol = sticky["last_kline_error_symbol"]
                 last_kline_subscription_error = sticky["last_kline_error"]
             last_moneyness_recalc_at = datetime.now(UTC).isoformat()
-            kline_symbols = sorted(
-                set(kline_symbols) | set(sticky["target_kline_symbols"])
-            )
-            near_kline_total = max(near_kline_total, sticky["target_near_kline_count"])
+            kline_symbols = sorted(set(kline_symbols) | set(sticky["kline_symbols"]))
+            if sticky["kline_symbols"]:
+                near_kline_total = max(
+                    near_kline_total,
+                    sticky["target_near_kline_count"],
+                )
             symbol_metadata = _quote_symbol_metadata(
                 connection,
                 sorted(set(symbols) | set(kline_symbols)),
@@ -769,13 +772,13 @@ def stream_quotes(
                 worker_count=worker_count,
                 quote_subscribed=len(quote_refs),
                 quote_total=len(symbols),
-                kline_subscribed=len(kline_refs),
+                kline_subscribed=_subscribed_target_count(kline_symbols, kline_refs),
                 kline_total=len(kline_symbols),
                 near_expiry_months=near_expiry_months,
                 near_expiry_quote_subscribed=near_quote_total,
                 near_expiry_quote_total=near_quote_total,
                 near_expiry_kline_subscribed=min(
-                    len(kline_refs),
+                    _subscribed_target_count(kline_symbols, kline_refs),
                     near_kline_total,
                 ),
                 near_expiry_kline_total=near_kline_total,
@@ -831,7 +834,7 @@ def stream_quotes(
         symbol_count=len(symbols),
         kline_symbol_count=len(kline_symbols),
         subscribed_quote_count=len(quote_refs),
-        subscribed_kline_count=len(kline_refs),
+        subscribed_kline_count=_subscribed_target_count(kline_symbols, kline_refs),
         quote_shard_size=quote_shard_size,
         kline_data_length=kline_data_length,
         near_expiry_months=near_expiry_months,
@@ -1157,6 +1160,12 @@ def _batches(symbols: list[str], batch_size: int) -> list[list[str]]:
     ]
 
 
+def _subscribed_target_count(symbols: list[str], refs: dict[str, Any]) -> int:
+    """Count subscribed refs that are still part of the current target scope."""
+
+    return sum(1 for symbol in symbols if symbol in refs)
+
+
 def _subscribe_kline_batch(
     api: Any,
     symbols: list[str],
@@ -1417,14 +1426,9 @@ def _reconcile_subscriptions(
         if include_options and include_klines and prioritize_near_expiry
         else 0
     )
-    kline_symbols = [
-        symbol
-        for symbol in active_kline_symbols
-        if symbol in kline_refs or symbol in set(matching_kline_symbols)
-    ]
     return {
         "symbols": symbols,
-        "kline_symbols": kline_symbols,
+        "kline_symbols": matching_kline_symbols,
         "near_quote_total": near_quote_total,
         "near_kline_total": near_kline_total,
         "added_quote_count": added_quote_count,
@@ -1803,13 +1807,13 @@ def _filter_kline_rows_by_moneyness(
     stats["skipped_missing_price_count"] = len(
         expected_underlyings - set(underlying_prices)
     )
-    classifications = classify_option_moneyness(
+    classification = build_moneyness_classification(
         option_rows,
         underlying_prices=underlying_prices,
     )
     selected_option_symbols = {
         symbol
-        for symbol, moneyness in classifications.items()
+        for symbol, moneyness in classification.classifications.items()
         if moneyness in selected
     }
     selected_underlyings = {
@@ -1877,21 +1881,27 @@ def _underlying_prices_for_rows(
     if not underlyings or not _table_exists(connection, "quote_current"):
         return {}
     placeholders = ",".join("?" for _ in underlyings)
-    fetched = _execute_read_with_retry(
+    cursor = _execute_read_with_retry(
         connection,
         f"""
-        SELECT symbol, COALESCE(last_price, average_price, close_price) AS price
+        SELECT
+            symbol,
+            last_price,
+            ask_price1,
+            bid_price1,
+            close_price,
+            average_price,
+            raw_payload_json
         FROM quote_current
         WHERE symbol IN ({placeholders})
         """,
         tuple(underlyings),
-    ).fetchall()
+    )
     prices: dict[str, float] = {}
-    for row in fetched:
-        try:
-            prices[str(row["symbol"])] = float(row["price"])
-        except (TypeError, ValueError):
-            continue
+    for row in _dict_rows(cursor):
+        price = underlying_reference_price(row)
+        if price is not None:
+            prices[str(row["symbol"])] = price
     return prices
 
 
@@ -2313,6 +2323,10 @@ def _underlying_subscription_progress(
                 "quote_total": 0,
                 "kline_subscribed": 0,
                 "kline_total": 0,
+                "kline_call_subscribed": 0,
+                "kline_call_total": 0,
+                "kline_put_subscribed": 0,
+                "kline_put_total": 0,
                 "subscribed_objects": 0,
                 "total_objects": 0,
                 "completion_ratio": 0.0,
@@ -2331,9 +2345,20 @@ def _underlying_subscription_progress(
         row = ensure(symbol)
         row["kline_total"] += 1
         row["total_objects"] += 1
+        option_class = str(
+            (symbol_metadata.get(symbol) or {}).get("option_class") or ""
+        ).upper()
+        if option_class == "CALL":
+            row["kline_call_total"] += 1
+        elif option_class == "PUT":
+            row["kline_put_total"] += 1
         if symbol in kline_refs:
             row["kline_subscribed"] += 1
             row["subscribed_objects"] += 1
+            if option_class == "CALL":
+                row["kline_call_subscribed"] += 1
+            elif option_class == "PUT":
+                row["kline_put_subscribed"] += 1
     for row in progress.values():
         total = int(row["total_objects"] or 0)
         subscribed = int(row["subscribed_objects"] or 0)

@@ -122,6 +122,7 @@ def test_overview_can_filter_to_current_realtime_quote_rows() -> None:
 def test_overview_and_tquote_include_underlying_trading_session_state() -> None:
     connection = sqlite3.connect(":memory:")
     read_model = WebuiReadModel(connection)
+    fresh_source_datetime = datetime.now().replace(microsecond=0).isoformat(sep=" ")
     _insert_simple_chain(
         connection,
         underlying_symbol="SHFE.cu2606",
@@ -134,10 +135,12 @@ def test_overview_and_tquote_include_underlying_trading_session_state() -> None:
     connection.execute(
         """
         UPDATE quote_current
-        SET raw_payload_json = ?
+        SET source_datetime = ?,
+            raw_payload_json = ?
         WHERE symbol = 'SHFE.cu2606'
         """,
         (
+            fresh_source_datetime,
             '{"trading_time":{"day":[["00:00:00","23:59:59"]],"night":[]}}',
         ),
     )
@@ -517,6 +520,10 @@ def test_overview_subscription_status_can_follow_underlying_progress() -> None:
                 "quote_total": 3,
                 "kline_subscribed": 3,
                 "kline_total": 3,
+                "kline_call_subscribed": 1,
+                "kline_call_total": 1,
+                "kline_put_subscribed": 1,
+                "kline_put_total": 1,
                 "subscribed_objects": 6,
                 "total_objects": 6,
             },
@@ -526,6 +533,10 @@ def test_overview_subscription_status_can_follow_underlying_progress() -> None:
                 "quote_total": 3,
                 "kline_subscribed": 1,
                 "kline_total": 3,
+                "kline_call_subscribed": 1,
+                "kline_call_total": 1,
+                "kline_put_subscribed": 0,
+                "kline_put_total": 1,
                 "subscribed_objects": 4,
                 "total_objects": 6,
             },
@@ -540,6 +551,76 @@ def test_overview_subscription_status_can_follow_underlying_progress() -> None:
         "CZCE.FG607": 6,
         "CZCE.FG608": 4,
     }
+    assert {row["underlying_symbol"]: row["subscription_kline_call_total"] for row in rows} == {
+        "CZCE.FG607": 1,
+        "CZCE.FG608": 1,
+    }
+    assert {row["underlying_symbol"]: row["subscription_kline_put_total"] for row in rows} == {
+        "CZCE.FG607": 1,
+        "CZCE.FG608": 1,
+    }
+
+
+def test_overview_distinguishes_quote_complete_from_kline_not_ready() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    today = date.today()
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="CZCE.FG607",
+        exchange_id="CZCE",
+        product_id="FG",
+        delivery_year=2026,
+        delivery_month=7,
+        received_at="2026-05-09T01:00:00+00:00",
+    )
+    connection.execute(
+        """
+        UPDATE instruments
+        SET expire_datetime = ?
+        WHERE underlying_symbol = 'CZCE.FG607' AND option_class IN ('CALL', 'PUT')
+        """,
+        ((today + timedelta(days=30)).isoformat(),),
+    )
+    connection.execute(
+        """
+        UPDATE quote_current
+        SET source_datetime = NULL,
+            raw_payload_json = ?
+        WHERE symbol = 'CZCE.FG607'
+        """,
+        (
+            '{"trading_time":{"day":[["09:00:00","10:15:00"],'
+            '["10:30:00","11:30:00"],["13:30:00","15:00:00"]],"night":[]}}',
+        ),
+    )
+    connection.commit()
+
+    row = read_model.overview(
+        current_quote_after="2026-05-12T01:00:00+00:00",
+        require_current_quote=True,
+        subscription_scope_enabled=True,
+        subscription_contract_month_limit=2,
+        subscription_min_days_to_expiry=1,
+        subscription_lifecycle_status="subscribing",
+        subscription_underlying_progress={
+            "CZCE.FG607": {
+                "status": "subscribed",
+                "quote_subscribed": 3,
+                "quote_total": 3,
+                "kline_subscribed": 0,
+                "kline_total": 0,
+                "subscribed_objects": 3,
+                "total_objects": 3,
+            },
+        },
+    )["underlyings"][0]
+
+    assert row["status"] == "订阅中"
+    assert row["subscription_quote_subscribed"] == 3
+    assert row["subscription_kline_total"] == 0
+    assert row["trading_session_state"] == "out_of_session"
+    assert row["trading_session_label"] == "休市"
 
 
 def test_tquote_marks_historical_cache_as_unsubscribed_until_realtime_refresh() -> None:
@@ -770,6 +851,8 @@ def test_tquote_masks_rows_outside_realtime_moneyness_scope() -> None:
     )
     by_strike = {row["strike_price"]: row for row in quote["strikes"]}
 
+    assert quote["atm_strike"] == 100.0
+    assert by_strike[100.0]["is_atm"] is True
     assert by_strike[110.0]["CALL"]["moneyness"] == "otm"
     assert by_strike[110.0]["CALL"]["last_price"] == 1.5
     assert by_strike[110.0]["CALL"]["iv"] == 0.2
@@ -789,7 +872,14 @@ def test_tquote_masks_rows_outside_realtime_moneyness_scope() -> None:
     assert by_strike[100.0]["PUT"]["last_price"] is None
 
     connection.execute(
-        "UPDATE quote_current SET last_price = 125 WHERE symbol = 'DCE.b2606'"
+        """
+        UPDATE quote_current
+        SET last_price = NULL,
+            bid_price1 = NULL,
+            ask_price1 = NULL,
+            raw_payload_json = '{"pre_settlement":125,"pre_close":124}'
+        WHERE symbol = 'DCE.b2606'
+        """
     )
 
     shifted_quote = read_model.tquote(
@@ -811,6 +901,9 @@ def test_tquote_masks_rows_outside_realtime_moneyness_scope() -> None:
     )
     shifted_by_strike = {row["strike_price"]: row for row in shifted_quote["strikes"]}
 
+    assert shifted_quote["underlying"]["moneyness_reference_price"] == 125
+    assert shifted_quote["atm_strike"] == 120.0
+    assert shifted_by_strike[120.0]["is_atm"] is True
     assert shifted_by_strike[110.0]["CALL"]["moneyness"] == "itm"
     assert shifted_by_strike[110.0]["CALL"]["last_price"] is None
     assert shifted_by_strike[110.0]["PUT"]["moneyness"] == "otm"

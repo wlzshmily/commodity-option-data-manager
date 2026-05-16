@@ -15,9 +15,11 @@ from option_data_manager.collection_state import CollectionStateRepository
 from option_data_manager.instruments import InstrumentRepository
 from option_data_manager.klines import KlineRepository
 from option_data_manager.moneyness import (
-    classify_option_moneyness,
+    MONEYNESS_ATM,
+    build_moneyness_classification,
     is_all_moneyness,
     normalize_moneyness_filter,
+    underlying_reference_price,
 )
 from option_data_manager.option_metrics import OptionMetricsRepository
 from option_data_manager.quote_streamer import selected_underlying_contract_symbols
@@ -188,13 +190,15 @@ class WebuiReadModel:
             realtime_started_at=realtime_started_at,
             allow_historical_realtime_data=quote_subscribed,
         )
-        if realtime_started_at is not None:
-            _apply_moneyness_subscription_scope(
-                option_rows,
-                underlying_symbol=selected,
-                underlying_last_price=underlying.get("last_price"),
-                moneyness_filter=moneyness_filter,
-            )
+        atm_strike = _apply_moneyness_subscription_scope(
+            option_rows,
+            underlying_symbol=selected,
+            underlying_price=underlying.get("moneyness_reference_price"),
+            moneyness_filter=(
+                moneyness_filter if realtime_started_at is not None else None
+            ),
+            mask_out_of_scope=realtime_started_at is not None,
+        )
         _apply_realtime_chain_status(
             underlying,
             option_rows,
@@ -202,7 +206,6 @@ class WebuiReadModel:
             subscription_progress=selected_progress,
         )
         strike_rows = _strike_rows(option_rows)
-        atm_strike = _atm_strike(strike_rows, underlying.get("last_price"))
         return {
             "underlying": underlying,
             "selectors": _selector_rows(self.connection) if include_selectors else [],
@@ -947,7 +950,7 @@ def _format_underlying_row(
         data,
         data.get("underlying_quote_raw_payload_json"),
         quote_source_datetime=data.get("book_time"),
-        quote_pending=data["status"] != "已订阅",
+        quote_pending=_subscription_quote_pending(data["status"], subscription_progress),
     )
     return data
 
@@ -1015,9 +1018,12 @@ def _underlying_summary(
             expiry.option_expire_rest_days,
             CASE WHEN {_quote_has_market_data_sql("q")} THEN q.source_datetime END AS source_datetime,
             q.received_at,
+            q.last_price AS quote_last_price,
             COALESCE(q.last_price, k.last_kline_close_price) AS last_price,
             q.ask_price1,
             q.bid_price1,
+            q.close_price,
+            q.average_price,
             q.ask_volume1,
             q.bid_volume1,
             COALESCE(NULLIF(q.volume, 0), k.last_kline_volume, q.volume) AS volume,
@@ -1078,6 +1084,16 @@ def _underlying_summary(
     if row is None:
         return {"symbol": symbol, "missing": True}
     data = _row_dict(row)
+    data["moneyness_reference_price"] = underlying_reference_price(
+        {
+            "last_price": data.get("quote_last_price"),
+            "ask_price1": data.get("ask_price1"),
+            "bid_price1": data.get("bid_price1"),
+            "close_price": data.get("close_price"),
+            "average_price": data.get("average_price"),
+            "raw_payload_json": data.get("raw_payload_json"),
+        }
+    )
     data["expiry_month"] = _expiry_month(symbol)
     data["product_display_name"] = _product_display_name(
         data.get("product_id"),
@@ -1252,31 +1268,39 @@ def _apply_moneyness_subscription_scope(
     option_rows: list[dict[str, Any]],
     *,
     underlying_symbol: str,
-    underlying_last_price: Any,
+    underlying_price: Any,
     moneyness_filter: str | set[str] | list[str] | tuple[str, ...] | None,
-) -> None:
+    mask_out_of_scope: bool,
+) -> float | None:
     selected = normalize_moneyness_filter(moneyness_filter)
-    if is_all_moneyness(selected):
-        for row in option_rows:
-            row["moneyness_in_subscription_scope"] = True
-        return
 
-    underlying_price = _float_or_none(underlying_last_price)
-    classifications = (
-        classify_option_moneyness(
+    reference_price = _float_or_none(underlying_price)
+    classification = (
+        build_moneyness_classification(
             option_rows,
-            underlying_prices={underlying_symbol: underlying_price},
+            underlying_prices={underlying_symbol: reference_price},
         )
-        if underlying_price is not None
-        else {}
+        if reference_price is not None
+        else None
     )
     for row in option_rows:
-        moneyness = classifications.get(str(row.get("symbol") or ""))
-        in_scope = moneyness in selected
+        symbol = str(row.get("symbol") or "")
+        moneyness = (
+            classification.classifications.get(symbol)
+            if classification is not None
+            else None
+        )
+        in_scope = is_all_moneyness(selected) or moneyness in selected
         row["moneyness"] = moneyness
+        row["atm_strike"] = (
+            classification.symbol_atm_strikes.get(symbol)
+            if classification is not None
+            else None
+        )
         row["moneyness_in_subscription_scope"] = in_scope
-        if not in_scope:
+        if mask_out_of_scope and not in_scope:
             _mask_unsubscribed_moneyness_fields(row)
+    return classification.primary_atm_strike if classification is not None else None
 
 
 def _mask_unsubscribed_moneyness_fields(data: dict[str, Any]) -> None:
@@ -1419,9 +1443,11 @@ def _strike_rows(option_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         strike_value = float(strike)
         row = by_strike.setdefault(
             strike_value,
-            {"strike_price": strike_value, "CALL": None, "PUT": None},
+            {"strike_price": strike_value, "CALL": None, "PUT": None, "is_atm": False},
         )
         row[str(option["option_class"])] = option
+        if option.get("moneyness") == MONEYNESS_ATM:
+            row["is_atm"] = True
     return [by_strike[strike] for strike in sorted(by_strike, reverse=True)]
 
 
@@ -1649,20 +1675,6 @@ def _expiry_days(value: Any, *, fallback_days: Any = None) -> int | None:
         return None
 
 
-def _atm_strike(strike_rows: list[dict[str, Any]], last_price: Any) -> float | None:
-    if not strike_rows:
-        return None
-    if last_price is None:
-        middle = len(strike_rows) // 2
-        return float(strike_rows[middle]["strike_price"])
-    price = float(last_price)
-    return float(
-        min(strike_rows, key=lambda row: abs(float(row["strike_price"]) - price))[
-            "strike_price"
-        ]
-    )
-
-
 def _maxima(strike_rows: list[dict[str, Any]]) -> dict[str, float]:
     maxima = _empty_maxima()
     for row in strike_rows:
@@ -1717,12 +1729,11 @@ def _subscription_status_from_counts(
     progress_status = _coerce_subscription_lifecycle_status(
         (subscription_progress or {}).get("status")
     )
-    if progress_status == SubscriptionLifecycleStatus.SUBSCRIBED:
-        return "已订阅"
-    if progress_status == SubscriptionLifecycleStatus.SUBSCRIBING:
-        return "订阅中"
-    if progress_status == SubscriptionLifecycleStatus.PENDING:
-        return "待订阅"
+    if progress_status is not None:
+        return _subscription_status_from_progress(
+            subscription_progress,
+            fallback=progress_status,
+        )
     lifecycle = _coerce_subscription_lifecycle_status(lifecycle_status)
     if lifecycle == SubscriptionLifecycleStatus.SUBSCRIBED:
         return "已订阅"
@@ -1736,6 +1747,50 @@ def _subscription_status_from_counts(
     if current_quote_count > 0:
         return "订阅中"
     return "待订阅"
+
+
+def _subscription_status_from_progress(
+    progress: dict[str, Any] | None,
+    *,
+    fallback: SubscriptionLifecycleStatus,
+) -> str:
+    if not isinstance(progress, dict):
+        return {
+            SubscriptionLifecycleStatus.SUBSCRIBED: "已订阅",
+            SubscriptionLifecycleStatus.SUBSCRIBING: "订阅中",
+            SubscriptionLifecycleStatus.PENDING: "待订阅",
+        }[fallback]
+    quote_total = int(progress.get("quote_total") or 0)
+    quote_subscribed = int(progress.get("quote_subscribed") or 0)
+    kline_total = int(progress.get("kline_total") or 0)
+    kline_subscribed = int(progress.get("kline_subscribed") or 0)
+    if quote_total > 0 and quote_subscribed < quote_total:
+        return "订阅中" if quote_subscribed > 0 else "待订阅"
+    if quote_total > 0 and kline_total <= 0:
+        return "订阅中"
+    if kline_total > 0 and kline_subscribed < kline_total:
+        return "订阅中"
+    if (quote_total > 0 or kline_total > 0) and (
+        quote_subscribed >= quote_total and kline_subscribed >= kline_total
+    ):
+        return "已订阅"
+    if fallback == SubscriptionLifecycleStatus.SUBSCRIBED:
+        return "已订阅"
+    if fallback == SubscriptionLifecycleStatus.SUBSCRIBING:
+        return "订阅中"
+    return "待订阅"
+
+
+def _subscription_quote_pending(
+    status: str,
+    subscription_progress: dict[str, Any] | None,
+) -> bool:
+    if isinstance(subscription_progress, dict):
+        quote_total = int(subscription_progress.get("quote_total") or 0)
+        quote_subscribed = int(subscription_progress.get("quote_subscribed") or 0)
+        if quote_total > 0:
+            return quote_subscribed < quote_total
+    return status not in {"正常", "已订阅", "K线待计算", "K线订阅中"}
 
 
 def _subscription_progress_for_row(
@@ -1757,6 +1812,10 @@ def _apply_subscription_progress(
         data["subscription_quote_total"] = None
         data["subscription_kline_subscribed"] = None
         data["subscription_kline_total"] = None
+        data["subscription_kline_call_subscribed"] = None
+        data["subscription_kline_call_total"] = None
+        data["subscription_kline_put_subscribed"] = None
+        data["subscription_kline_put_total"] = None
         data["subscription_subscribed"] = None
         data["subscription_total"] = None
         data["subscription_completion_ratio"] = None
@@ -1765,12 +1824,20 @@ def _apply_subscription_progress(
     quote_total = int(progress.get("quote_total") or 0)
     kline_subscribed = int(progress.get("kline_subscribed") or 0)
     kline_total = int(progress.get("kline_total") or 0)
+    kline_call_subscribed = int(progress.get("kline_call_subscribed") or 0)
+    kline_call_total = int(progress.get("kline_call_total") or 0)
+    kline_put_subscribed = int(progress.get("kline_put_subscribed") or 0)
+    kline_put_total = int(progress.get("kline_put_total") or 0)
     subscribed = int(progress.get("subscribed_objects") or 0)
     total = int(progress.get("total_objects") or 0)
     data["subscription_quote_subscribed"] = quote_subscribed
     data["subscription_quote_total"] = quote_total
     data["subscription_kline_subscribed"] = kline_subscribed
     data["subscription_kline_total"] = kline_total
+    data["subscription_kline_call_subscribed"] = kline_call_subscribed
+    data["subscription_kline_call_total"] = kline_call_total
+    data["subscription_kline_put_subscribed"] = kline_put_subscribed
+    data["subscription_kline_put_total"] = kline_put_total
     data["subscription_subscribed"] = subscribed
     data["subscription_total"] = total
     data["subscription_completion_ratio"] = subscribed / total if total else 0.0

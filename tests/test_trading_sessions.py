@@ -54,6 +54,25 @@ def test_trading_session_state_handles_cross_midnight_night_segment() -> None:
     )
 
 
+def test_trading_session_state_does_not_treat_saturday_night_as_session() -> None:
+    payload = '{"trading_time":{"day":[],"night":[["21:00:00","02:30:00"]]}}'
+
+    assert (
+        trading_session_state_from_payload(
+            payload,
+            now=datetime(2026, 5, 16, 1, 30),
+        ).state
+        == SESSION_IN
+    )
+    assert (
+        trading_session_state_from_payload(
+            payload,
+            now=datetime(2026, 5, 16, 22, 30),
+        ).state
+        == SESSION_OUT
+    )
+
+
 def test_fresh_quote_datetime_overrides_missing_night_segment() -> None:
     now = datetime(2026, 5, 14, 23, 42)
     payload = (

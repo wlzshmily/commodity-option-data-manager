@@ -344,6 +344,42 @@ def test_moneyness_filter_keeps_quote_scope_broad_but_filters_klines() -> None:
     ]
 
 
+def test_moneyness_filter_uses_underlying_quote_price_fallbacks() -> None:
+    connection = sqlite3.connect(":memory:")
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C90", "DCE.a2601C100", "DCE.a2601C110"),
+            put_symbols=("DCE.a2601P90", "DCE.a2601P100", "DCE.a2601P110"),
+            last_seen_at="2026-05-16T00:00:00+00:00",
+        )
+    )
+    QuoteRepository(connection).upsert_quote(
+        normalize_quote(
+            "DCE.a2601",
+            {
+                "datetime": "2026-05-15 19:02:13.000000",
+                "last_price": None,
+                "bid_price1": None,
+                "ask_price1": None,
+                "close": None,
+                "pre_settlement": 100,
+                "pre_close": 101,
+            },
+            received_at="2026-05-16T13:00:00+00:00",
+        )
+    )
+    connection.row_factory = None
+
+    kline_symbols = select_kline_symbols(connection, moneyness_filter="otm")
+
+    assert set(kline_symbols) == {
+        "DCE.a2601",
+        "DCE.a2601C110",
+        "DCE.a2601P90",
+    }
+
+
 def test_stream_quotes_writes_initial_snapshot_only_when_unchanged() -> None:
     connection = sqlite3.connect(":memory:")
     InstrumentRepository(connection).upsert_instruments(
@@ -424,6 +460,10 @@ def test_stream_quotes_writes_initial_snapshot_only_when_unchanged() -> None:
         "quote_total": 3,
         "kline_subscribed": 3,
         "kline_total": 3,
+        "kline_call_subscribed": 1,
+        "kline_call_total": 1,
+        "kline_put_subscribed": 1,
+        "kline_put_total": 1,
         "subscribed_objects": 6,
         "total_objects": 6,
         "completion_ratio": 1.0,
@@ -1241,6 +1281,71 @@ def test_stream_quotes_sticky_adds_moneyness_klines_without_releasing_old(
     }
 
 
+def test_stream_quotes_reports_target_kline_progress_after_sticky_refs(
+    monkeypatch,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    InstrumentRepository(connection).upsert_instruments(
+        normalize_option_chain_discovery(
+            underlying_symbol="DCE.a2601",
+            call_symbols=("DCE.a2601C90", "DCE.a2601C100", "DCE.a2601C110"),
+            put_symbols=("DCE.a2601P90", "DCE.a2601P100", "DCE.a2601P110"),
+            last_seen_at="2026-05-08T00:00:00+00:00",
+        )
+    )
+    clock = {"value": 0.0}
+    monkeypatch.setattr(
+        quote_streamer_module.time,
+        "monotonic",
+        lambda: clock["value"],
+    )
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.quote_refs: dict[str, dict[str, object]] = {}
+
+        def get_quote_list(self, symbols: list[str]) -> list[dict[str, object]]:
+            self.quote_refs = {
+                symbol: {
+                    "datetime": "2026-05-14T09:30:00+08:00",
+                    "last_price": 85.0 if symbol == "DCE.a2601" else 1.0,
+                }
+                for symbol in symbols
+            }
+            return list(self.quote_refs.values())
+
+        def wait_update(self, *, deadline: float) -> bool:
+            clock["value"] += 2.0
+            self.quote_refs["DCE.a2601"]["last_price"] = 100.0
+            return True
+
+        def is_changing(self, quote: object, fields: object) -> bool:
+            return False
+
+        def get_kline_serial(
+            self,
+            symbol: object,
+            *,
+            duration_seconds: int,
+            data_length: int,
+        ) -> list[dict[str, object]]:
+            return []
+
+    progress_events: list[dict[str, object]] = []
+    result = stream_quotes(
+        FakeApi(),
+        connection,
+        cycles=2,
+        wait_deadline_seconds=1,
+        moneyness_filter="otm",
+        moneyness_recalc_seconds=1,
+        progress_callback=progress_events.append,
+    )
+
+    assert progress_events[-1]["kline_subscribed"] <= progress_events[-1]["kline_total"]
+    assert progress_events[-1]["kline_total"] == result.kline_symbol_count
+
+
 def test_stream_quotes_initial_moneyness_subscription_ignores_closed_session(
     monkeypatch,
 ) -> None:
@@ -1384,4 +1489,5 @@ def test_stream_quotes_skips_sticky_moneyness_when_underlying_session_is_closed(
     assert result.moneyness_recalc_count >= 1
     assert result.moneyness_added_kline_count == 0
     assert result.moneyness_skipped_out_of_session_count >= 1
+    assert result.kline_symbol_count == 0
     assert api.kline_symbols == []

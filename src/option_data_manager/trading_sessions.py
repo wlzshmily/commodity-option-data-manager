@@ -56,10 +56,11 @@ def trading_session_state_from_payload(
             day=(),
             night=(),
         )
-    current = current_now.time()
-    in_session = any(_time_in_segment(current, segment) for segment in day_segments)
+    in_session = any(
+        _day_segment_is_active(current_now, segment) for segment in day_segments
+    )
     in_session = in_session or any(
-        _time_in_segment(current, segment) for segment in night_segments
+        _night_segment_is_active(current_now, segment) for segment in night_segments
     )
     return TradingSessionState(
         state=SESSION_IN if in_session or quote_is_live else SESSION_OUT,
@@ -190,6 +191,26 @@ def _time_in_segment(current: time, segment: tuple[time, time]) -> bool:
     if start <= end:
         return start <= current <= end
     return current >= start or current <= end
+
+
+def _day_segment_is_active(current: datetime, segment: tuple[time, time]) -> bool:
+    if current.weekday() > 4:
+        return False
+    return _time_in_segment(current.time(), segment)
+
+
+def _night_segment_is_active(current: datetime, segment: tuple[time, time]) -> bool:
+    start, end = segment
+    current_time = current.time()
+    weekday = current.weekday()
+    if start <= end:
+        return weekday <= 4 and start <= current_time <= end
+    if current_time >= start:
+        return weekday <= 4
+    if current_time <= end:
+        previous_weekday = (weekday - 1) % 7
+        return previous_weekday <= 4
+    return False
 
 
 def _format_time(value: time) -> str:

@@ -854,6 +854,10 @@ def _aggregate_underlying_progress(rows: list[dict]) -> dict:
                     "quote_total": 0,
                     "kline_subscribed": 0,
                     "kline_total": 0,
+                    "kline_call_subscribed": 0,
+                    "kline_call_total": 0,
+                    "kline_put_subscribed": 0,
+                    "kline_put_total": 0,
                     "subscribed_objects": 0,
                     "total_objects": 0,
                     "completion_ratio": 0.0,
@@ -865,6 +869,10 @@ def _aggregate_underlying_progress(rows: list[dict]) -> dict:
                 "quote_total",
                 "kline_subscribed",
                 "kline_total",
+                "kline_call_subscribed",
+                "kline_call_total",
+                "kline_put_subscribed",
+                "kline_put_total",
                 "subscribed_objects",
                 "total_objects",
             ):
@@ -3367,9 +3375,7 @@ function renderUnderlyingRows() {
       : ["数据缺口", "待订阅", "订阅中"].includes(row.status)
       ? "warn"
       : "bad";
-    const subscriptionText = row.subscription_total
-      ? `${fmtNum(row.subscription_subscribed)}/${fmtNum(row.subscription_total)}`
-      : "";
+    const subscriptionLines = subscriptionProgressLines(row);
     const sessionTone = tradingSessionTone(row.trading_session_state);
     return `<tr class="clickable" data-underlying="${escapeHtml(row.underlying_symbol)}">
       <td>${escapeHtml(exchangeNames[row.exchange_id] ?? row.exchange_id)}</td>
@@ -3377,14 +3383,14 @@ function renderUnderlyingRows() {
       <td class="mono">${escapeHtml(row.underlying_symbol)}</td>
       <td class="mono">${escapeHtml(row.expiry_month ?? "--")}</td>
       <td class="mono cell-right">${fmtDaysToExpiry(row.days_to_expiry)}</td>
-      <td class="mono cell-right">${fmtNum(row.call_count)}</td>
-      <td class="mono cell-right">${fmtNum(row.put_count)}</td>
+      <td class="mono cell-right">${fmtNum(overviewSideCount(row, "CALL"))}</td>
+      <td class="mono cell-right">${fmtNum(overviewSideCount(row, "PUT"))}</td>
       <td class="good cell-right">${fmtPct(row.quote_coverage)}</td>
       <td class="${row.iv_coverage < 0.98 ? "warn" : "good"} cell-right">${fmtPct(row.iv_coverage)}</td>
       <td class="${row.kline_count ? "good" : "warn"} cell-center">${row.kline_count ? escapeHtml(fmtDateTime(row.display_kline_time ?? row.latest_kline_time)) : "缺口"}</td>
       <td class="mono cell-center">${escapeHtml(fmtDateTime(row.display_market_time ?? row.latest_quote_time))}</td>
       <td class="cell-center"><span class="tag ${sessionTone}">${escapeHtml(row.trading_session_label ?? "--")}</span></td>
-      <td class="cell-center"><div class="status-cell"><span class="tag ${statusClass}">${escapeHtml(row.status)}</span>${subscriptionText ? `<span class="status-subline mono">${escapeHtml(subscriptionText)}</span>` : ""}</div></td>
+      <td class="cell-center"><div class="status-cell"><span class="tag ${statusClass}">${escapeHtml(row.status)}</span>${subscriptionLines}</div></td>
       <td class="cell-center"><button class="btn btn-sm btn-light" type="button">进入T型</button></td>
     </tr>`;
   }).join("");
@@ -3394,6 +3400,35 @@ function renderUnderlyingRows() {
     await loadQuote(state.selectedUnderlying, { animate: false });
     showPage("quote");
   }));
+}
+
+function overviewSideCount(row, side) {
+  const klineTotal = Number(row.subscription_kline_total ?? 0);
+  if (klineTotal <= 0) return side === "CALL" ? row.call_count : row.put_count;
+  const sideTotal =
+    Number(row.subscription_kline_call_total ?? 0)
+    + Number(row.subscription_kline_put_total ?? 0);
+  if (sideTotal <= 0) return side === "CALL" ? row.call_count : row.put_count;
+  const key = side === "CALL" ? "subscription_kline_call_total" : "subscription_kline_put_total";
+  return Number(row[key] ?? 0);
+}
+
+function subscriptionProgressLines(row) {
+  const quoteTotal = Number(row.subscription_quote_total ?? 0);
+  const quoteSubscribed = Number(row.subscription_quote_subscribed ?? 0);
+  const klineTotal = Number(row.subscription_kline_total ?? 0);
+  const klineSubscribed = Number(row.subscription_kline_subscribed ?? 0);
+  if (quoteTotal <= 0 && klineTotal <= 0) return "";
+  const quoteText = quoteTotal > 0
+    ? `Quote ${fmtNum(quoteSubscribed)}/${fmtNum(quoteTotal)}`
+    : "Quote --";
+  const klineText = klineTotal > 0
+    ? `K线 ${fmtNum(klineSubscribed)}/${fmtNum(klineTotal)}`
+    : "K线 0/0";
+  return `
+    <span class="status-subline mono">${escapeHtml(quoteText)}</span>
+    <span class="status-subline mono">${escapeHtml(klineText)}</span>
+  `;
 }
 
 function selectorRows() {
@@ -3669,17 +3704,16 @@ function sideMaxima(rows) {
   return maxima;
 }
 
-function moneynessClass(strike, side, data) {
-  if (Number(strike) === Number(data.atm_strike)) return "atm-neutral";
-  const last = Number(data.underlying?.last_price);
-  if (!Number.isFinite(last)) return "otm";
-  if (side === "CALL") return Number(strike) < last ? "itm" : "otm";
-  return Number(strike) > last ? "itm" : "otm";
+function optionMoneynessClass(option) {
+  const moneyness = String(option?.moneyness || "").toLowerCase();
+  if (moneyness === "atm") return "atm-neutral";
+  if (moneyness === "itm") return "itm";
+  return "otm";
 }
 
 function quoteRow(row, data, maxima) {
   const payload = JSON.stringify({ strike: row.strike_price, call: row.CALL, put: row.PUT }).replace(/"/g, "&quot;");
-  const atm = Number(row.strike_price) === Number(data.atm_strike) ? " atm" : "";
+  const atm = row.is_atm ? " atm" : "";
   return `<tr class="clickable" data-payload="${payload}">
     ${callCells(row.CALL, row.strike_price, data, maxima)}
     <td class="strike-cell${atm}">${fmtNum(row.strike_price, 0)}</td>
@@ -3688,7 +3722,7 @@ function quoteRow(row, data, maxima) {
 }
 
 function callCells(option, strike, data, maxima) {
-  const tone = `call-side ${moneynessClass(strike, "CALL", data)}`;
+  const tone = `call-side ${optionMoneynessClass(option)}`;
   return [
     barCell(option, { displayKey: "volume", max: maxima.CALL.volume, side: "call", kind: "quantity", className: tone }),
     barCell(option, { displayKey: "open_interest", max: maxima.CALL.open_interest, side: "call", kind: "quantity", className: tone }),
@@ -3704,7 +3738,7 @@ function callCells(option, strike, data, maxima) {
 }
 
 function putCells(option, strike, data, maxima) {
-  const tone = `put-side ${moneynessClass(strike, "PUT", data)}`;
+  const tone = `put-side ${optionMoneynessClass(option)}`;
   return [
     barCell(option, { displayKey: "bid_price1", energyKey: "bid_volume1", max: maxima.PUT.bid_volume1, side: "put", kind: "depth", className: tone, digits: 3, priceClass: "price-bid" }),
     barCell(option, { displayKey: "ask_price1", energyKey: "ask_volume1", max: maxima.PUT.ask_volume1, side: "put", kind: "depth", className: `${tone} ask`, digits: 3, priceClass: "price-ask" }),

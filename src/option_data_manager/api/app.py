@@ -747,7 +747,15 @@ def create_app(
                     contract_list_ready=bool(manager_status["healthy"]),
                 )
             started_at = datetime.now(UTC).isoformat()
-            report_dir = Path("docs/qa/live-evidence/quote-stream-runtime")
+            configured_report_dir = _safe_get_service_value(
+                service_state,
+                "quote_stream.report_dir",
+            )
+            report_dir = (
+                Path(configured_report_dir)
+                if configured_report_dir
+                else Path("docs/qa/live-evidence/quote-stream-runtime")
+            )
             report_dir.mkdir(parents=True, exist_ok=True)
             service_state.set_value("quote_stream.status", QuoteStreamState.STARTING.value)
             service_state.set_value("quote_stream.running", "false")
@@ -2841,6 +2849,10 @@ def _aggregate_underlying_progress(
                     "quote_total": 0,
                     "kline_subscribed": 0,
                     "kline_total": 0,
+                    "kline_call_subscribed": 0,
+                    "kline_call_total": 0,
+                    "kline_put_subscribed": 0,
+                    "kline_put_total": 0,
                     "subscribed_objects": 0,
                     "total_objects": 0,
                     "completion_ratio": 0.0,
@@ -2852,6 +2864,10 @@ def _aggregate_underlying_progress(
                 "quote_total",
                 "kline_subscribed",
                 "kline_total",
+                "kline_call_subscribed",
+                "kline_call_total",
+                "kline_put_subscribed",
+                "kline_put_total",
                 "subscribed_objects",
                 "total_objects",
             ):
