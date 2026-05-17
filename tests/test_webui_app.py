@@ -51,6 +51,12 @@ def test_overview_call_put_counts_use_subscription_kline_scope_when_running() ->
     assert "overviewSideCount(row, \"PUT\")" in WEBUI_JS
 
 
+def test_overview_renders_operations_alerts() -> None:
+    assert 'id="operations-alerts"' in INDEX_HTML
+    assert "function renderOperationsAlerts()" in WEBUI_JS
+    assert "state.overview?.operations?.alerts" in WEBUI_JS
+
+
 def test_webui_product_label_prefers_tqsdk_display_name_and_ad_fallback_is_alloy() -> None:
     assert 'ad: "铝合金"' in WEBUI_JS
     assert "function productLabelForRow(row)" in WEBUI_JS

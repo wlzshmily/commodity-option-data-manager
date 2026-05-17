@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 import json
 import re
@@ -532,6 +532,7 @@ def _collection_progress(
     *,
     scope: str = "routine-market-current-slice",
 ) -> dict[str, Any]:
+    stale_running_batches = _stale_running_batches(connection, scope=scope)
     row = connection.execute(
         """
         SELECT
@@ -573,6 +574,8 @@ def _collection_progress(
         "latest_batch_update": data.get("latest_batch_update"),
         "latest_batch_completion": data.get("latest_batch_completion"),
         "recent_failures": _collection_failures(connection, scope=scope),
+        "stale_running_batches": len(stale_running_batches),
+        "recent_stale_running_batches": stale_running_batches[:5],
     }
 
 
@@ -612,6 +615,11 @@ def _collection_progress_for_predicate(
     where_sql: str,
     where_params: tuple[Any, ...],
 ) -> dict[str, Any]:
+    stale_running_batches = _stale_running_batches_for_predicate(
+        connection,
+        where_sql=where_sql,
+        where_params=where_params,
+    )
     row = connection.execute(
         f"""
         SELECT
@@ -657,7 +665,100 @@ def _collection_progress_for_predicate(
             where_sql=where_sql,
             where_params=where_params,
         ),
+        "stale_running_batches": len(stale_running_batches),
+        "recent_stale_running_batches": stale_running_batches[:5],
     }
+
+
+def _stale_running_batches(
+    connection: sqlite3.Connection,
+    *,
+    scope: str,
+    limit: int = 10,
+    max_age_minutes: int = 30,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT
+            underlying_symbol,
+            batch_index,
+            exchange_id,
+            product_id,
+            option_count,
+            status,
+            attempt_count,
+            last_error,
+            updated_at
+        FROM collection_plan_batches
+        WHERE plan_scope = ?
+          AND stale = 0
+          AND status = 'running'
+        ORDER BY updated_at, underlying_symbol, batch_index
+        """,
+        (scope,),
+    ).fetchall()
+    return _filter_stale_running_rows(
+        [_row_dict(row) for row in rows],
+        limit=limit,
+        max_age_minutes=max_age_minutes,
+    )
+
+
+def _stale_running_batches_for_predicate(
+    connection: sqlite3.Connection,
+    *,
+    where_sql: str,
+    where_params: tuple[Any, ...],
+    limit: int = 10,
+    max_age_minutes: int = 30,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        f"""
+        SELECT
+            underlying_symbol,
+            batch_index,
+            exchange_id,
+            product_id,
+            option_count,
+            status,
+            attempt_count,
+            last_error,
+            updated_at
+        FROM collection_plan_batches
+        WHERE {where_sql}
+          AND stale = 0
+          AND status = 'running'
+        ORDER BY updated_at, underlying_symbol, batch_index
+        """,
+        where_params,
+    ).fetchall()
+    return _filter_stale_running_rows(
+        [_row_dict(row) for row in rows],
+        limit=limit,
+        max_age_minutes=max_age_minutes,
+    )
+
+
+def _filter_stale_running_rows(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int,
+    max_age_minutes: int,
+) -> list[dict[str, Any]]:
+    now = datetime.now(UTC)
+    threshold = timedelta(minutes=max_age_minutes)
+    stale_rows: list[dict[str, Any]] = []
+    for row in rows:
+        updated_at = _parse_datetime(row.get("updated_at"))
+        if updated_at is None:
+            continue
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=UTC)
+        age = now - updated_at.astimezone(UTC)
+        if age >= threshold:
+            row["age_seconds"] = int(age.total_seconds())
+            stale_rows.append(row)
+    return stale_rows[:limit]
 
 
 def _collection_failures(

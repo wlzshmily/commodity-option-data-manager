@@ -16,6 +16,7 @@ from option_data_manager.api.app import (
     QuoteStreamState,
     create_app as create_local_api_app,
 )
+from option_data_manager.operations_monitor import build_operations_monitor
 from option_data_manager.realtime_health import build_realtime_health
 from option_data_manager.service_state import ServiceStateRepository
 from option_data_manager.sqlite_runtime import configure_sqlite_runtime
@@ -205,6 +206,11 @@ def _overview_payload(
         "quote_stream": quote_stream,
     }
     _align_summary_with_quote_stream_progress(payload, quote_stream)
+    payload["operations"] = build_operations_monitor(
+        overview=payload,
+        quote_stream=quote_stream,
+        metrics_worker=quote_stream.get("metrics_worker"),
+    )
     return payload
 
 
@@ -431,7 +437,45 @@ def _quote_stream_payload(
             service_state.get_value("quote_stream.contract_list_ready") or "false"
         )
         == "true",
+        "metrics_worker": _metrics_worker_payload(service_state),
     }
+
+
+def _metrics_worker_payload(service_state: ServiceStateRepository) -> dict:
+    pids = _json_int_list(service_state.get_value("metrics_worker.pids"))
+    live_pids = [pid for pid in pids if _pid_is_metrics_worker(pid)]
+    report_dir = service_state.get_value("metrics_worker.report_dir")
+    report = _metrics_worker_report(report_dir)
+    report_status = str(report.get("status") or "").lower()
+    running = (
+        (service_state.get_value("metrics_worker.running") or "false") == "true"
+        and bool(live_pids)
+    )
+    status = "running" if running else "stopped"
+    if not running and report_status == "failed":
+        status = "failed"
+    return {
+        "status": status,
+        "running": running,
+        "pids": live_pids,
+        "report_dir": report_dir,
+        "started_at": service_state.get_value("metrics_worker.started_at"),
+        "finished_at": service_state.get_value("metrics_worker.finished_at")
+        or report.get("finished_at"),
+        "message": service_state.get_value("metrics_worker.message") or report.get("error"),
+        "report": report,
+    }
+
+
+def _metrics_worker_report(report_dir: str | None) -> dict:
+    if not report_dir:
+        return {}
+    path = Path(report_dir) / "metrics-worker.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _quote_stream_status_value(
@@ -1160,6 +1204,24 @@ def _pid_is_quote_stream(pid: int) -> bool:
         return False
 
 
+def _pid_is_metrics_worker(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _windows_pid_command_line_contains(
+            pid,
+            "option_data_manager.cli.metrics_worker",
+        )
+    command_line_path = Path(f"/proc/{pid}/cmdline")
+    try:
+        return "option_data_manager.cli.metrics_worker" in command_line_path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except OSError:
+        return False
+
+
 def _windows_pid_command_line_contains(pid: int, needle: str) -> bool:
     try:
         completed = subprocess.run(
@@ -1250,6 +1312,7 @@ INDEX_HTML = """<!doctype html>
               <div class="metric-card"><span>采集分片</span><strong id="summary-batches">--</strong></div>
             </div>
           </div>
+          <div class="notice bad d-none" id="operations-alerts"></div>
 
           <section class="panel card">
             <div class="panel-header">
@@ -2939,6 +3002,7 @@ function renderOverview() {
   $("#summary-kline").textContent = summary.kline_coverage >= 0.999 ? "正常" : "补齐中";
   $("#summary-batches").textContent = fmtCollectionProgress(state.overview.collection);
   updateHealthPill(summary);
+  renderOperationsAlerts();
   renderExchangeCards();
   renderCollectionProgress();
   renderExchangeTabs();
@@ -2949,6 +3013,24 @@ function updateHealthPill(summary) {
   const hasData = Number(summary.active_options) > 0;
   $("#health-text").textContent = hasData ? "数据已加载" : "等待采集";
   $("#health-dot").classList.toggle("warn", !hasData);
+}
+
+function renderOperationsAlerts() {
+  const container = $("#operations-alerts");
+  const alerts = state.overview?.operations?.alerts ?? [];
+  container.classList.toggle("d-none", alerts.length === 0);
+  if (!alerts.length) {
+    container.innerHTML = "";
+    return;
+  }
+  const critical = alerts.some((alert) => alert.severity === "critical");
+  container.classList.toggle("bad", critical);
+  container.classList.toggle("warn", !critical);
+  container.innerHTML = alerts.slice(0, 4).map((alert) => {
+    const samples = alert.samples?.length ? ` · ${alert.samples.join(" / ")}` : "";
+    const detail = alert.detail ? ` · ${alert.detail}` : "";
+    return `<div><strong>${escapeHtml(alert.title)}</strong>：${escapeHtml(alert.message)}${escapeHtml(samples)}${escapeHtml(detail)}</div>`;
+  }).join("");
 }
 
 function renderExchangeCards() {

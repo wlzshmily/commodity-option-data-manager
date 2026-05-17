@@ -654,6 +654,67 @@ def test_quote_stream_progress_resets_when_stopped(tmp_path: Path) -> None:
     assert payload["progress"]["total_objects"] == 0
 
 
+def test_api_status_surfaces_operations_alerts_for_runtime_data_gaps(
+    tmp_path: Path,
+) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.pid = 34000
+
+        def poll(self):
+            return None
+
+    report_dir = tmp_path / "quote-stream-runtime"
+    report_dir.mkdir()
+    (report_dir / "worker-00-of-01.json").write_text(
+        """
+        {
+          "status": "success",
+          "progress": {
+            "status": "running",
+            "started_at": "2026-05-17T00:00:00+00:00",
+            "updated_at": "2026-05-17T00:01:00+00:00",
+            "quote_subscribed": 3,
+            "quote_total": 3,
+            "kline_subscribed": 3,
+            "kline_total": 3,
+            "subscribed_objects": 6,
+            "total_objects": 6,
+            "completion_ratio": 1.0
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
+    _insert_simple_chain(
+        connection,
+        underlying_symbol="DCE.pp2606",
+        exchange_id="DCE",
+        product_id="pp",
+        delivery_year=2026,
+        delivery_month=6,
+        received_at="2026-05-17T00:00:30+00:00",
+    )
+    app.state.quote_stream_processes["processes"] = [FakeProcess()]
+    app.state.service_state.set_value("quote_stream.running", "true")
+    app.state.service_state.set_value("quote_stream.worker_count", "1")
+    app.state.service_state.set_value("quote_stream.report_dir", str(report_dir))
+    app.state.service_state.set_value("quote_stream.pids", "[34000]")
+    client = TestClient(app)
+
+    payload = client.get("/api/status").json()
+
+    codes = {alert["code"] for alert in payload["operations"]["alerts"]}
+    assert payload["operations"]["status"] == "critical"
+    assert "metrics_worker_not_running" in codes
+    assert "subscribed_kline_data_missing" in codes
+    assert "subscribed_metrics_data_missing" in codes
+    assert payload["quote_stream"]["metrics_worker"]["running"] is False
+
+
 def test_quote_stream_start_blocks_without_credentials() -> None:
     connection = sqlite3.connect(":memory:", check_same_thread=False)
     app = create_app(connection, database_path=":memory:", protector=PlainTextProtector())
@@ -736,3 +797,98 @@ def test_options_api_exposes_tqsdk_date_fields_and_derived_days() -> None:
     assert "days_to_expiry" not in row
     assert "days_to_expire_datetime" in row
     assert "days_to_last_exercise_datetime" in row
+
+
+def _insert_simple_chain(
+    connection: sqlite3.Connection,
+    *,
+    underlying_symbol: str,
+    exchange_id: str,
+    product_id: str,
+    delivery_year: int,
+    delivery_month: int,
+    received_at: str,
+) -> None:
+    instrument_id = underlying_symbol.split(".", maxsplit=1)[-1]
+    call_symbol = f"{underlying_symbol}C100"
+    put_symbol = f"{underlying_symbol}P100"
+    connection.executemany(
+        """
+        INSERT INTO instruments (
+            symbol,
+            exchange_id,
+            product_id,
+            instrument_id,
+            instrument_name,
+            ins_class,
+            underlying_symbol,
+            option_class,
+            strike_price,
+            delivery_year,
+            delivery_month,
+            price_tick,
+            volume_multiple,
+            expired,
+            active,
+            inactive_reason,
+            last_seen_at,
+            raw_payload_json
+        )
+        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 1, NULL, '2026-05-17T00:00:00+00:00', '{}')
+        """,
+        [
+            (
+                underlying_symbol,
+                exchange_id,
+                product_id,
+                instrument_id,
+                "FUTURE",
+                None,
+                None,
+                None,
+                delivery_year,
+                delivery_month,
+            ),
+            (
+                call_symbol,
+                exchange_id,
+                product_id,
+                f"{instrument_id}C100",
+                "OPTION",
+                underlying_symbol,
+                "CALL",
+                100,
+                None,
+                None,
+            ),
+            (
+                put_symbol,
+                exchange_id,
+                product_id,
+                f"{instrument_id}P100",
+                "OPTION",
+                underlying_symbol,
+                "PUT",
+                100,
+                None,
+                None,
+            ),
+        ],
+    )
+    connection.executemany(
+        """
+        INSERT INTO quote_current (
+            symbol,
+            source_datetime,
+            received_at,
+            last_price,
+            raw_payload_json
+        )
+        VALUES (?, '2026-05-17 09:00:00.000000', ?, 1, '{}')
+        """,
+        [
+            (underlying_symbol, received_at),
+            (call_symbol, received_at),
+            (put_symbol, received_at),
+        ],
+    )

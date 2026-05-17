@@ -89,6 +89,53 @@ def test_overview_can_prefer_parallel_collection_progress() -> None:
     ]
 
 
+def test_overview_flags_stale_running_collection_batches() -> None:
+    connection = sqlite3.connect(":memory:")
+    read_model = WebuiReadModel(connection)
+    connection.execute(
+        """
+        INSERT INTO collection_plan_batches (
+            plan_scope,
+            underlying_symbol,
+            batch_index,
+            exchange_id,
+            product_id,
+            option_symbols_json,
+            option_count,
+            status,
+            attempt_count,
+            last_error,
+            created_at,
+            updated_at,
+            completed_at,
+            stale
+        )
+        VALUES (
+            'routine-market-current-slice',
+            'DCE.pg2610',
+            4,
+            'DCE',
+            'pg',
+            '[]',
+            40,
+            'running',
+            1,
+            NULL,
+            '2026-05-10T17:00:00+00:00',
+            '2026-05-10T17:46:44+00:00',
+            NULL,
+            0
+        )
+        """
+    )
+
+    progress = read_model.overview()["collection"]
+
+    assert progress["running_batches"] == 1
+    assert progress["stale_running_batches"] == 1
+    assert progress["recent_stale_running_batches"][0]["underlying_symbol"] == "DCE.pg2610"
+
+
 def test_overview_can_filter_to_current_realtime_quote_rows() -> None:
     connection = sqlite3.connect(":memory:")
     read_model = WebuiReadModel(connection)

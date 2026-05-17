@@ -68,3 +68,24 @@ Operational consequence:
 
 - Future deployment notes must record the stop/quiesce evidence and the
   data-readiness gate outcome, not only HTTP 200 smoke results.
+
+## 2026-05-17 OPS-006 Code-Level Monitoring Follow-Up
+
+The deployment safety gate is now backed by runtime monitoring in code:
+
+- `/api/status` includes an `operations` object with alert severity, counts, and
+  samples.
+- WebUI overview renders an operational alert banner when the monitor reports a
+  warning or critical condition.
+- Collection progress includes stale active `running` batch samples.
+- Quote-stream status includes metrics-worker status so the API can tell when
+  realtime subscription is alive but IV/Greeks refresh is not.
+- Alerts cover stale running batches, incomplete current-slice work, metrics
+  worker not-running/failed states, and subscription-complete rows with missing
+  K-line or metrics current-slice rows.
+
+Verification:
+
+- `uv run python -m pytest -s -q` passed 141 tests.
+- `uv run python -m compileall -q src tests option_data_manager` passed.
+- `bash scripts/agentic-sdlc/check-agentic-sdlc.sh` passed.

@@ -24,6 +24,7 @@ from option_data_manager.api_keys import ApiKeyRecord, ApiKeyRepository
 from option_data_manager.collection_state import CollectionStateRepository
 from option_data_manager.klines import KlineRepository
 from option_data_manager.option_metrics import OptionMetricsRepository
+from option_data_manager.operations_monitor import build_operations_monitor
 from option_data_manager.quote_streamer import (
     DEFAULT_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS,
     DEFAULT_MONEYNESS_FILTER,
@@ -207,6 +208,7 @@ class QuoteStreamResponse(BaseModel):
     contract_list_ready: bool = False
     contract_months: str | None = None
     min_days_to_expiry: int | None = None
+    metrics_worker: dict[str, Any] | None = None
 
 
 def create_app(
@@ -367,17 +369,25 @@ def create_app(
         overview = read_model.overview(limit=500)
         api_summary = service_state.api_summary()
         latest_run = AcquisitionRepository(connection).list_runs(limit=1)
+        quote_stream = _quote_stream_status(
+            service_state,
+            quote_stream_processes,
+            metrics_process_table=metrics_worker_processes,
+            connection=connection,
+        )
+        operations = build_operations_monitor(
+            overview=overview,
+            quote_stream=quote_stream,
+            metrics_worker=quote_stream.get("metrics_worker"),
+        )
         return {
             "status": _overall_status(overview, latest_run),
             "database_path": database_path,
             "summary": overview["summary"],
             "collection": overview["collection"],
             "refresh": _refresh_status(service_state),
-            "quote_stream": _quote_stream_status(
-                service_state,
-                quote_stream_processes,
-                connection=connection,
-            ),
+            "quote_stream": quote_stream,
+            "operations": operations,
             "latest_run": latest_run[0].__dict__ if latest_run else None,
             "api": {
                 "bind": settings.get_value(API_BIND_KEY) or "127.0.0.1",
@@ -2161,6 +2171,7 @@ def _quote_stream_status(
     service_state: ServiceStateRepository,
     process_table: dict[str, list[Any]],
     *,
+    metrics_process_table: dict[str, list[Any]] | None = None,
     connection: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     processes = process_table.get("processes", [])
@@ -2254,6 +2265,10 @@ def _quote_stream_status(
         service_state,
         "quote_stream.contract_list_ready",
     )
+    metrics_worker = _metrics_worker_status(
+        service_state,
+        metrics_process_table or {"processes": []},
+    )
     return {
         "status": status.value,
         "running": running,
@@ -2271,7 +2286,66 @@ def _quote_stream_status(
         "contract_list_ready": contract_list_ready,
         "contract_months": contract_months,
         "min_days_to_expiry": min_days_to_expiry,
+        "metrics_worker": metrics_worker,
     }
+
+
+def _metrics_worker_status(
+    service_state: ServiceStateRepository,
+    process_table: dict[str, list[Any]],
+) -> dict[str, Any]:
+    processes = process_table.get("processes", [])
+    attached_pids = [int(process.pid) for process in processes if process.poll() is None]
+    persisted_pids = _json_int_list(
+        _safe_get_service_value(service_state, "metrics_worker.pids")
+    )
+    live_persisted_pids = [
+        pid for pid in persisted_pids if pid not in attached_pids and _pid_is_metrics_worker(pid)
+    ]
+    live_pids = attached_pids or live_persisted_pids
+    report_dir = _safe_get_service_value(service_state, "metrics_worker.report_dir")
+    report = _metrics_worker_report(report_dir)
+    persisted_running = _safe_get_service_value(service_state, "metrics_worker.running")
+    running = bool(live_pids)
+    status = "running" if running else "stopped"
+    report_status = str(report.get("status") or "").lower()
+    if not running and report_status == "failed":
+        status = "failed"
+    elif not running and (persisted_running or "false") == "true":
+        _safe_set_service_value(service_state, "metrics_worker.running", "false")
+        _safe_set_service_value(
+            service_state,
+            "metrics_worker.finished_at",
+            datetime.now(UTC).isoformat(),
+        )
+        _safe_set_service_value(
+            service_state,
+            "metrics_worker.message",
+            "指标刷新 worker 已退出。",
+        )
+    return {
+        "status": status,
+        "running": running,
+        "pids": live_pids,
+        "report_dir": report_dir,
+        "started_at": _safe_get_service_value(service_state, "metrics_worker.started_at"),
+        "finished_at": _safe_get_service_value(service_state, "metrics_worker.finished_at")
+        or report.get("finished_at"),
+        "message": _safe_get_service_value(service_state, "metrics_worker.message")
+        or report.get("error"),
+        "report": report,
+    }
+
+
+def _metrics_worker_report(report_dir: str | None) -> dict[str, Any]:
+    if not report_dir:
+        return {}
+    path = Path(report_dir) / "metrics-worker.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _safe_get_service_value(
@@ -2386,7 +2460,7 @@ def _safe_set_service_value(
 ) -> bool:
     try:
         service_state.set_value(key, value)
-    except (sqlite3.OperationalError, SystemError) as exc:
+    except (sqlite3.DatabaseError, SystemError) as exc:
         if _is_sqlite_retryable(exc):
             return False
         raise
@@ -2408,7 +2482,7 @@ def _safe_append_service_log(
             message=message,
             context=context,
         )
-    except (sqlite3.OperationalError, SystemError) as exc:
+    except (sqlite3.DatabaseError, SystemError) as exc:
         if _is_sqlite_retryable(exc):
             return False
         raise
@@ -2430,19 +2504,19 @@ def _safe_record_request(
             status_code=status_code,
             latency_ms=latency_ms,
         )
-    except (sqlite3.OperationalError, SystemError) as exc:
+    except (sqlite3.DatabaseError, SystemError) as exc:
         if _is_sqlite_retryable(exc):
             return False
         raise
     return True
 
 
-def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+def _is_sqlite_busy(exc: sqlite3.DatabaseError) -> bool:
     message = str(exc).lower()
     return "database is locked" in message or "database is busy" in message
 
 
-def _is_sqlite_retryable(exc: sqlite3.OperationalError | SystemError) -> bool:
+def _is_sqlite_retryable(exc: sqlite3.DatabaseError | SystemError) -> bool:
     message = str(exc).lower()
     if isinstance(exc, SystemError):
         return (
