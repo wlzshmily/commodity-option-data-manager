@@ -13,11 +13,13 @@
 - Linux server deployment: `docs/operations/linux-server-deployment.md`
 - Operations deployment log: `docs/operations/deployment-log.md`
 - Local server lifecycle script: `scripts/odm-server.sh`
+- OPS-007 resource/log monitoring spec: `docs/specs/SPEC-003-ops-resource-log-monitoring/`
 
 ## Current Active Plan
 
-Release-readiness pass is complete for the local production release covering five commodity option exchanges, including WebUI/API controls for realtime Quote/Kline stream workers, runtime subscription-object progress, current-realtime-slice display semantics, near-contract remaining-day filtering, enum-driven realtime state, WEBUI-021 overview lifecycle consistency, and WEBUI-022 live T型报价 freshness during Kline setup.
+Release-readiness pass is complete for the local production release covering five commodity option exchanges, including WebUI/API controls for realtime Quote/Kline stream workers, runtime subscription-object progress, current-realtime-slice display semantics, near-contract remaining-day filtering, enum-driven realtime state, WEBUI-021 overview lifecycle consistency, WEBUI-022 live T型报价 freshness during Kline setup, and OPS-007 resource/log keepalive monitoring.
 
 ## Draft Follow-Up Specs
 
 - `docs/specs/SPEC-001-dynamic-contract-manager/`: v0.2 candidate for pre-session contract-universe refresh and active/inactive contract management. Implementation is not approved while requirements still contain open clarification items.
+- `docs/specs/SPEC-003-ops-resource-log-monitoring/`: approved OPS-007 spec for SQLite retry visibility, telemetry retention, disk/CPU/memory monitoring, and runtime log keepalive.

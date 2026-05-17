@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
 from typing import Any
 
 from .storage import Migration, apply_migrations
+from .sqlite_runtime import is_sqlite_retryable
 
 
 SERVICE_STATE_MIGRATION = Migration(
@@ -109,7 +110,7 @@ class ServiceStateRepository:
                 (key, value, now),
             )
             self._connection.commit()
-        except sqlite3.OperationalError:
+        except sqlite3.DatabaseError:
             self._connection.rollback()
             raise
 
@@ -145,9 +146,47 @@ class ServiceStateRepository:
                 ),
             )
             self._connection.commit()
-        except sqlite3.OperationalError:
+        except sqlite3.DatabaseError:
             self._connection.rollback()
             raise
+
+    def cleanup_request_metrics(
+        self,
+        *,
+        retention_days: int,
+        max_rows: int,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        """Delete old API metric rows by age and total row cap."""
+
+        cutoff = (now or datetime.now(UTC)) - timedelta(days=max(0, retention_days))
+        before = self._count_rows("api_request_metrics")
+        deleted_by_age = self._connection.execute(
+            "DELETE FROM api_request_metrics WHERE created_at < ?",
+            (cutoff.isoformat(),),
+        ).rowcount
+        deleted_by_cap = 0
+        if max_rows > 0:
+            deleted_by_cap = self._connection.execute(
+                """
+                DELETE FROM api_request_metrics
+                WHERE metric_id NOT IN (
+                    SELECT metric_id
+                    FROM api_request_metrics
+                    ORDER BY metric_id DESC
+                    LIMIT ?
+                )
+                """,
+                (max_rows,),
+            ).rowcount
+        self._connection.commit()
+        after = self._count_rows("api_request_metrics")
+        return {
+            "before": before,
+            "after": after,
+            "deleted_by_age": max(0, int(deleted_by_age or 0)),
+            "deleted_by_cap": max(0, int(deleted_by_cap or 0)),
+        }
 
     def api_summary(self) -> ApiMetricSummary:
         row = self._connection.execute(
@@ -164,6 +203,9 @@ class ServiceStateRepository:
             error_count=int(row["error_count"] or 0),
             average_latency_ms=float(row["average_latency_ms"] or 0.0),
         )
+
+    def _count_rows(self, table: str) -> int:
+        return int(self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
 
 class ServiceLogRepository:
@@ -207,8 +249,17 @@ class ServiceLogRepository:
                 ),
             )
             self._connection.commit()
-        except sqlite3.OperationalError:
+        except sqlite3.DatabaseError as exc:
             self._connection.rollback()
+            if is_sqlite_retryable(exc):
+                return ServiceLogRecord(
+                    log_id=0,
+                    created_at=created_at,
+                    level=normalized_level,
+                    category=cleaned_category,
+                    message=cleaned_message,
+                    context_json=_context_json(context),
+                )
             raise
         return ServiceLogRecord(
             log_id=int(cursor.lastrowid),
@@ -250,6 +301,47 @@ class ServiceLogRepository:
                 (safe_limit,),
             ).fetchall()
         return [ServiceLogRecord(**dict(row)) for row in rows]
+
+    def cleanup_logs(
+        self,
+        *,
+        retention_days: int,
+        max_rows: int,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        """Delete old service log rows by age and total row cap."""
+
+        cutoff = (now or datetime.now(UTC)) - timedelta(days=max(0, retention_days))
+        before = self._count_rows("service_logs")
+        deleted_by_age = self._connection.execute(
+            "DELETE FROM service_logs WHERE created_at < ?",
+            (cutoff.isoformat(),),
+        ).rowcount
+        deleted_by_cap = 0
+        if max_rows > 0:
+            deleted_by_cap = self._connection.execute(
+                """
+                DELETE FROM service_logs
+                WHERE log_id NOT IN (
+                    SELECT log_id
+                    FROM service_logs
+                    ORDER BY log_id DESC
+                    LIMIT ?
+                )
+                """,
+                (max_rows,),
+            ).rowcount
+        self._connection.commit()
+        after = self._count_rows("service_logs")
+        return {
+            "before": before,
+            "after": after,
+            "deleted_by_age": max(0, int(deleted_by_age or 0)),
+            "deleted_by_cap": max(0, int(deleted_by_cap or 0)),
+        }
+
+    def _count_rows(self, table: str) -> int:
+        return int(self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
 
 def _context_json(context: dict[str, Any] | None) -> str:

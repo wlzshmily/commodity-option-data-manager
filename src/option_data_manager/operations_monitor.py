@@ -6,6 +6,9 @@ from typing import Any
 
 
 _SEVERITY_RANK = {"info": 0, "warn": 1, "critical": 2}
+_TWO_GIB = 2 * 1024 * 1024 * 1024
+_RUNTIME_LOG_WARN_BYTES = 512 * 1024 * 1024
+_WAL_WARN_BYTES = 128 * 1024 * 1024
 
 
 def build_operations_monitor(
@@ -13,12 +16,18 @@ def build_operations_monitor(
     overview: dict[str, Any],
     quote_stream: dict[str, Any] | None = None,
     metrics_worker: dict[str, Any] | None = None,
+    resources: dict[str, Any] | None = None,
+    sqlite_runtime: dict[str, Any] | None = None,
+    telemetry_cleanup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build operator-facing alerts from current runtime/readiness state."""
 
     alerts: list[dict[str, Any]] = []
     quote_stream = quote_stream or {}
     metrics_worker = metrics_worker or {}
+    resources = resources or {}
+    sqlite_runtime = sqlite_runtime or {}
+    telemetry_cleanup = telemetry_cleanup or {}
     collection = overview.get("collection") or {}
     rows = overview.get("underlyings") or []
     progress = quote_stream.get("progress") or {}
@@ -112,6 +121,10 @@ def build_operations_monitor(
                 samples=_row_samples(metric_gap_rows),
             )
 
+    _append_resource_alerts(alerts, resources)
+    _append_sqlite_runtime_alerts(alerts, sqlite_runtime)
+    _append_telemetry_cleanup_alerts(alerts, telemetry_cleanup)
+
     status = "ok"
     if alerts:
         worst = max(alerts, key=lambda item: _SEVERITY_RANK.get(item["severity"], 0))
@@ -123,6 +136,9 @@ def build_operations_monitor(
         "critical_count": sum(1 for item in alerts if item["severity"] == "critical"),
         "warn_count": sum(1 for item in alerts if item["severity"] == "warn"),
         "alerts": alerts,
+        "resources": resources,
+        "sqlite_runtime": sqlite_runtime,
+        "telemetry_cleanup": telemetry_cleanup,
     }
 
 
@@ -189,3 +205,158 @@ def _batch_label(item: Any) -> str:
     if batch is None:
         return f"{underlying}@{updated_at}"
     return f"{underlying}#{batch}@{updated_at}"
+
+
+def _append_resource_alerts(alerts: list[dict[str, Any]], resources: dict[str, Any]) -> None:
+    disk = resources.get("disk") or {}
+    free_percent = _float_value(disk.get("free_percent"))
+    free_bytes = _int_value(disk.get("free_bytes"))
+    if disk.get("status") == "ok":
+        if free_percent < 10.0 or free_bytes < _TWO_GIB:
+            _append_alert(
+                alerts,
+                severity="critical",
+                code="disk_space_critical",
+                title="磁盘空间不足",
+                message=(
+                    f"数据目录所在磁盘剩余 {free_percent:.1f}% / "
+                    f"{_format_bytes(free_bytes)}，需要释放空间后再继续运行。"
+                ),
+                detail=disk.get("path"),
+            )
+        elif free_percent < 15.0:
+            _append_alert(
+                alerts,
+                severity="warn",
+                code="disk_space_low",
+                title="磁盘空间偏低",
+                message=(
+                    f"数据目录所在磁盘剩余 {free_percent:.1f}% / "
+                    f"{_format_bytes(free_bytes)}，请关注日志和 SQLite 文件增长。"
+                ),
+                detail=disk.get("path"),
+            )
+
+    memory = resources.get("memory") or {}
+    available_percent = _float_value(memory.get("available_percent"))
+    if memory.get("status") == "ok":
+        if available_percent < 10.0:
+            _append_alert(
+                alerts,
+                severity="critical",
+                code="memory_available_critical",
+                title="内存可用率过低",
+                message=f"系统可用内存约 {available_percent:.1f}%，worker 可能不稳定。",
+            )
+        elif available_percent < 15.0:
+            _append_alert(
+                alerts,
+                severity="warn",
+                code="memory_available_low",
+                title="内存可用率偏低",
+                message=f"系统可用内存约 {available_percent:.1f}%，建议观察 worker。"
+            )
+
+    cpu = resources.get("cpu") or {}
+    load_ratio = _float_value(cpu.get("load_5m_ratio"))
+    if cpu.get("status") == "ok":
+        if load_ratio >= 2.0:
+            _append_alert(
+                alerts,
+                severity="critical",
+                code="cpu_load_critical",
+                title="CPU 负载过高",
+                message=f"5 分钟负载约为 CPU 核数的 {load_ratio:.2f} 倍。",
+            )
+        elif load_ratio >= 1.5:
+            _append_alert(
+                alerts,
+                severity="warn",
+                code="cpu_load_high",
+                title="CPU 负载偏高",
+                message=f"5 分钟负载约为 CPU 核数的 {load_ratio:.2f} 倍。",
+            )
+
+    sqlite_files = resources.get("sqlite") or {}
+    wal_bytes = _int_value(sqlite_files.get("total_wal_size_bytes"))
+    if wal_bytes > _WAL_WARN_BYTES:
+        _append_alert(
+            alerts,
+            severity="warn",
+            code="sqlite_wal_large",
+            title="SQLite WAL 文件偏大",
+            message=f"SQLite WAL 总体积约 {_format_bytes(wal_bytes)}，需要关注 checkpoint。"
+        )
+
+    runtime_logs = resources.get("runtime_logs") or {}
+    runtime_log_bytes = _int_value(runtime_logs.get("total_bytes"))
+    if runtime_log_bytes > _RUNTIME_LOG_WARN_BYTES:
+        _append_alert(
+            alerts,
+            severity="warn",
+            code="runtime_logs_large",
+            title="运行日志体积偏大",
+            message=(
+                f"运行日志目录约 {_format_bytes(runtime_log_bytes)}，"
+                "需要执行日志轮转或清理旧日志。"
+            ),
+        )
+
+
+def _append_sqlite_runtime_alerts(
+    alerts: list[dict[str, Any]],
+    sqlite_runtime: dict[str, Any],
+) -> None:
+    retry_count = _int_value(sqlite_runtime.get("retry_count"))
+    if retry_count <= 0:
+        return
+    _append_alert(
+        alerts,
+        severity="warn",
+        code="sqlite_retryable_lock_seen",
+        title="SQLite 出现可重试锁等待",
+        message=(
+            f"当前进程记录到 {retry_count} 次可重试 SQLite busy/locked 事件，"
+            "说明写入争用仍需观察。"
+        ),
+        detail=sqlite_runtime.get("last_error"),
+    )
+
+
+def _append_telemetry_cleanup_alerts(
+    alerts: list[dict[str, Any]],
+    telemetry_cleanup: dict[str, Any],
+) -> None:
+    if telemetry_cleanup and telemetry_cleanup.get("status") == "failed":
+        _append_alert(
+            alerts,
+            severity="critical",
+            code="telemetry_cleanup_failed",
+            title="日志保留清理失败",
+            message="SQLite telemetry 日志清理失败，日志表可能继续增长。",
+            detail=telemetry_cleanup.get("error"),
+        )
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_value(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _format_bytes(value: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    amount = float(max(value, 0))
+    for unit in units:
+        if amount < 1024.0 or unit == units[-1]:
+            return f"{amount:.1f} {unit}"
+        amount /= 1024.0
+    return f"{amount:.1f} B"

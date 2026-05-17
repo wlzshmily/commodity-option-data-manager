@@ -39,6 +39,9 @@ def test_api_status_and_settings_do_not_require_key_by_default() -> None:
     assert client.get("/api/health").status_code == 200
     status = client.get("/api/status").json()
     assert status["collection"]["active_batches"] == 0
+    assert "resources" in status
+    assert "resources" in status["operations"]
+    assert "telemetry_cleanup" in status["operations"]
     settings = client.get("/api/settings").json()
     assert settings["api"]["auth_required"] is False
     assert settings["tqsdk"]["password_configured"] is False

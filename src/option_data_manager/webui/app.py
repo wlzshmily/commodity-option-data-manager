@@ -17,8 +17,12 @@ from option_data_manager.api.app import (
     create_app as create_local_api_app,
 )
 from option_data_manager.operations_monitor import build_operations_monitor
+from option_data_manager.operations_resources import (
+    build_resource_snapshot,
+    default_telemetry_database_path,
+)
 from option_data_manager.realtime_health import build_realtime_health
-from option_data_manager.service_state import ServiceStateRepository
+from option_data_manager.service_state import ServiceLogRepository, ServiceStateRepository
 from option_data_manager.sqlite_runtime import configure_sqlite_runtime
 from .read_model import SubscriptionLifecycleStatus, WebuiReadModel
 
@@ -30,15 +34,25 @@ def create_webui_app(
     connection: sqlite3.Connection,
     *,
     database_path: str | None = None,
+    telemetry_connection: sqlite3.Connection | None = None,
+    telemetry_database_path: str | None = None,
 ) -> FastAPI:
     """Create the local WebUI and its read-only JSON endpoints."""
 
     connection.row_factory = sqlite3.Row
     configure_sqlite_runtime(connection, enable_wal=database_path not in (None, ":memory:"))
+    telemetry_connection = telemetry_connection or connection
     read_model = WebuiReadModel(connection)
     service_state = ServiceStateRepository(connection)
+    telemetry_state = ServiceStateRepository(telemetry_connection)
+    service_logs = ServiceLogRepository(telemetry_connection)
     app = FastAPI(title="期权数据管理工具 WebUI")
-    local_api = create_local_api_app(connection, database_path=database_path)
+    local_api = create_local_api_app(
+        connection,
+        database_path=database_path,
+        telemetry_connection=telemetry_connection,
+        telemetry_database_path=telemetry_database_path,
+    )
     for route in local_api.router.routes:
         if getattr(route, "path", "") == "/":
             continue
@@ -79,6 +93,12 @@ def create_webui_app(
                 **_overview_payload(
                     active_read_model,
                     service_state=service_state,
+                    telemetry_database_path=telemetry_database_path,
+                    telemetry_cleanup=getattr(
+                        local_api.state,
+                        "telemetry_cleanup",
+                        {},
+                    ),
                     database_path=database_path,
                     limit=limit,
                 ),
@@ -120,14 +140,18 @@ def create_webui_app(
             database_path=database_path,
         )
         try:
-            return active_read_model.runs(limit=limit)
+            payload = active_read_model.runs(limit=limit)
+            payload["service_logs"] = [
+                log.__dict__ for log in service_logs.list_logs(limit=limit)
+            ]
+            return payload
         finally:
             if read_connection is not None:
                 read_connection.close()
 
     @app.get("/api/webui/api-summary")
     def api_page_summary() -> dict:
-        summary = service_state.api_summary()
+        summary = telemetry_state.api_summary()
         return {
             "status": "ok",
             "database_path": database_path,
@@ -161,6 +185,8 @@ def _overview_payload(
     read_model: WebuiReadModel,
     *,
     service_state: ServiceStateRepository,
+    telemetry_database_path: str | None,
+    telemetry_cleanup: dict,
     database_path: str | None,
     limit: int,
 ) -> dict:
@@ -206,11 +232,19 @@ def _overview_payload(
         "quote_stream": quote_stream,
     }
     _align_summary_with_quote_stream_progress(payload, quote_stream)
+    resources = build_resource_snapshot(
+        database_path=database_path,
+        telemetry_database_path=telemetry_database_path,
+        runtime_log_dirs=_runtime_log_dirs(database_path),
+    )
     payload["operations"] = build_operations_monitor(
         overview=payload,
         quote_stream=quote_stream,
         metrics_worker=quote_stream.get("metrics_worker"),
+        resources=resources,
+        telemetry_cleanup=telemetry_cleanup,
     )
+    payload["resources"] = resources
     return payload
 
 
@@ -1248,7 +1282,33 @@ def create_app_from_database() -> FastAPI:
     Path(database_path).parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path, check_same_thread=False, timeout=30)
     configure_sqlite_runtime(connection, enable_wal=True)
-    return create_webui_app(connection, database_path=database_path)
+    telemetry_path = default_telemetry_database_path(database_path)
+    telemetry_connection = _connect_telemetry_database(telemetry_path)
+    return create_webui_app(
+        connection,
+        database_path=database_path,
+        telemetry_connection=telemetry_connection,
+        telemetry_database_path=telemetry_path,
+    )
+
+
+def _connect_telemetry_database(path: str | None) -> sqlite3.Connection | None:
+    if not path:
+        return None
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, check_same_thread=False, timeout=30)
+    configure_sqlite_runtime(
+        connection,
+        enable_wal=True,
+        enable_incremental_vacuum=True,
+    )
+    return connection
+
+
+def _runtime_log_dirs(database_path: str | None) -> list[Path]:
+    if not database_path or database_path == ":memory:":
+        return []
+    return [Path(database_path).parent]
 
 
 def main() -> None:

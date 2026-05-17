@@ -26,6 +26,12 @@ from option_data_manager.metrics_dirty_queue import (
     next_time_after,
 )
 from option_data_manager.option_metrics import OptionMetricsRepository
+from option_data_manager.sqlite_runtime import (
+    SQLiteRetryPolicy,
+    SQLiteRetryTracker,
+    is_sqlite_retryable,
+    run_with_sqlite_retries,
+)
 from option_data_manager.tqsdk_connection import create_tqsdk_api_with_retries
 
 
@@ -47,6 +53,8 @@ class MetricsWorkerResult:
     failed_count: int
     pending_count: int
     error_count: int
+    sqlite_retry_count: int = 0
+    last_sqlite_retry_at: str | None = None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -174,6 +182,8 @@ def run_metrics_worker(
     failed_count = 0
     error_count = 0
     iv_calculator = _create_option_impv_calculator()
+    sqlite_retries = SQLiteRetryTracker()
+    retry_policy = SQLiteRetryPolicy(attempts=3, initial_delay_seconds=0.25)
 
     while True:
         if cycles is not None and cycle_count >= cycles:
@@ -182,7 +192,29 @@ def run_metrics_worker(
             break
         cycle_count += 1
         now = datetime.now(UTC).isoformat()
-        tasks = queue.claim_due_tasks(now=now, limit=claim_limit)
+        try:
+            tasks = _run_sqlite_worker_operation(
+                lambda: queue.claim_due_tasks(now=now, limit=claim_limit),
+                tracker=sqlite_retries,
+                policy=retry_policy,
+            )
+        except (sqlite3.DatabaseError, SystemError) as exc:
+            if not is_sqlite_retryable(exc):
+                raise
+            _write_progress(
+                report_path,
+                started_at=started_at,
+                cycles=cycle_count,
+                claimed_count=claimed_count,
+                completed_count=completed_count,
+                postponed_count=postponed_count,
+                failed_count=failed_count,
+                pending_count=_safe_pending_count(queue, sqlite_retries),
+                error_count=error_count,
+                sqlite_runtime=sqlite_retries.snapshot(),
+            )
+            time.sleep(max(poll_interval_seconds, 1.0))
+            continue
         claimed_count += len(tasks)
         if not tasks and poll_interval_seconds:
             _write_progress(
@@ -193,8 +225,9 @@ def run_metrics_worker(
                 completed_count=completed_count,
                 postponed_count=postponed_count,
                 failed_count=failed_count,
-                pending_count=queue.pending_count(),
+                pending_count=_safe_pending_count(queue, sqlite_retries),
                 error_count=error_count,
+                sqlite_runtime=sqlite_retries.snapshot(),
             )
             time.sleep(poll_interval_seconds)
             continue
@@ -207,10 +240,16 @@ def run_metrics_worker(
                 now=now,
             )
             if postpone_until is not None:
-                queue.postpone_recently_refreshed(
-                    task=task,
-                    next_attempt_at=postpone_until,
-                    now=now,
+                _run_sqlite_worker_operation(
+                    lambda task=task, postpone_until=postpone_until: (
+                        queue.postpone_recently_refreshed(
+                            task=task,
+                            next_attempt_at=postpone_until,
+                            now=now,
+                        )
+                    ),
+                    tracker=sqlite_retries,
+                    policy=retry_policy,
                 )
                 postponed_count += 1
                 continue
@@ -233,7 +272,11 @@ def run_metrics_worker(
                         f"Metrics refresh completed with {result.error_count} error(s)."
                     )
                 for task in grouped_tasks:
-                    queue.complete_task(task)
+                    _run_sqlite_worker_operation(
+                        lambda task=task: queue.complete_task(task),
+                        tracker=sqlite_retries,
+                        policy=retry_policy,
+                    )
                 completed_count += len(grouped_tasks)
             except Exception as exc:
                 failed_count += len(grouped_tasks)
@@ -241,12 +284,15 @@ def run_metrics_worker(
                 retry_at = next_time_after(retry_delay_seconds, now=now)
                 failed_at = datetime.now(UTC).isoformat()
                 for task in grouped_tasks:
-                    queue.fail_task(
+                    _best_effort_fail_task(
+                        queue,
                         task,
                         error_type=type(exc).__name__,
                         message=str(exc),
                         retry_at=retry_at,
                         now=failed_at,
+                        tracker=sqlite_retries,
+                        policy=retry_policy,
                     )
         _write_progress(
             report_path,
@@ -256,10 +302,13 @@ def run_metrics_worker(
             completed_count=completed_count,
             postponed_count=postponed_count,
             failed_count=failed_count,
-            pending_count=queue.pending_count(),
+            pending_count=_safe_pending_count(queue, sqlite_retries),
             error_count=error_count,
+            sqlite_runtime=sqlite_retries.snapshot(),
         )
 
+    sqlite_snapshot = sqlite_retries.snapshot()
+    last_sqlite_retry_at = sqlite_snapshot.get("last_retry_at")
     return MetricsWorkerResult(
         started_at=started_at,
         finished_at=datetime.now(UTC).isoformat(),
@@ -268,8 +317,12 @@ def run_metrics_worker(
         completed_count=completed_count,
         postponed_count=postponed_count,
         failed_count=failed_count,
-        pending_count=queue.pending_count(),
+        pending_count=_safe_pending_count(queue, sqlite_retries),
         error_count=error_count,
+        sqlite_retry_count=int(sqlite_snapshot.get("retry_count") or 0),
+        last_sqlite_retry_at=(
+            str(last_sqlite_retry_at) if last_sqlite_retry_at is not None else None
+        ),
     )
 
 
@@ -303,6 +356,57 @@ def _fresh_metrics_retry_at(
     return eligible_at.isoformat()
 
 
+def _run_sqlite_worker_operation(
+    operation,
+    *,
+    tracker: SQLiteRetryTracker,
+    policy: SQLiteRetryPolicy,
+):
+    return run_with_sqlite_retries(operation, tracker=tracker, policy=policy)
+
+
+def _best_effort_fail_task(
+    queue: MetricsDirtyQueueRepository,
+    task: MetricsDirtyTask,
+    *,
+    error_type: str,
+    message: str,
+    retry_at: str,
+    now: str,
+    tracker: SQLiteRetryTracker,
+    policy: SQLiteRetryPolicy,
+) -> None:
+    try:
+        _run_sqlite_worker_operation(
+            lambda: queue.fail_task(
+                task,
+                error_type=error_type,
+                message=message,
+                retry_at=retry_at,
+                now=now,
+            ),
+            tracker=tracker,
+            policy=policy,
+        )
+    except (sqlite3.DatabaseError, SystemError) as exc:
+        if not is_sqlite_retryable(exc):
+            raise
+        tracker.record_retry(exc)
+
+
+def _safe_pending_count(
+    queue: MetricsDirtyQueueRepository,
+    tracker: SQLiteRetryTracker,
+) -> int:
+    try:
+        return run_with_sqlite_retries(lambda: queue.pending_count(), tracker=tracker)
+    except (sqlite3.DatabaseError, SystemError) as exc:
+        if not is_sqlite_retryable(exc):
+            raise
+        tracker.record_retry(exc)
+        return -1
+
+
 def _create_option_impv_calculator():
     from tqsdk.ta import OPTION_IMPV
 
@@ -327,6 +431,7 @@ def _write_progress(
     failed_count: int,
     pending_count: int,
     error_count: int,
+    sqlite_runtime: dict[str, Any] | None = None,
 ) -> None:
     if report_path is None:
         return
@@ -344,6 +449,7 @@ def _write_progress(
                 "failed_count": failed_count,
                 "pending_count": pending_count,
                 "error_count": error_count,
+                "sqlite_runtime": sqlite_runtime or {},
             },
             "secret_handling": "No credential value was written to this report.",
         },

@@ -156,3 +156,21 @@
 - No-Quote-time state follow-up: user clarified the distinction between startup uncertainty and subscribed closed-session evidence. Overview rows now show `待行情` only before the row is fully subscribed; if the row is `已订阅` and still has no underlying Quote time, it shows `休市`. Verification passed with targeted WebUI read-model/trading-session/quote-stream tests at 48 tests.
 - MM-T018 reference-price fallback follow-up: user asked whether TQSDK has a per-option moneyness field. Local TQSDK 3.9.5 inspection confirmed no ready-made moneyness field, but Quote exposes `settlement`, `pre_settlement`, and `pre_close`. Implemented shared `underlying_reference_price` for realtime Kline selection and T型报价 masking: latest price, bid/ask midpoint, close/settlement, then previous settlement/close. Added tests for no-night/closed-session `last_price=None` with `pre_settlement` still producing OTM Kline targets instead of `0/0`. Browser restart initially failed because worker SQLite rows were plain tuples and `dict(row)` crashed before Quote subscription; fixed by routing cursor rows through `_dict_rows()`, added tuple-row test coverage, and verified live local realtime reached Quote `11126/11126`, Kline `5496/5496`, with 4 workers and 0 Kline errors. A second live observation caught Saturday-night theoretical-session leakage; trading-session gating now excludes Saturday night while preserving Friday-night/Saturday-early continuation. Also made `/api/quote-stream/start` respect an already configured `quote_stream.report_dir` to keep tests and local runtime reports isolated.
 - MM-T018 progress口径 follow-up: browser review found the overview could show impossible realtime progress such as Kline `6225/2160` and AP610 `14/14` after running-phase reconciliation. Root cause was reporting held sticky Kline refs as subscribed while replacing the target list with a smaller reconciliation candidate list. `quote_streamer` now returns the moneyness-selected target list from reconciliation and counts subscribed Klines only when the ref is still in that target scope. Added regression coverage and verified local restart: Quote `11126/11126`, Kline `5496/5496`, AP610 `36/36`, 0 Kline errors; full suite passed 132 tests.
+## 2026-05-17 OPS-007 Resource And Log Keepalive Monitoring
+
+- Delivered: SPEC-003 / OPS-007 for SQLite retry visibility, telemetry retention,
+  disk/CPU/memory monitoring, WAL/log-size alerts, and metrics-worker SQLite lock
+  retry resilience.
+- Code entry points: `src/option_data_manager/sqlite_runtime.py`,
+  `src/option_data_manager/log_retention.py`,
+  `src/option_data_manager/operations_resources.py`,
+  `src/option_data_manager/operations_monitor.py`,
+  `src/option_data_manager/api/app.py`,
+  `src/option_data_manager/webui/app.py`, and
+  `src/option_data_manager/cli/metrics_worker.py`.
+- Tests: `tests/test_log_retention.py`, `tests/test_operations_resources.py`,
+  `tests/test_metrics_worker.py`, API/WebUI status tests; full pytest passed 146
+  tests before final release-gate checks.
+- Operational note: active SQLite `-wal`/`-shm` files remain protected; active
+  stdout/stderr logs should be controlled by Ubuntu `logrotate`/journald while
+  app cleanup prunes table telemetry and stale rotated artifacts.

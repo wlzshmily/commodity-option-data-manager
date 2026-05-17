@@ -9,6 +9,8 @@ test-server deployment completed on 2026-05-11.
 - Runtime: Ubuntu server, Python 3.11 managed by `uv`.
 - Application service: `odm-webui`, which mounts the local API routes.
 - Runtime database: SQLite under `/opt/option-data-manager/shared/data/`.
+- Telemetry database: by default
+  `/opt/option-data-manager/shared/data/option-data-telemetry.sqlite3`.
 - Service manager: `systemd`.
 - Default safe binding: `127.0.0.1:8765`.
 - Optional test-only binding: `0.0.0.0:8765`.
@@ -427,6 +429,64 @@ If the gate fails, the deployment is still live but it is not complete. Record i
 as degraded in `docs/operations/deployment-log.md`, reset or resume the affected
 batch work, and keep monitoring until the gate passes.
 
+## OPS-007 Resource And Log Gate
+
+Before marking a deployment complete, inspect `/api/status` for the resource and
+SQLite/log-retention fields added by OPS-007:
+
+```bash
+STATUS_JSON="$(curl -sS http://127.0.0.1:8765/api/status)"
+python - "$STATUS_JSON" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+operations = payload.get("operations") or {}
+resources = payload.get("resources") or operations.get("resources") or {}
+alerts = operations.get("alerts") or []
+critical = [item for item in alerts if item.get("severity") == "critical"]
+
+for label, section in resources.items():
+    print(f"{label}: {section}")
+
+if critical:
+    for alert in critical:
+        print(
+            f"NO-GO: {alert.get('code')} - {alert.get('message')}",
+            file=sys.stderr,
+        )
+    sys.exit(1)
+
+print("GO: no critical OPS-007 resource/log alerts")
+PY
+```
+
+The deployment remains degraded if disk, memory, CPU, SQLite WAL size, telemetry
+cleanup, or runtime log size is critical. Resolve the resource condition before
+starting long-running collection workers.
+
+Runtime SQLite `-wal` and `-shm` files must not be deleted by hand. Let SQLite
+checkpoint them normally by stopping writers cleanly, restarting `odm-webui`, or
+using application-level cleanup/checkpoint behavior from the current release.
+
+Use system log rotation for stdout/stderr files created by local scripts or
+systemd services. A conservative `/etc/logrotate.d/odm-webui` example:
+
+```text
+/opt/option-data-manager/shared/data/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+```
+
+OPS-007 application cleanup removes stale rotated log artifacts and prunes
+SQLite telemetry rows, but active stdout/stderr logs still need `logrotate` or
+`journald` limits on Ubuntu.
+
 ## Upgrade
 
 1. Resolve the target GitHub commit SHA.
@@ -438,8 +498,8 @@ batch work, and keep monitoring until the gate passes.
 6. Re-run local and public smoke.
 7. Restart contract manager, background refresh, realtime subscriptions, and the
    metrics worker path.
-8. Run the Safe Upgrade Gate data-readiness step before marking the deployment
-   complete.
+8. Run the Safe Upgrade Gate data-readiness step and OPS-007 resource/log gate
+   before marking the deployment complete.
 
 ```bash
 systemctl start odm-webui

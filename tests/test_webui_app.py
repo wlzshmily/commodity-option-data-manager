@@ -84,3 +84,16 @@ def test_api_page_summary_endpoint_is_lightweight() -> None:
     assert payload["status"] == "ok"
     assert payload["api"]["request_count"] >= 0
     assert payload["summary"]["active_options"] == 0
+
+
+def test_webui_overview_includes_resource_operations_snapshot() -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    client = TestClient(create_webui_app(connection, database_path=":memory:"))
+
+    response = client.get("/api/webui/overview")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "resources" in payload
+    assert "resources" in payload["operations"]
+    assert "telemetry_cleanup" in payload["operations"]

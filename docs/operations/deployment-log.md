@@ -89,3 +89,25 @@ Verification:
 - `uv run python -m pytest -s -q` passed 141 tests.
 - `uv run python -m compileall -q src tests option_data_manager` passed.
 - `bash scripts/agentic-sdlc/check-agentic-sdlc.sh` passed.
+
+## 2026-05-17 OPS-007 Resource And Log Keepalive Monitoring
+
+Operational decision:
+
+- SQLite lock symptoms are treated as an operational health signal, not only as
+  isolated exceptions.
+- Disk, memory, CPU, SQLite WAL size, telemetry cleanup status, and runtime log
+  directory growth must be visible through `/api/status.operations` and the WebUI
+  overview.
+- Service logs and API request metrics have bounded retention, and stale runtime
+  log artifacts can be cleaned automatically without touching active PID/stop
+  files, worker reports, or SQLite WAL/SHM files.
+- Metrics-worker retryable SQLite busy/locked operations must be retried and
+  recorded in progress reports instead of terminating the worker.
+
+Deployment rule added:
+
+- Future server deployment notes must record the OPS-007 resource/log gate result
+  alongside the OPS-005 data-readiness gate. A deployment with critical disk,
+  memory, CPU, telemetry cleanup, or WAL/log growth alerts is degraded and cannot
+  be marked complete.

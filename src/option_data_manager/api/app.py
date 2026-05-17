@@ -23,8 +23,17 @@ from option_data_manager.cli.collect_market import _discover_and_persist_market
 from option_data_manager.api_keys import ApiKeyRecord, ApiKeyRepository
 from option_data_manager.collection_state import CollectionStateRepository
 from option_data_manager.klines import KlineRepository
+from option_data_manager.log_retention import (
+    DEFAULT_TELEMETRY_RETENTION_POLICY,
+    cleanup_runtime_log_files,
+    cleanup_telemetry,
+)
 from option_data_manager.option_metrics import OptionMetricsRepository
 from option_data_manager.operations_monitor import build_operations_monitor
+from option_data_manager.operations_resources import (
+    build_resource_snapshot,
+    default_telemetry_database_path,
+)
 from option_data_manager.quote_streamer import (
     DEFAULT_KLINE_SUBSCRIPTION_TIMEOUT_SECONDS,
     DEFAULT_MONEYNESS_FILTER,
@@ -42,7 +51,12 @@ from option_data_manager.settings import (
 )
 from option_data_manager.source_quality import SourceQualityRepository
 from option_data_manager.service_state import ServiceLogRepository, ServiceStateRepository
-from option_data_manager.sqlite_runtime import configure_sqlite_runtime
+from option_data_manager.sqlite_runtime import (
+    SQLiteRetryTracker,
+    configure_sqlite_runtime,
+    is_sqlite_busy,
+    is_sqlite_retryable,
+)
 from option_data_manager.tqsdk_connection import create_tqsdk_api_with_retries
 from option_data_manager.webui.read_model import (
     WebuiReadModel,
@@ -215,6 +229,8 @@ def create_app(
     connection: sqlite3.Connection,
     *,
     database_path: str | None = None,
+    telemetry_connection: sqlite3.Connection | None = None,
+    telemetry_database_path: str | None = None,
     protector: Any | None = None,
 ) -> FastAPI:
     """Create the unified local API application."""
@@ -222,10 +238,13 @@ def create_app(
     connection.row_factory = sqlite3.Row
     secret_protector = protector or _default_protector()
     _ensure_runtime_tables(connection, protector=secret_protector)
+    telemetry_connection = telemetry_connection or connection
+    _ensure_telemetry_tables(telemetry_connection)
     settings = SettingsRepository(connection, secret_protector)
     api_keys = ApiKeyRepository(connection)
     service_state = ServiceStateRepository(connection)
-    service_logs = ServiceLogRepository(connection)
+    telemetry_state = ServiceStateRepository(telemetry_connection)
+    service_logs = ServiceLogRepository(telemetry_connection)
     read_model = WebuiReadModel(connection)
     refresh_lock = threading.Lock()
     refresh_worker: dict[str, threading.Thread | None] = {"thread": None}
@@ -237,6 +256,12 @@ def create_app(
     contract_manager_worker: dict[str, threading.Thread | None] = {"thread": None}
     quote_stream_processes: dict[str, list[Any]] = {"processes": []}
     metrics_worker_processes: dict[str, list[Any]] = {"processes": []}
+    sqlite_retry_tracker = SQLiteRetryTracker()
+    telemetry_cleanup_state: dict[str, Any] = {
+        "last_cleanup_monotonic": 0.0,
+        "last_result": {},
+        "lock": threading.Lock(),
+    }
     service_state.set_value("quote_stream.contract_discovery_running", "false")
     service_state.set_value("quote_stream.contract_list_ready", "false")
     service_state.set_value("quote_stream.status", QuoteStreamState.BLOCKED.value)
@@ -273,9 +298,35 @@ def create_app(
 
     app = FastAPI(title="Option Data Manager API")
     app.state.service_state = service_state
+    app.state.telemetry_state = telemetry_state
     app.state.quote_stream_processes = quote_stream_processes
     app.state.metrics_worker_processes = metrics_worker_processes
     app.state.contract_manager_worker = contract_manager_worker
+    app.state.sqlite_retry_tracker = sqlite_retry_tracker
+
+    def maybe_run_telemetry_cleanup(*, force: bool = False) -> dict[str, Any]:
+        with telemetry_cleanup_state["lock"]:
+            now_monotonic = time.monotonic()
+            last_cleanup = float(telemetry_cleanup_state["last_cleanup_monotonic"])
+            if not force and now_monotonic - last_cleanup < 1800:
+                return dict(telemetry_cleanup_state["last_result"] or {})
+            table_result = cleanup_telemetry(
+                telemetry_connection,
+                policy=DEFAULT_TELEMETRY_RETENTION_POLICY,
+            )
+            file_result: dict[str, Any] = {}
+            if database_path and database_path != ":memory:":
+                file_result = cleanup_runtime_log_files(
+                    Path(database_path).parent,
+                    policy=DEFAULT_TELEMETRY_RETENTION_POLICY,
+                )
+            result = {**table_result, "runtime_logs": file_result}
+            telemetry_cleanup_state["last_cleanup_monotonic"] = now_monotonic
+            telemetry_cleanup_state["last_result"] = result
+            app.state.telemetry_cleanup = result
+            return dict(result)
+
+    app.state.telemetry_cleanup = maybe_run_telemetry_cleanup(force=True)
 
     @app.middleware("http")
     async def record_metrics(request: Request, call_next: Any) -> Any:
@@ -285,11 +336,12 @@ def create_app(
         except Exception as exc:
             if request.url.path.startswith("/api/"):
                 _safe_record_request(
-                    service_state,
+                    telemetry_state,
                     path=request.url.path,
                     method=request.method,
                     status_code=500,
                     latency_ms=(time.perf_counter() - started) * 1000,
+                    retry_tracker=sqlite_retry_tracker,
                 )
                 _safe_append_service_log(
                     service_logs,
@@ -301,15 +353,17 @@ def create_app(
                         "method": request.method,
                         "error_type": type(exc).__name__,
                     },
+                    retry_tracker=sqlite_retry_tracker,
                 )
             raise
         if request.url.path.startswith("/api/"):
             _safe_record_request(
-                service_state,
+                telemetry_state,
                 path=request.url.path,
                 method=request.method,
                 status_code=response.status_code,
                 latency_ms=(time.perf_counter() - started) * 1000,
+                retry_tracker=sqlite_retry_tracker,
             )
             if response.status_code >= 500:
                 _safe_append_service_log(
@@ -322,6 +376,7 @@ def create_app(
                         "method": request.method,
                         "status_code": response.status_code,
                     },
+                    retry_tracker=sqlite_retry_tracker,
                 )
         return response
 
@@ -367,7 +422,7 @@ def create_app(
     @app.get("/api/status")
     def status(_: ApiKeyRecord | None = Depends(require_auth)) -> dict[str, Any]:
         overview = read_model.overview(limit=500)
-        api_summary = service_state.api_summary()
+        api_summary = telemetry_state.api_summary()
         latest_run = AcquisitionRepository(connection).list_runs(limit=1)
         quote_stream = _quote_stream_status(
             service_state,
@@ -375,10 +430,19 @@ def create_app(
             metrics_process_table=metrics_worker_processes,
             connection=connection,
         )
+        telemetry_cleanup = maybe_run_telemetry_cleanup()
+        resources = build_resource_snapshot(
+            database_path=database_path,
+            telemetry_database_path=telemetry_database_path,
+            runtime_log_dirs=_runtime_log_dirs(database_path),
+        )
         operations = build_operations_monitor(
             overview=overview,
             quote_stream=quote_stream,
             metrics_worker=quote_stream.get("metrics_worker"),
+            resources=resources,
+            sqlite_runtime=sqlite_retry_tracker.snapshot(),
+            telemetry_cleanup=telemetry_cleanup,
         )
         return {
             "status": _overall_status(overview, latest_run),
@@ -388,6 +452,7 @@ def create_app(
             "refresh": _refresh_status(service_state),
             "quote_stream": quote_stream,
             "operations": operations,
+            "resources": resources,
             "latest_run": latest_run[0].__dict__ if latest_run else None,
             "api": {
                 "bind": settings.get_value(API_BIND_KEY) or "127.0.0.1",
@@ -1479,7 +1544,14 @@ def create_app_from_database() -> FastAPI:
     Path(database_path).parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path, check_same_thread=False)
     configure_sqlite_runtime(connection, enable_wal=True)
-    return create_app(connection, database_path=database_path)
+    telemetry_path = default_telemetry_database_path(database_path)
+    telemetry_connection = _connect_telemetry_database(telemetry_path)
+    return create_app(
+        connection,
+        database_path=database_path,
+        telemetry_connection=telemetry_connection,
+        telemetry_database_path=telemetry_path,
+    )
 
 
 def main() -> None:
@@ -1512,6 +1584,30 @@ def _ensure_runtime_tables(connection: sqlite3.Connection, *, protector: Any | N
     ApiKeyRepository(connection)
     ServiceStateRepository(connection)
     ServiceLogRepository(connection)
+
+
+def _ensure_telemetry_tables(connection: sqlite3.Connection) -> None:
+    ServiceStateRepository(connection)
+    ServiceLogRepository(connection)
+
+
+def _connect_telemetry_database(path: str | None) -> sqlite3.Connection | None:
+    if not path:
+        return None
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, check_same_thread=False, timeout=30)
+    configure_sqlite_runtime(
+        connection,
+        enable_wal=True,
+        enable_incremental_vacuum=True,
+    )
+    return connection
+
+
+def _runtime_log_dirs(database_path: str | None) -> list[Path]:
+    if not database_path or database_path == ":memory:":
+        return []
+    return [Path(database_path).parent]
 
 
 def _default_protector() -> Any:
@@ -2356,7 +2452,7 @@ def _safe_get_service_value(
     try:
         return service_state.get_value(key)
     except sqlite3.OperationalError as exc:
-        if _is_sqlite_busy(exc):
+        if is_sqlite_busy(exc):
             return default
         raise
 
@@ -2457,11 +2553,15 @@ def _safe_set_service_value(
     service_state: ServiceStateRepository,
     key: str,
     value: str | None,
+    *,
+    retry_tracker: SQLiteRetryTracker | None = None,
 ) -> bool:
     try:
         service_state.set_value(key, value)
     except (sqlite3.DatabaseError, SystemError) as exc:
-        if _is_sqlite_retryable(exc):
+        if is_sqlite_retryable(exc):
+            if retry_tracker is not None:
+                retry_tracker.record_retry(exc)
             return False
         raise
     return True
@@ -2474,6 +2574,7 @@ def _safe_append_service_log(
     category: str,
     message: str,
     context: dict[str, Any] | None = None,
+    retry_tracker: SQLiteRetryTracker | None = None,
 ) -> bool:
     try:
         service_logs.append(
@@ -2483,7 +2584,9 @@ def _safe_append_service_log(
             context=context,
         )
     except (sqlite3.DatabaseError, SystemError) as exc:
-        if _is_sqlite_retryable(exc):
+        if is_sqlite_retryable(exc):
+            if retry_tracker is not None:
+                retry_tracker.record_retry(exc)
             return False
         raise
     return True
@@ -2496,6 +2599,7 @@ def _safe_record_request(
     method: str,
     status_code: int,
     latency_ms: float,
+    retry_tracker: SQLiteRetryTracker | None = None,
 ) -> bool:
     try:
         service_state.record_request(
@@ -2505,30 +2609,12 @@ def _safe_record_request(
             latency_ms=latency_ms,
         )
     except (sqlite3.DatabaseError, SystemError) as exc:
-        if _is_sqlite_retryable(exc):
+        if is_sqlite_retryable(exc):
+            if retry_tracker is not None:
+                retry_tracker.record_retry(exc)
             return False
         raise
     return True
-
-
-def _is_sqlite_busy(exc: sqlite3.DatabaseError) -> bool:
-    message = str(exc).lower()
-    return "database is locked" in message or "database is busy" in message
-
-
-def _is_sqlite_retryable(exc: sqlite3.DatabaseError | SystemError) -> bool:
-    message = str(exc).lower()
-    if isinstance(exc, SystemError):
-        return (
-            "sqlite3.connection" in message
-            or "commit" in message
-            or "error return without exception set" in message
-        )
-    return (
-        _is_sqlite_busy(exc)
-        or "cannot commit - no transaction is active" in message
-        or "cannot rollback - no transaction is active" in message
-    )
 
 
 def _quote_stream_progress(report_dir: str | None, *, running: bool) -> dict[str, Any]:
