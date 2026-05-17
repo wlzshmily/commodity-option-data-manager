@@ -2,6 +2,11 @@
 
 ## 2026-05-17
 
+- OPS-005 deployment safety documentation completed after operator reported that `DCE.pp2606` and later rows had K-line plus IV/Greeks gaps while realtime subscription progress was complete.
+- Root-cause position: this was not simply "new code failed to copy"; the unsafe deployment completion gate allowed old/incomplete runtime state to pass unnoticed. Server evidence showed routine current-slice batches only `715/1544` complete, one stale active `running` batch on `DCE.pg2610` since `2026-05-10T17:46:44Z`, and a metrics-worker report with `sqlite3.OperationalError: database is locked`.
+- New required process is recorded in `docs/operations/deployment-log.md` and `docs/operations/linux-server-deployment.md`: prepare/verify release first, stop quote-stream and contract-manager through the running API, stop `odm-webui` through systemd, verify no old quote/metrics/WebUI processes and no unexpected SQLite holder remain, switch `current`, start WebUI, start contract manager, resume refresh, start quote-stream/metrics worker path, then run the data-readiness gate before recording deployment complete.
+- Future deployment summaries must include safe-stop/quiesce evidence and data-readiness gate evidence, not only HTTP 200 smoke checks.
+
 - OPS-004 deployment completed for the dedicated Ubuntu test server `39.103.49.231`.
 - Target release: GitHub commit `0780618709561ccd864fd9b1401d313cf9b31ddb`, deployed at `/opt/option-data-manager/releases/078061870956`; `/opt/option-data-manager/current` points there and `/opt/option-data-manager/current-release.txt` contains the full SHA.
 - Server-side `git fetch` timed out connecting to GitHub, but the server successfully downloaded the official GitHub codeload archive for the same commit and rebuilt the release from that archive.

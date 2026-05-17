@@ -11,6 +11,7 @@
 - Release plan: `docs/release/release-plan.md`
 - WSL2 Ubuntu operations: `docs/operations/wsl2-ubuntu.md`
 - Linux server deployment: `docs/operations/linux-server-deployment.md`
+- Operations deployment log: `docs/operations/deployment-log.md`
 - Local server lifecycle script: `scripts/odm-server.sh`
 
 ## Current Active Plan

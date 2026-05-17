@@ -22,12 +22,15 @@
 - Linux server deployment is documented in `docs/operations/linux-server-deployment.md`.
 - Deploy explicit GitHub commit SHAs into `/opt/option-data-manager/releases/<short-sha>`, switch `/opt/option-data-manager/current`, and keep runtime SQLite/report state under `/opt/option-data-manager/shared/`.
 - Run deployment verification before switching traffic: `pytest -q`, compileall, `scripts/smoke-local-app.py`, and `scripts/agentic-sdlc/check-agentic-sdlc.sh`.
-- After a service restart, restart background refresh and realtime subscriptions if operators expect collection to continue immediately.
+- Before switching a server release, safely stop quote-stream, metrics-worker, contract-manager, and `odm-webui`; verify no old runtime process or unexpected SQLite holder remains.
+- After a service restart, restart contract manager, background refresh, realtime subscriptions, and the metrics worker path if operators expect collection to continue immediately.
+- A server deployment cannot be recorded as complete until the data-readiness gate passes or the deployment log explicitly marks the remaining current-slice gaps as degraded work. The gate must check for stale `running` batches, pending/failed/running current-slice batches, alive quote/metrics workers, and unexplained K-line/IV/Greeks gaps in the subscribed scope.
 - Public `8765/tcp` binding is for temporary test servers only; production access should use SSH tunneling, VPN, Cloudflare Access, or an authenticated HTTPS reverse proxy.
 
 ## Acceptance Evidence
 
 - Ubuntu test server update on 2026-05-16: `39.103.49.231` runs GitHub commit `c54847bfe4c6d73c15d87e1a42a9eb74c0b0cd53` from `/opt/option-data-manager/releases/c54847bfe4c6`; server-side verification passed 127 tests, compileall, smoke-local-app, and agentic-SDLC check; systemd `odm-webui` is active on `0.0.0.0:8765`, and public smoke for core UI/API/static endpoints returned 200.
+- 2026-05-17 deployment safety correction: OPS-004 was service-smoke complete but later operator inspection found routine current-slice work incomplete after `DCE.pp2606`, one stale `running` batch, and a previously failed metrics worker. OPS-005 hardens the runbook and deployment log so future deployments require safe old-runtime quiescence plus data-readiness gates before being marked complete.
 - Final tuned full-market catch-up: `docs/qa/live-evidence/final-parallel-catchup/summary.json` with 4 worker shards, 6 waves, 27,386 active options, 864/864 successful batches, 0 failed batches, 4,325.332 seconds, and 6.332 options/second.
 - Real runtime display readiness: WebUI read model reported `completion_ratio=1.0`, `failed_batches=0`, `stale_batches=0`, K-line coverage `1.0`, IV coverage `0.9013`, Greeks coverage `0.8959`, and price-field quote coverage `0.8553`.
 - Source quality note: all active options have Quote, K-line, and metrics rows. Remaining IV/Greeks and price-field gaps are retained as visible source-quality diagnostics.

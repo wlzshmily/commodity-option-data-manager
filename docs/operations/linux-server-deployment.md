@@ -283,18 +283,167 @@ done
 If local curl succeeds but public curl fails, check cloud security-group rules
 for `8765/tcp` and the server firewall.
 
+## Safe Upgrade Gate
+
+Do not treat `systemctl restart odm-webui` as a complete upgrade by itself. The
+WebUI starts and stops child quote-stream and metrics-worker processes, and the
+shared SQLite database can also contain interrupted batch state from an earlier
+runtime. A safe server upgrade must explicitly quiesce the old runtime, switch
+the release, restart runtime services, and then prove the current-slice data is
+ready.
+
+Prepare and verify the new release directory first, then quiesce the old
+runtime before switching `/opt/option-data-manager/current`:
+
+```bash
+BASE_URL=http://127.0.0.1:8765
+DB=/opt/option-data-manager/shared/data/option-data-current.sqlite3
+
+curl -fsS -X POST "$BASE_URL/api/quote-stream/stop" || true
+curl -fsS -X POST "$BASE_URL/api/contract-manager/stop" || true
+sleep 5
+
+systemctl stop odm-webui
+
+pkill -TERM -f 'option_data_manager.cli.quote_stream' || true
+pkill -TERM -f 'option_data_manager.cli.metrics_worker' || true
+sleep 2
+pkill -KILL -f 'option_data_manager.cli.quote_stream' || true
+pkill -KILL -f 'option_data_manager.cli.metrics_worker' || true
+
+if pgrep -af 'odm-webui|option_data_manager.cli.quote_stream|option_data_manager.cli.metrics_worker'; then
+  echo "Old ODM runtime process is still alive; aborting release switch." >&2
+  exit 1
+fi
+
+if command -v fuser >/dev/null 2>&1; then
+  fuser -v "$DB" 2>&1 || true
+fi
+```
+
+After the old runtime is quiet, switch `current`, start systemd, and restore the
+runtime services:
+
+```bash
+ln -sfn "/opt/option-data-manager/releases/$SHORT" /opt/option-data-manager/current
+printf "%s\n" "$SHA" > /opt/option-data-manager/current-release.txt
+chown -h odm:odm /opt/option-data-manager/current
+
+systemctl daemon-reload
+systemctl start odm-webui
+curl -fsS "$BASE_URL/api/health"
+
+curl -fsS -X POST "$BASE_URL/api/contract-manager/start"
+curl -fsS -X POST "$BASE_URL/api/refresh"
+curl -fsS -X POST -H "Content-Type: application/json" -d '{}' "$BASE_URL/api/quote-stream/start"
+
+ps -eo pid,ppid,user,etime,cmd \
+  | grep -E 'odm-webui|option_data_manager[.]cli[.](quote_stream|metrics_worker)' \
+  | grep -v grep
+```
+
+Before the deployment can be recorded as complete, run a data-readiness gate.
+This gate exists because realtime subscription progress only proves that Quote
+and K-line objects were created; it does not prove `kline_20d_current` or
+`option_source_metrics_current` have been populated.
+
+```bash
+cd /opt/option-data-manager/current
+DB=/opt/option-data-manager/shared/data/option-data-current.sqlite3
+
+.venv/bin/python - "$DB" <<'PY'
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+import sqlite3
+import sys
+
+db = sys.argv[1]
+now = datetime.now(UTC)
+connection = sqlite3.connect(db)
+connection.row_factory = sqlite3.Row
+
+row = connection.execute(
+    """
+    SELECT
+        SUM(CASE WHEN stale = 0 THEN 1 ELSE 0 END) AS active_batches,
+        SUM(CASE WHEN stale = 0 AND status = 'pending' THEN 1 ELSE 0 END) AS pending_batches,
+        SUM(CASE WHEN stale = 0 AND status = 'running' THEN 1 ELSE 0 END) AS running_batches,
+        SUM(CASE WHEN stale = 0 AND status = 'failed' THEN 1 ELSE 0 END) AS failed_batches,
+        SUM(CASE WHEN stale = 0 AND status = 'success' THEN 1 ELSE 0 END) AS success_batches
+    FROM collection_plan_batches
+    WHERE plan_scope = 'routine-market-current-slice'
+    """
+).fetchone()
+
+active = int(row["active_batches"] or 0)
+pending = int(row["pending_batches"] or 0)
+running = int(row["running_batches"] or 0)
+failed = int(row["failed_batches"] or 0)
+success = int(row["success_batches"] or 0)
+
+stale_running = []
+for item in connection.execute(
+    """
+    SELECT underlying_symbol, batch_index, updated_at
+    FROM collection_plan_batches
+    WHERE plan_scope = 'routine-market-current-slice'
+      AND stale = 0
+      AND status = 'running'
+    """
+):
+    updated = datetime.fromisoformat(str(item["updated_at"]))
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    if updated < now - timedelta(minutes=30):
+        stale_running.append(item)
+
+issues = []
+if stale_running:
+    labels = ", ".join(
+        f"{item['underlying_symbol']}#{item['batch_index']}@{item['updated_at']}"
+        for item in stale_running[:10]
+    )
+    issues.append(f"stale running batch exists: {labels}")
+if pending or running or failed:
+    issues.append(
+        f"current-slice incomplete: success={success}, active={active}, "
+        f"pending={pending}, running={running}, failed={failed}"
+    )
+
+if issues:
+    for issue in issues:
+        print(f"NO-GO: {issue}", file=sys.stderr)
+    sys.exit(1)
+
+print(
+    "GO: routine-market-current-slice complete "
+    f"success={success}, active={active}, pending=0, running=0, failed=0"
+)
+PY
+```
+
+If the gate fails, the deployment is still live but it is not complete. Record it
+as degraded in `docs/operations/deployment-log.md`, reset or resume the affected
+batch work, and keep monitoring until the gate passes.
+
 ## Upgrade
 
 1. Resolve the target GitHub commit SHA.
 2. Create and verify a new release directory.
-3. Switch `/opt/option-data-manager/current`.
-4. Restart `odm-webui`.
-5. Re-run local and public smoke.
-6. Restart background refresh and realtime subscriptions if the service restart
-   interrupted them.
+3. Run the Safe Upgrade Gate quiesce step so old workers and SQLite holders are
+   not carried across the switch.
+4. Switch `/opt/option-data-manager/current`.
+5. Start `odm-webui`.
+6. Re-run local and public smoke.
+7. Restart contract manager, background refresh, realtime subscriptions, and the
+   metrics worker path.
+8. Run the Safe Upgrade Gate data-readiness step before marking the deployment
+   complete.
 
 ```bash
-systemctl restart odm-webui
+systemctl start odm-webui
+curl -sS -X POST http://127.0.0.1:8765/api/contract-manager/start
 curl -sS -X POST http://127.0.0.1:8765/api/refresh
 curl -sS -X POST -H "Content-Type: application/json" -d '{}' \
   http://127.0.0.1:8765/api/quote-stream/start
